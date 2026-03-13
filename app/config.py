@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # FalkorDB connection
     falkordb_host: str = "localhost"
-    falkordb_port: int = 10000
+    falkordb_port: int = 6379
     falkordb_password: str = ""
 
     # LLM for entity extraction (Haiku for cost efficiency)
