@@ -7,7 +7,8 @@ from typing import Any
 
 import yaml
 from graphiti_core import Graphiti
-from graphiti_core.nodes import EpisodeType
+from graphiti_core.nodes import EpisodeType as GraphitiEpisodeType
+from graphiti_core.driver.falkordb_driver import FalkorDriver
 
 from app.config import settings
 
@@ -17,16 +18,8 @@ logger = logging.getLogger("graphiti_service")
 _clients: dict[str, Graphiti] = {}
 
 
-def _build_falkordb_uri() -> str:
-    """Build FalkorDB connection URI."""
-    if settings.falkordb_password:
-        return f"falkor://default:{settings.falkordb_password}@{settings.falkordb_host}:{settings.falkordb_port}"
-    return f"falkor://{settings.falkordb_host}:{settings.falkordb_port}"
-
-
 def _graph_name_for_client(client_slug: str) -> str:
     """Map client slug to isolated graph name."""
-    # Sanitize slug to prevent injection
     safe_slug = "".join(c for c in client_slug if c.isalnum() or c == "_").lower()
     return f"client_{safe_slug}"
 
@@ -48,19 +41,28 @@ def _load_entity_types() -> list[dict[str, str]]:
         return []
 
 
+def _create_driver(graph_name: str) -> FalkorDriver:
+    """Create a FalkorDB driver targeting a specific named graph."""
+    return FalkorDriver(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+        database=graph_name,
+    )
+
+
 async def get_client(client_slug: str) -> Graphiti:
-    """Get or create a Graphiti client for a specific client graph."""
+    """Get or create a Graphiti client for a specific client graph.
+
+    Each client gets a separate FalkorDB named graph via the driver's
+    `database` parameter, providing full data isolation.
+    """
     graph_name = _graph_name_for_client(client_slug)
 
     if graph_name not in _clients:
-        uri = _build_falkordb_uri()
         logger.info(f"[graphiti] Initializing graph: {graph_name}")
-
-        client = Graphiti(
-            uri=uri,
-            graph_name=graph_name,
-        )
-
+        driver = _create_driver(graph_name)
+        client = Graphiti(graph_driver=driver)
         _clients[graph_name] = client
 
     return _clients[graph_name]
@@ -71,14 +73,9 @@ async def get_segment_client(industry: str) -> Graphiti:
     graph_name = _segment_graph_name(industry)
 
     if graph_name not in _clients:
-        uri = _build_falkordb_uri()
         logger.info(f"[graphiti] Initializing segment graph: {graph_name}")
-
-        client = Graphiti(
-            uri=uri,
-            graph_name=graph_name,
-        )
-
+        driver = _create_driver(graph_name)
+        client = Graphiti(graph_driver=driver)
         _clients[graph_name] = client
 
     return _clients[graph_name]
@@ -102,9 +99,13 @@ async def add_episode(
     reference_time: datetime,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Add an episode to the client's knowledge graph."""
+    """Add an episode to the client's knowledge graph.
+
+    Uses EpisodeType.text for all ingestion (plain text content).
+    group_id is set to the graph name to prevent driver re-cloning.
+    """
     client = await get_client(client_slug)
-    group_id = f"{client_slug}:{engagement_id}"
+    graph_name = _graph_name_for_client(client_slug)
 
     start = time.time()
 
@@ -113,46 +114,62 @@ async def add_episode(
         episode_body=content,
         source_description=source_description,
         reference_time=reference_time,
-        group_id=group_id,
+        source=GraphitiEpisodeType.text,
+        group_id=graph_name,
     )
 
     elapsed_ms = (time.time() - start) * 1000
     logger.info(
-        f"[graphiti] Episode added to {_graph_name_for_client(client_slug)} "
+        f"[graphiti] Episode added to {graph_name} "
         f"in {elapsed_ms:.0f}ms: {name}"
     )
 
+    # AddEpisodeResults has .episode, .nodes, .edges attributes
+    entities_extracted = len(result.nodes) if hasattr(result, "nodes") else 0
+    facts_created = len(result.edges) if hasattr(result, "edges") else 0
+    episode_id = ""
+    if hasattr(result, "episode") and hasattr(result.episode, "uuid"):
+        episode_id = str(result.episode.uuid)
+
     return {
-        "episode_id": str(result.uuid) if hasattr(result, "uuid") else str(id(result)),
+        "episode_id": episode_id,
+        "entities_extracted": entities_extracted,
+        "facts_created": facts_created,
         "elapsed_ms": elapsed_ms,
     }
 
 
 async def search(
     client_slug: str,
-    engagement_id: str,
     query: str,
     max_results: int = 10,
-) -> dict[str, Any]:
-    """Search the client's knowledge graph using hybrid search."""
+) -> list[Any]:
+    """Search the client's knowledge graph.
+
+    Returns list of EntityEdge objects. Each edge has:
+    - fact: human-readable fact string
+    - name: relationship label
+    - source_node_uuid / target_node_uuid
+    - valid_at / invalid_at / expired_at (temporal)
+    - episodes: list of source episode UUIDs
+    """
     client = await get_client(client_slug)
-    group_id = f"{client_slug}:{engagement_id}"
+    graph_name = _graph_name_for_client(client_slug)
 
     start = time.time()
 
-    # Retrieve nodes (entities)
-    nodes = await client.search(
+    edges = await client.search(
         query=query,
         num_results=max_results,
-        group_ids=[group_id],
+        group_ids=[graph_name],
     )
 
     elapsed_ms = (time.time() - start) * 1000
+    logger.info(
+        f"[graphiti] Search in {graph_name}: {len(edges)} edges ({elapsed_ms:.0f}ms)"
+    )
 
-    return {
-        "nodes": nodes,
-        "elapsed_ms": elapsed_ms,
-    }
+    return edges
 
 
 async def search_segment(
@@ -160,12 +177,14 @@ async def search_segment(
     query: str,
     max_results: int = 5,
 ) -> list[Any]:
-    """Search the segment knowledge graph."""
+    """Search the segment knowledge graph. Returns list of EntityEdge."""
     try:
         client = await get_segment_client(industry)
+        graph_name = _segment_graph_name(industry)
         results = await client.search(
             query=query,
             num_results=max_results,
+            group_ids=[graph_name],
         )
         return results
     except Exception as e:

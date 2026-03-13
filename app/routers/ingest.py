@@ -56,8 +56,8 @@ async def ingest_episode(req: IngestEpisodeRequest):
 
         return IngestEpisodeResponse(
             episode_id=result.get("episode_id", ""),
-            entities_extracted=0,  # TODO: extract count from Graphiti result
-            facts_created=0,
+            entities_extracted=result.get("entities_extracted", 0),
+            facts_created=result.get("facts_created", 0),
             graph_name=graph_name,
         )
 

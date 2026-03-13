@@ -6,8 +6,6 @@ import time
 from fastapi import APIRouter, HTTPException
 
 from app.models.search import (
-    ContradictionResult,
-    EntityResult,
     FactResult,
     SearchContextRequest,
     SearchContextResponse,
@@ -24,66 +22,51 @@ async def search_context(req: SearchContextRequest):
     """Search the knowledge graph for relevant context.
 
     Called synchronously by the Engage backend before each AI service call.
-    Returns entities, facts, contradictions, and segment insights.
+    Returns facts (edges) and segment insights.
+
+    Graphiti search returns EntityEdge objects — each represents a
+    temporal fact/relationship between two entities.
     """
     start = time.time()
 
     try:
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
 
-        # Search client graph
-        result = await graphiti_client.search(
+        # Search client graph — returns list[EntityEdge]
+        edges = await graphiti_client.search(
             client_slug=req.client_slug,
-            engagement_id=req.engagement_id,
             query=req.query,
             max_results=req.max_results,
         )
 
-        # Parse nodes into structured results
-        nodes: list[EntityResult] = []
+        # Parse EntityEdge objects into structured facts
         facts: list[FactResult] = []
-        contradictions: list[ContradictionResult] = []
-
-        raw_nodes = result.get("nodes", [])
-        for node in raw_nodes:
-            if hasattr(node, "name") and hasattr(node, "summary"):
-                nodes.append(
-                    EntityResult(
-                        name=node.name if hasattr(node, "name") else str(node),
-                        entity_type=getattr(node, "label", "Unknown"),
-                        properties={"summary": node.summary}
-                        if hasattr(node, "summary")
-                        else {},
-                        relevance_score=getattr(node, "score", 0.0),
-                    )
+        for edge in edges:
+            facts.append(
+                FactResult(
+                    subject=getattr(edge, "source_node_uuid", ""),
+                    predicate=getattr(edge, "name", ""),
+                    object=getattr(edge, "target_node_uuid", ""),
+                    fact=getattr(edge, "fact", ""),
+                    valid_from=getattr(edge, "valid_at", None),
+                    valid_to=getattr(edge, "invalid_at", None),
+                    expired_at=getattr(edge, "expired_at", None),
                 )
-            elif hasattr(node, "fact"):
-                facts.append(
-                    FactResult(
-                        subject=getattr(node, "source_node_name", ""),
-                        predicate=getattr(node, "name", ""),
-                        object=getattr(node, "target_node_name", ""),
-                        valid_from=getattr(node, "valid_at", None),
-                        valid_to=getattr(node, "invalid_at", None),
-                        confidence=getattr(node, "score", 0.0),
-                        source_description=getattr(node, "fact", ""),
-                    )
-                )
+            )
 
         # Search segment graph if requested
         segment_insights: list[str] = []
         if req.include_segment:
             try:
-                segment_results = await graphiti_client.search_segment(
+                segment_edges = await graphiti_client.search_segment(
                     industry="tribal_gaming",  # TODO: look up from client metadata
                     query=req.query,
                     max_results=5,
                 )
-                for item in segment_results:
-                    if hasattr(item, "summary"):
-                        segment_insights.append(item.summary)
-                    elif hasattr(item, "fact"):
-                        segment_insights.append(item.fact)
+                for edge in segment_edges:
+                    fact_text = getattr(edge, "fact", None)
+                    if fact_text:
+                        segment_insights.append(fact_text)
             except Exception as e:
                 logger.warning(f"[graphiti] Segment search skipped: {e}")
 
@@ -91,14 +74,12 @@ async def search_context(req: SearchContextRequest):
 
         logger.info(
             f"[graphiti] Search for '{req.query[:50]}...' in {graph_name}: "
-            f"{len(nodes)} nodes, {len(facts)} facts, "
+            f"{len(facts)} facts, "
             f"{len(segment_insights)} segment insights ({elapsed_ms:.0f}ms)"
         )
 
         return SearchContextResponse(
-            nodes=nodes[:req.max_results],
-            facts=facts[:15],  # Top-K limit per Gemini review
-            contradictions=contradictions,
+            facts=facts[:15],  # Top-K limit per plan
             segment_insights=segment_insights[:5],
             graph_name=graph_name,
             search_time_ms=elapsed_ms,

@@ -37,10 +37,14 @@ async def health_check():
         )
         status["falkordb"]["maxmemory_human"] = info.get("maxmemory_human", "unknown")
 
-        # Get list of graphs
-        graphs = await r.execute_command("GRAPH.LIST")
-        status["falkordb"]["graphs"] = graphs if graphs else []
-        status["falkordb"]["graph_count"] = len(graphs) if graphs else 0
+        # Get list of graphs (FalkorDB-specific command)
+        try:
+            graphs = await r.execute_command("GRAPH.LIST")
+            status["falkordb"]["graphs"] = graphs if graphs else []
+            status["falkordb"]["graph_count"] = len(graphs) if graphs else 0
+        except Exception:
+            status["falkordb"]["graphs"] = []
+            status["falkordb"]["graph_count"] = 0
 
         await r.aclose()
     except Exception as e:
