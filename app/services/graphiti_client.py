@@ -9,6 +9,8 @@ import yaml
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType as GraphitiEpisodeType
 from graphiti_core.driver.falkordb_driver import FalkorDriver
+from graphiti_core.llm_client.anthropic_client import AnthropicClient
+from graphiti_core.llm_client.config import LLMConfig
 
 from app.config import settings
 
@@ -41,6 +43,16 @@ def _load_entity_types() -> list[dict[str, str]]:
         return []
 
 
+def _create_llm_client() -> AnthropicClient:
+    """Create Anthropic LLM client for entity extraction (Sonnet 4.6)."""
+    return AnthropicClient(
+        config=LLMConfig(
+            api_key=settings.anthropic_api_key,
+            model=settings.graphiti_llm_model,
+        )
+    )
+
+
 def _create_driver(graph_name: str) -> FalkorDriver:
     """Create a FalkorDB driver targeting a specific named graph."""
     return FalkorDriver(
@@ -62,7 +74,8 @@ async def get_client(client_slug: str) -> Graphiti:
     if graph_name not in _clients:
         logger.info(f"[graphiti] Initializing graph: {graph_name}")
         driver = _create_driver(graph_name)
-        client = Graphiti(graph_driver=driver)
+        llm_client = _create_llm_client()
+        client = Graphiti(graph_driver=driver, llm_client=llm_client)
         _clients[graph_name] = client
 
     return _clients[graph_name]
@@ -75,7 +88,8 @@ async def get_segment_client(industry: str) -> Graphiti:
     if graph_name not in _clients:
         logger.info(f"[graphiti] Initializing segment graph: {graph_name}")
         driver = _create_driver(graph_name)
-        client = Graphiti(graph_driver=driver)
+        llm_client = _create_llm_client()
+        client = Graphiti(graph_driver=driver, llm_client=llm_client)
         _clients[graph_name] = client
 
     return _clients[graph_name]

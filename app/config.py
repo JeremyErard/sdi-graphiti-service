@@ -9,9 +9,9 @@ class Settings(BaseSettings):
     falkordb_port: int = 6379
     falkordb_password: str = ""
 
-    # LLM for entity extraction (Haiku for cost efficiency)
+    # LLM for entity extraction (Sonnet — better reasoning for contradictions/ambiguity)
     anthropic_api_key: str = ""
-    graphiti_llm_model: str = "claude-haiku-4-5-20251001"
+    graphiti_llm_model: str = "claude-sonnet-4-6"
 
     # OpenAI for embeddings (Graphiti default)
     openai_api_key: str = ""
