@@ -1,0 +1,49 @@
+# Entity types for SDI Engage consulting engagements
+# These define what Graphiti extracts from episodes
+
+entity_types:
+  # People
+  - name: Stakeholder
+    description: "Client organization employee, leader, or contact involved in the engagement"
+  - name: Consultant
+    description: "SDI team member working the engagement"
+
+  # Organizational
+  - name: Department
+    description: "Organizational unit, division, or team within the client organization"
+  - name: Role
+    description: "Job function, position, or title within the organization"
+
+  # Process
+  - name: Process
+    description: "Business process, workflow, or procedure within the organization"
+  - name: System
+    description: "Technology system, software tool, or platform used by the organization"
+
+  # Knowledge
+  - name: Finding
+    description: "Engagement finding, insight, observation, or conclusion"
+  - name: PainPoint
+    description: "Identified problem, challenge, friction, bottleneck, or gap"
+  - name: Opportunity
+    description: "Improvement opportunity, recommendation, or potential enhancement"
+
+  # Compliance & Governance
+  - name: Regulation
+    description: "Regulatory requirement, compliance standard, or governing authority rule"
+  - name: Policy
+    description: "Internal policy, standard operating procedure, or organizational rule"
+
+  # Deliverables
+  - name: Deliverable
+    description: "Engagement output, artifact, report, or work product"
+
+  # Strategy
+  - name: Decision
+    description: "Key decision made or pending, including rationale and stakeholders involved"
+  - name: Metric
+    description: "KPI, performance metric, measurement, or benchmark"
+  - name: Goal
+    description: "Strategic objective, target, or desired outcome"
+  - name: Risk
+    description: "Identified risk, threat, vulnerability, or concern requiring mitigation"
