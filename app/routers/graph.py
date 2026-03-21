@@ -3,9 +3,9 @@
 import logging
 from typing import Any
 
-from falkordb import FalkorDB
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from redis import Redis
 
 from app.config import settings
 
@@ -50,129 +50,137 @@ class GraphDataResponse(BaseModel):
 
 @router.post("/nodes-and-edges", response_model=GraphDataResponse)
 async def get_graph_data(req: GraphDataRequest):
-    """Return all nodes and edges from a client's knowledge graph for visualization."""
+    """Return all nodes and edges from a client's knowledge graph for visualization.
+
+    Uses the Redis protocol to query FalkorDB directly via GRAPH.QUERY command.
+    """
     graph_name = _graph_name_for_client(req.client_slug)
 
     try:
-        db = FalkorDB(
+        # Connect via Redis protocol (same as FalkorDB driver)
+        r = Redis(
             host=settings.falkordb_host,
             port=settings.falkordb_port,
             password=settings.falkordb_password or None,
+            decode_responses=True,
+            socket_timeout=30,
         )
-        graph = db.select_graph(graph_name)
 
         # Query all nodes
-        node_result = graph.query(
-            f"MATCH (n) RETURN n LIMIT {req.max_nodes}"
-        )
+        node_query = f"MATCH (n) RETURN n LIMIT {req.max_nodes}"
+        node_result = r.execute_command("GRAPH.QUERY", graph_name, node_query)
 
         nodes: list[GraphNode] = []
         node_ids: set[str] = set()
 
-        for record in node_result.result_set:
-            node = record[0]
-            props = dict(node.properties) if hasattr(node, 'properties') else {}
-            node_id = str(props.get('uuid', props.get('id', node.id)))
-            name = str(props.get('name', props.get('label', f'Node {node.id}')))
+        # FalkorDB GRAPH.QUERY returns [header, data, stats]
+        if len(node_result) >= 2:
+            for record in node_result[1]:
+                # Each record is a list with one node
+                # Node format varies — extract properties
+                node_data = record[0] if isinstance(record, list) else record
 
-            # Determine node type from labels
-            labels = node.labels if hasattr(node, 'labels') else []
-            node_type = labels[0].lower() if labels else 'entity'
+                # Parse node properties from the result
+                props = {}
+                name = "Unknown"
+                node_id = ""
+                node_type = "entity"
 
-            # Map Graphiti labels to visualization types
-            type_map = {
-                'entity': 'entity',
-                'entitynode': 'entity',
-                'episode': 'episode',
-                'episodenode': 'episode',
-                'community': 'community',
-                'communitynode': 'community',
-            }
-            mapped_type = type_map.get(node_type, node_type)
+                if isinstance(node_data, list):
+                    # FalkorDB returns [labels, properties] for nodes
+                    if len(node_data) >= 3:
+                        labels = node_data[0] if isinstance(node_data[0], list) else [node_data[0]]
+                        # Properties are key-value pairs
+                        prop_data = node_data[2] if len(node_data) > 2 else node_data[1]
+                        if isinstance(prop_data, list):
+                            for i in range(0, len(prop_data), 2):
+                                if i + 1 < len(prop_data):
+                                    props[str(prop_data[i])] = prop_data[i + 1]
 
-            # Try to infer a more specific type from the name/properties
-            name_lower = name.lower()
-            if any(d in name_lower for d in ['audit', 'licensing', 'compliance', 'enforcement', 'executive', 'gaming technology']):
-                if 'department' in name_lower or 'division' in name_lower:
-                    mapped_type = 'department'
-            if any(s in name_lower for s in ['permitrak', 'filemaker', 'teammate', 'key traka', 'igt', 'system', 'software']):
-                mapped_type = 'system'
-            if mapped_type == 'entity':
-                # Check summary/description for type hints
+                        node_id = str(props.get('uuid', props.get('id', str(id(node_data)))))
+                        name = str(props.get('name', props.get('label', f'Node')))
+
+                        if labels:
+                            label = str(labels[0]).lower() if labels[0] else 'entity'
+                            if 'entity' in label:
+                                node_type = 'entity'
+                            elif 'episode' in label:
+                                node_type = 'episode'
+                            elif 'community' in label:
+                                node_type = 'community'
+
+                if not node_id:
+                    continue
+
+                # Infer type from name/properties
+                name_lower = name.lower()
                 summary = str(props.get('summary', '')).lower()
-                if any(w in summary for w in ['pain', 'problem', 'issue', 'challenge', 'friction']):
-                    mapped_type = 'pain_point'
-                elif any(w in summary for w in ['opportunity', 'improve', 'potential', 'automat']):
-                    mapped_type = 'opportunity'
-                elif any(w in summary for w in ['process', 'workflow', 'procedure', 'step']):
-                    mapped_type = 'process'
-                elif any(w in summary for w in ['person', 'director', 'manager', 'inspector', 'specialist']):
-                    mapped_type = 'person'
 
-            if node_id not in node_ids:
-                node_ids.add(node_id)
-                # Clean properties for JSON serialization
-                clean_props = {}
-                for k, v in props.items():
-                    if k not in ('uuid', 'id', 'name', 'label'):
-                        try:
-                            clean_props[k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
-                        except:
-                            clean_props[k] = str(v)
+                if any(d in name_lower for d in ['audit', 'licensing', 'compliance', 'enforcement', 'executive', 'gaming technology']):
+                    if 'department' in name_lower or 'division' in name_lower or 'director' in summary:
+                        node_type = 'department'
+                if any(s in name_lower for s in ['permitrak', 'filemaker', 'teammate', 'key traka', 'igt', 'software']):
+                    node_type = 'system'
+                if node_type == 'entity':
+                    if any(w in summary for w in ['pain', 'problem', 'issue', 'challenge', 'friction']):
+                        node_type = 'pain_point'
+                    elif any(w in summary for w in ['opportunity', 'improve', 'potential', 'automat']):
+                        node_type = 'opportunity'
+                    elif any(w in summary for w in ['process', 'workflow', 'procedure']):
+                        node_type = 'process'
+                    elif any(w in summary for w in ['person', 'director', 'manager', 'inspector']):
+                        node_type = 'person'
 
-                nodes.append(GraphNode(
-                    id=node_id,
-                    name=name,
-                    type=mapped_type,
-                    properties=clean_props,
-                ))
+                if node_id not in node_ids:
+                    node_ids.add(node_id)
+                    clean_props = {}
+                    for k, v in props.items():
+                        if k not in ('uuid', 'id', 'name'):
+                            try:
+                                clean_props[k] = str(v)[:200] if isinstance(v, str) and len(str(v)) > 200 else v
+                            except:
+                                pass
 
-        # Query all edges between the retrieved nodes
-        edge_result = graph.query(
-            f"MATCH (a)-[r]->(b) RETURN a, r, b LIMIT {req.max_nodes * 3}"
-        )
+                    nodes.append(GraphNode(
+                        id=node_id,
+                        name=name,
+                        type=node_type,
+                        properties=clean_props,
+                    ))
+
+        # Query all edges
+        edge_query = f"MATCH (a)-[r]->(b) RETURN a.uuid, type(r), b.uuid, r.fact LIMIT {req.max_nodes * 3}"
+        edge_result = r.execute_command("GRAPH.QUERY", graph_name, edge_query)
 
         edges: list[GraphEdge] = []
         edge_ids: set[str] = set()
 
-        for record in edge_result.result_set:
-            src_node = record[0]
-            rel = record[1]
-            tgt_node = record[2]
+        if len(edge_result) >= 2:
+            for record in edge_result[1]:
+                if len(record) >= 3:
+                    src_id = str(record[0]) if record[0] else ""
+                    rel_type = str(record[1]) if record[1] else "RELATED_TO"
+                    tgt_id = str(record[2]) if record[2] else ""
+                    fact = str(record[3]) if len(record) > 3 and record[3] else ""
 
-            src_props = dict(src_node.properties) if hasattr(src_node, 'properties') else {}
-            tgt_props = dict(tgt_node.properties) if hasattr(tgt_node, 'properties') else {}
-            rel_props = dict(rel.properties) if hasattr(rel, 'properties') else {}
+                    if not src_id or not tgt_id:
+                        continue
 
-            src_id = str(src_props.get('uuid', src_props.get('id', src_node.id)))
-            tgt_id = str(tgt_props.get('uuid', tgt_props.get('id', tgt_node.id)))
-            rel_type = rel.relation if hasattr(rel, 'relation') else 'RELATED_TO'
+                    edge_id = f"{src_id}-{rel_type}-{tgt_id}"
+                    if edge_id in edge_ids:
+                        continue
+                    edge_ids.add(edge_id)
 
-            edge_id = f"{src_id}-{rel_type}-{tgt_id}"
-            if edge_id in edge_ids:
-                continue
-            edge_ids.add(edge_id)
+                    if src_id in node_ids and tgt_id in node_ids:
+                        edges.append(GraphEdge(
+                            id=edge_id,
+                            source=src_id,
+                            target=tgt_id,
+                            label=rel_type,
+                            fact=fact,
+                        ))
 
-            fact = str(rel_props.get('fact', ''))
-
-            # Only include edges where both nodes are in our node set
-            if src_id in node_ids and tgt_id in node_ids:
-                clean_props = {}
-                for k, v in rel_props.items():
-                    if k != 'fact':
-                        try:
-                            clean_props[k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
-                        except:
-                            clean_props[k] = str(v)
-
-                edges.append(GraphEdge(
-                    id=edge_id,
-                    source=src_id,
-                    target=tgt_id,
-                    label=rel_type,
-                    fact=fact,
-                    properties=clean_props,
-                ))
+        r.close()
 
         logger.info(f"[graph] Retrieved {len(nodes)} nodes, {len(edges)} edges from {graph_name}")
 
