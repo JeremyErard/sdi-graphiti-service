@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import settings
-from app.routers import admin, health, ingest, search
+from app.routers import admin, graph, health, ingest, search
 from app.services import graphiti_client
 
 # Configure logging
@@ -40,3 +40,4 @@ app.include_router(health.router, tags=["health"])
 app.include_router(ingest.router, prefix="/ingest", tags=["ingestion"])
 app.include_router(search.router, prefix="/search", tags=["search"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
+app.include_router(graph.router, prefix="/graph", tags=["graph"])
