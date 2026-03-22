@@ -82,28 +82,53 @@ class GraphDataResponse(BaseModel):
 
 def _infer_type(name: str, summary: str) -> str:
     """Infer a visualization-friendly node type from name and summary."""
-    name_lower = name.lower()
+    name_lower = name.lower().strip()
     summary_lower = summary.lower()
 
-    # Department detection
-    dept_keywords = ['audit', 'licensing', 'compliance', 'enforcement', 'executive', 'gaming technology', 'investigations']
-    if any(d in name_lower for d in dept_keywords):
-        if any(w in name_lower or w in summary_lower for w in ['department', 'division', 'director', 'unit']):
-            return 'department'
+    # Department detection — strict allowlist, not keyword matching
+    ACTUAL_DEPARTMENTS = [
+        'internal audit', 'audit department',
+        'compliance & enforcement', 'compliance and enforcement', 'compliance and enforcement department', 'c&e',
+        'licensing & investigations', 'licensing and investigations', 'licensing and investigation division',
+        'licensing department', 'compliance department',
+        'gaming technology', 'gaming technology department', 'gtu',
+        'executive', 'executive office',
+        'pokagon band gaming commission', 'pbgc',
+        'casino operations', 'surveillance', 'surveillance department',
+        'human resources', 'hr', 'information technology', 'it department',
+    ]
+    if name_lower in ACTUAL_DEPARTMENTS:
+        return 'department'
+
+    # Person detection — job titles and named individuals
+    person_indicators = ['director of', 'chief', 'manager', 'specialist', 'investigator', 'inspector',
+                         'assistant', 'commissioner', 'auditor', 'supervisor', 'officer']
+    if any(name_lower.startswith(p) for p in person_indicators):
+        return 'person'
+    # Named people (First Last pattern with summary mentioning "holds" or "serves")
+    if any(w in summary_lower for w in ['holds this role', 'holds the position', 'serves as', 'reporting to']):
+        return 'person'
 
     # System detection
-    sys_keywords = ['permitrak', 'filemaker', 'teammate', 'key traka', 'igt', 'table manager', 'premisys', 'software', 'system']
+    sys_keywords = ['permitrak', 'filemaker', 'fmp', 'teammate', 'teamrisk', 'teamschedule',
+                    'key traka', 'traka', 'igt', 'table manager', 'premisys', 'sharepoint',
+                    'sharefile', 'active directory', 'vmware', 'adp', 'zendesk', 'excel',
+                    'casino cash trac', 'casino tables accounting', 'kambi', 'crossmatch',
+                    'barracuda', 'infogenesis', 'itraq', 'kiteworks', 'powerkiosk',
+                    'geocomply', 'pala interactive']
     if any(s in name_lower for s in sys_keywords):
+        return 'system'
+    if 'software' in name_lower or 'platform' in name_lower or 'application' in name_lower:
         return 'system'
 
     # Content-based inference
-    if any(w in summary_lower for w in ['pain', 'problem', 'issue', 'challenge', 'friction', 'struggle']):
+    if any(w in summary_lower for w in ['pain', 'problem', 'issue', 'challenge', 'friction', 'struggle', 'failure', 'crisis']):
         return 'pain_point'
-    if any(w in summary_lower for w in ['opportunity', 'improve', 'potential', 'automat', 'recommend']):
+    if any(w in summary_lower for w in ['opportunity', 'improve', 'potential', 'automat', 'recommend', 'should consider']):
         return 'opportunity'
-    if any(w in summary_lower for w in ['process', 'workflow', 'procedure', 'step', 'lifecycle']):
+    if any(w in summary_lower for w in ['process', 'workflow', 'procedure', 'step', 'lifecycle', 'policy', 'protocol']):
         return 'process'
-    if any(w in summary_lower for w in ['person', 'director', 'manager', 'inspector', 'specialist', 'commissioner']):
+    if any(w in summary_lower for w in ['person', 'employee', 'staff member']):
         return 'person'
 
     return 'entity'
