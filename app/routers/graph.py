@@ -1,16 +1,13 @@
-"""Graph traversal endpoints for Knowledge Map visualization.
-
-Uses lazy initialization with strict socket timeouts to prevent
-startup hangs. Connection to FalkorDB only happens when the
-endpoint is actually called, not at import/startup time.
-"""
+"""Graph traversal endpoints for Knowledge Map visualization."""
 
 import logging
-import os
 from typing import Any
 
+from falkordb import FalkorDB
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+from app.config import settings
 
 logger = logging.getLogger("graphiti_service")
 
@@ -20,36 +17,6 @@ router = APIRouter()
 def _graph_name_for_client(client_slug: str) -> str:
     safe_slug = "".join(c for c in client_slug if c.isalnum() or c == "_").lower()
     return f"client_{safe_slug}"
-
-
-def _get_redis_connection():
-    """Lazy connection with strict 5-second socket timeout.
-
-    Never called at import time — only when the endpoint is hit.
-    Fails fast and loudly if FalkorDB is unreachable.
-    """
-    from redis import Redis
-
-    host = os.getenv("FALKORDB_HOST", "localhost")
-    port = int(os.getenv("FALKORDB_PORT", "6379"))
-    password = os.getenv("FALKORDB_PASSWORD", None)
-
-    try:
-        r = Redis(
-            host=host,
-            port=port,
-            password=password,
-            decode_responses=True,
-            socket_connect_timeout=5.0,
-            socket_timeout=15.0,
-        )
-        # Test connection immediately
-        r.ping()
-        logger.info(f"[graph] Connected to FalkorDB at {host}:{port}")
-        return r
-    except Exception as e:
-        logger.error(f"[graph] FalkorDB connection failed ({host}:{port}): {e}")
-        raise HTTPException(status_code=503, detail=f"Knowledge graph database unreachable: {str(e)}")
 
 
 class GraphDataRequest(BaseModel):
@@ -70,6 +37,7 @@ class GraphEdge(BaseModel):
     target: str
     label: str
     fact: str = ""
+    properties: dict[str, Any] = {}
 
 
 class GraphDataResponse(BaseModel):
@@ -80,130 +48,122 @@ class GraphDataResponse(BaseModel):
     edge_count: int
 
 
-def _infer_type(name: str, summary: str) -> str:
-    """Infer a visualization-friendly node type from name and summary."""
-    name_lower = name.lower().strip()
-    summary_lower = summary.lower()
-
-    # Department detection — strict allowlist, not keyword matching
-    ACTUAL_DEPARTMENTS = [
-        'internal audit', 'audit department',
-        'compliance & enforcement', 'compliance and enforcement', 'compliance and enforcement department', 'c&e',
-        'licensing & investigations', 'licensing and investigations', 'licensing and investigation division',
-        'licensing department', 'compliance department',
-        'gaming technology', 'gaming technology department', 'gtu',
-        'executive', 'executive office',
-        'pokagon band gaming commission', 'pbgc',
-        'casino operations', 'surveillance', 'surveillance department',
-        'human resources', 'hr', 'information technology', 'it department',
-    ]
-    if name_lower in ACTUAL_DEPARTMENTS:
-        return 'department'
-
-    # Person detection — job titles and named individuals
-    person_indicators = ['director of', 'chief', 'manager', 'specialist', 'investigator', 'inspector',
-                         'assistant', 'commissioner', 'auditor', 'supervisor', 'officer']
-    if any(name_lower.startswith(p) for p in person_indicators):
-        return 'person'
-    # Named people (First Last pattern with summary mentioning "holds" or "serves")
-    if any(w in summary_lower for w in ['holds this role', 'holds the position', 'serves as', 'reporting to']):
-        return 'person'
-
-    # System detection
-    sys_keywords = ['permitrak', 'filemaker', 'fmp', 'teammate', 'teamrisk', 'teamschedule',
-                    'key traka', 'traka', 'igt', 'table manager', 'premisys', 'sharepoint',
-                    'sharefile', 'active directory', 'vmware', 'adp', 'zendesk', 'excel',
-                    'casino cash trac', 'casino tables accounting', 'kambi', 'crossmatch',
-                    'barracuda', 'infogenesis', 'itraq', 'kiteworks', 'powerkiosk',
-                    'geocomply', 'pala interactive']
-    if any(s in name_lower for s in sys_keywords):
-        return 'system'
-    if 'software' in name_lower or 'platform' in name_lower or 'application' in name_lower:
-        return 'system'
-
-    # Content-based inference
-    if any(w in summary_lower for w in ['pain', 'problem', 'issue', 'challenge', 'friction', 'struggle', 'failure', 'crisis']):
-        return 'pain_point'
-    if any(w in summary_lower for w in ['opportunity', 'improve', 'potential', 'automat', 'recommend', 'should consider']):
-        return 'opportunity'
-    if any(w in summary_lower for w in ['process', 'workflow', 'procedure', 'step', 'lifecycle', 'policy', 'protocol']):
-        return 'process'
-    if any(w in summary_lower for w in ['person', 'employee', 'staff member']):
-        return 'person'
-
-    return 'entity'
-
-
 @router.post("/nodes-and-edges", response_model=GraphDataResponse)
 async def get_graph_data(req: GraphDataRequest):
-    """Return all nodes and edges from a client's knowledge graph."""
+    """Return all nodes and edges from a client's knowledge graph for visualization."""
     graph_name = _graph_name_for_client(req.client_slug)
-    r = _get_redis_connection()
 
     try:
-        # Query nodes via GRAPH.QUERY
-        logger.info(f"[graph] Querying nodes from {graph_name} (limit {req.max_nodes})")
-        node_result = r.execute_command(
-            "GRAPH.QUERY", graph_name,
-            f"MATCH (n) RETURN id(n), labels(n), n.uuid, n.name, n.summary LIMIT {req.max_nodes}"
+        db = FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+        graph = db.select_graph(graph_name)
+
+        # Query all nodes
+        node_result = graph.query(
+            f"MATCH (n) RETURN n LIMIT {req.max_nodes}"
         )
 
         nodes: list[GraphNode] = []
         node_ids: set[str] = set()
 
-        # GRAPH.QUERY returns [header, data, stats]
-        if len(node_result) >= 2 and node_result[1]:
-            for record in node_result[1]:
-                internal_id = str(record[0]) if record[0] is not None else ""
-                labels = record[1] if isinstance(record[1], list) else []
-                uuid = str(record[2]) if record[2] else internal_id
-                name = str(record[3]) if record[3] else f"Node {internal_id}"
-                summary = str(record[4]) if record[4] else ""
+        for record in node_result.result_set:
+            node = record[0]
+            props = dict(node.properties) if hasattr(node, 'properties') else {}
+            node_id = str(props.get('uuid', props.get('id', node.id)))
+            name = str(props.get('name', props.get('label', f'Node {node.id}')))
 
-                if not uuid or uuid in node_ids:
-                    continue
+            # Determine node type from labels
+            labels = node.labels if hasattr(node, 'labels') else []
+            node_type = labels[0].lower() if labels else 'entity'
 
-                # Skip Graphiti internal nodes
-                label_str = str(labels).lower() if labels else ""
-                if 'episode' in label_str or 'community' in label_str:
-                    continue
+            # Map Graphiti labels to visualization types
+            type_map = {
+                'entity': 'entity',
+                'entitynode': 'entity',
+                'episode': 'episode',
+                'episodenode': 'episode',
+                'community': 'community',
+                'communitynode': 'community',
+            }
+            mapped_type = type_map.get(node_type, node_type)
 
-                node_type = _infer_type(name, summary)
-                node_ids.add(uuid)
+            # Try to infer a more specific type from the name/properties
+            name_lower = name.lower()
+            if any(d in name_lower for d in ['audit', 'licensing', 'compliance', 'enforcement', 'executive', 'gaming technology']):
+                if 'department' in name_lower or 'division' in name_lower:
+                    mapped_type = 'department'
+            if any(s in name_lower for s in ['permitrak', 'filemaker', 'teammate', 'key traka', 'igt', 'system', 'software']):
+                mapped_type = 'system'
+            if mapped_type == 'entity':
+                # Check summary/description for type hints
+                summary = str(props.get('summary', '')).lower()
+                if any(w in summary for w in ['pain', 'problem', 'issue', 'challenge', 'friction']):
+                    mapped_type = 'pain_point'
+                elif any(w in summary for w in ['opportunity', 'improve', 'potential', 'automat']):
+                    mapped_type = 'opportunity'
+                elif any(w in summary for w in ['process', 'workflow', 'procedure', 'step']):
+                    mapped_type = 'process'
+                elif any(w in summary for w in ['person', 'director', 'manager', 'inspector', 'specialist']):
+                    mapped_type = 'person'
+
+            if node_id not in node_ids:
+                node_ids.add(node_id)
+                # Clean properties for JSON serialization
+                clean_props = {}
+                for k, v in props.items():
+                    if k not in ('uuid', 'id', 'name', 'label'):
+                        try:
+                            clean_props[k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                        except:
+                            clean_props[k] = str(v)
 
                 nodes.append(GraphNode(
-                    id=uuid,
+                    id=node_id,
                     name=name,
-                    type=node_type,
-                    properties={"summary": summary[:200]} if summary else {},
+                    type=mapped_type,
+                    properties=clean_props,
                 ))
 
-        # Query edges
-        logger.info(f"[graph] Querying edges from {graph_name}")
-        edge_result = r.execute_command(
-            "GRAPH.QUERY", graph_name,
-            f"MATCH (a)-[r]->(b) RETURN a.uuid, type(r), b.uuid, r.fact LIMIT {req.max_nodes * 3}"
+        # Query all edges between the retrieved nodes
+        edge_result = graph.query(
+            f"MATCH (a)-[r]->(b) RETURN a, r, b LIMIT {req.max_nodes * 3}"
         )
 
         edges: list[GraphEdge] = []
         edge_ids: set[str] = set()
 
-        if len(edge_result) >= 2 and edge_result[1]:
-            for record in edge_result[1]:
-                src_id = str(record[0]) if record[0] else ""
-                rel_type = str(record[1]) if record[1] else "RELATED_TO"
-                tgt_id = str(record[2]) if record[2] else ""
-                fact = str(record[3]) if len(record) > 3 and record[3] else ""
+        for record in edge_result.result_set:
+            src_node = record[0]
+            rel = record[1]
+            tgt_node = record[2]
 
-                if not src_id or not tgt_id:
-                    continue
-                if src_id not in node_ids or tgt_id not in node_ids:
-                    continue
+            src_props = dict(src_node.properties) if hasattr(src_node, 'properties') else {}
+            tgt_props = dict(tgt_node.properties) if hasattr(tgt_node, 'properties') else {}
+            rel_props = dict(rel.properties) if hasattr(rel, 'properties') else {}
 
-                edge_id = f"{src_id}-{rel_type}-{tgt_id}"
-                if edge_id in edge_ids:
-                    continue
-                edge_ids.add(edge_id)
+            src_id = str(src_props.get('uuid', src_props.get('id', src_node.id)))
+            tgt_id = str(tgt_props.get('uuid', tgt_props.get('id', tgt_node.id)))
+            rel_type = rel.relation if hasattr(rel, 'relation') else 'RELATED_TO'
+
+            edge_id = f"{src_id}-{rel_type}-{tgt_id}"
+            if edge_id in edge_ids:
+                continue
+            edge_ids.add(edge_id)
+
+            fact = str(rel_props.get('fact', ''))
+
+            # Only include edges where both nodes are in our node set
+            if src_id in node_ids and tgt_id in node_ids:
+                clean_props = {}
+                for k, v in rel_props.items():
+                    if k != 'fact':
+                        try:
+                            clean_props[k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                        except:
+                            clean_props[k] = str(v)
 
                 edges.append(GraphEdge(
                     id=edge_id,
@@ -211,11 +171,10 @@ async def get_graph_data(req: GraphDataRequest):
                     target=tgt_id,
                     label=rel_type,
                     fact=fact,
+                    properties=clean_props,
                 ))
 
-        r.close()
-
-        logger.info(f"[graph] Result: {len(nodes)} nodes, {len(edges)} edges from {graph_name}")
+        logger.info(f"[graph] Retrieved {len(nodes)} nodes, {len(edges)} edges from {graph_name}")
 
         return GraphDataResponse(
             nodes=nodes,
@@ -225,9 +184,6 @@ async def get_graph_data(req: GraphDataRequest):
             edge_count=len(edges),
         )
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"[graph] Query error on {graph_name}: {e}")
-        r.close()
-        raise HTTPException(status_code=500, detail=f"Graph query failed: {str(e)}")
+        logger.error(f"[graph] Error retrieving graph data from {graph_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve graph data: {str(e)}")
