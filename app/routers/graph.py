@@ -90,24 +90,72 @@ async def get_graph_data(req: GraphDataRequest):
             }
             mapped_type = type_map.get(node_type, node_type)
 
-            # Try to infer a more specific type from the name/properties
-            name_lower = name.lower()
-            if any(d in name_lower for d in ['audit', 'licensing', 'compliance', 'enforcement', 'executive', 'gaming technology']):
-                if 'department' in name_lower or 'division' in name_lower:
+            # ── Improved type inference ──
+            name_lower = name.lower().strip()
+            summary = str(props.get('summary', '')).lower()
+
+            # Known locations — NOT people
+            LOCATIONS = {'new buffalo', 'hartford', 'dowagiac', 'south bend', 'four winds'}
+            # Known documents/reports — NOT people
+            DOC_INDICATORS = ['document', 'report', 'dataset', 'checklist', 'template', 'spreadsheet',
+                              'analysis', '.xlsx', '.pdf', '.docx', 'combined', 'all stats']
+            # Known operational concepts — NOT people
+            CONCEPT_INDICATORS = ['shift', 'coverage', 'scheduling', 'staffing', 'volume', 'model',
+                                  'issuance', 'activity', 'incident report', 'coin-in', 'admission',
+                                  'wagering', 'drop', 'count', 'seal', 'shipment']
+            # Known organizational units — departments
+            DEPARTMENTS = {'internal audit', 'audit department', 'compliance & enforcement',
+                          'compliance and enforcement', 'c&e', 'compliance & enforcement (c&e)',
+                          'compliance and enforcement department', 'licensing & investigations',
+                          'licensing and investigations', 'licensing department', 'compliance department',
+                          'gaming technology', 'gaming technology department', 'gtu',
+                          'executive', 'executive office', 'casino operations', 'surveillance',
+                          'pokagon band gaming commission', 'pbgc', 'information technology',
+                          'licensing and investigation division', 'human resources'}
+            # Known systems
+            SYSTEMS = ['permitrak', 'filemaker', 'fmp', 'teammate', 'teamrisk', 'teamschedule',
+                       'key traka', 'traka', 'igt', 'table manager', 'premisys', 'sharefile',
+                       'active directory', 'vmware', 'adp', 'zendesk', 'kambi', 'crossmatch',
+                       'barracuda', 'infogenesis', 'itraq', 'kiteworks', 'powerkiosk', 'geocomply',
+                       'pala interactive', 'casino cash trac', 'ai integration']
+
+            if mapped_type == 'entity' or mapped_type == 'entitynode':
+                # 1. Department (strict allowlist)
+                if name_lower in DEPARTMENTS:
                     mapped_type = 'department'
-            if any(s in name_lower for s in ['permitrak', 'filemaker', 'teammate', 'key traka', 'igt', 'system', 'software']):
-                mapped_type = 'system'
-            if mapped_type == 'entity':
-                # Check summary/description for type hints
-                summary = str(props.get('summary', '')).lower()
-                if any(w in summary for w in ['pain', 'problem', 'issue', 'challenge', 'friction']):
-                    mapped_type = 'pain_point'
-                elif any(w in summary for w in ['opportunity', 'improve', 'potential', 'automat']):
-                    mapped_type = 'opportunity'
-                elif any(w in summary for w in ['process', 'workflow', 'procedure', 'step']):
+                # 2. Location
+                elif any(loc in name_lower for loc in LOCATIONS):
+                    mapped_type = 'entity'  # keep as generic entity, not person
+                # 3. Document/report
+                elif any(d in name_lower for d in DOC_INDICATORS):
+                    mapped_type = 'entity'
+                # 4. Operational concept
+                elif any(c in name_lower for c in CONCEPT_INDICATORS):
                     mapped_type = 'process'
-                elif any(w in summary for w in ['person', 'director', 'manager', 'inspector', 'specialist']):
-                    mapped_type = 'person'
+                # 5. System
+                elif any(s in name_lower for s in SYSTEMS):
+                    mapped_type = 'system'
+                # 6. Person — only if the name looks like a person name
+                #    (First Last pattern, or explicit role title prefix)
+                elif ' ' in name and len(name.split()) <= 4 and not any(c.isdigit() for c in name):
+                    # Check if summary says this is a person
+                    if any(w in summary for w in ['holds this role', 'holds the position', 'serves as',
+                                                   'reporting to', 'is a ', 'is the ']):
+                        mapped_type = 'person'
+                    # Check if it's a known role title
+                    elif any(name_lower.startswith(p) for p in ['director of', 'chief ', 'commissioner ']):
+                        mapped_type = 'person'
+                    # Otherwise check if summary strongly indicates a person (by name reference)
+                    elif any(w in summary for w in [' he ', ' she ', ' his ', ' her ', ' they ']):
+                        mapped_type = 'person'
+                # 7. Summary-based inference for remaining entities
+                if mapped_type == 'entity':
+                    if any(w in summary for w in ['pain', 'problem', 'crisis', 'failure', 'gap']):
+                        mapped_type = 'pain_point'
+                    elif any(w in summary for w in ['opportunity', 'should consider', 'recommend', 'potential']):
+                        mapped_type = 'opportunity'
+                    elif any(w in summary for w in ['process', 'workflow', 'procedure', 'lifecycle', 'protocol']):
+                        mapped_type = 'process'
 
             if node_id not in node_ids:
                 node_ids.add(node_id)
