@@ -3,7 +3,6 @@
 import logging
 from typing import Any
 
-from falkordb import FalkorDB
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -54,6 +53,7 @@ async def get_graph_data(req: GraphDataRequest):
     graph_name = _graph_name_for_client(req.client_slug)
 
     try:
+        from falkordb import FalkorDB
         db = FalkorDB(
             host=settings.falkordb_host,
             port=settings.falkordb_port,
