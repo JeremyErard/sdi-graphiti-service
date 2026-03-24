@@ -79,8 +79,8 @@ async def get_graph_data(req: GraphDataRequest):
             labels = node.labels if hasattr(node, 'labels') else []
             node_type = labels[0].lower() if labels else 'entity'
 
-            # Map Graphiti labels to visualization types
-            type_map = {
+            # ── Step 1: Map FalkorDB node labels to base types ──
+            LABEL_MAP = {
                 'entity': 'entity',
                 'entitynode': 'entity',
                 'episode': 'episode',
@@ -88,74 +88,71 @@ async def get_graph_data(req: GraphDataRequest):
                 'community': 'community',
                 'communitynode': 'community',
             }
-            mapped_type = type_map.get(node_type, node_type)
+            mapped_type = LABEL_MAP.get(node_type, node_type)
 
-            # ── Improved type inference ──
-            name_lower = name.lower().strip()
-            summary = str(props.get('summary', '')).lower()
+            # ── Step 2: Use Graphiti LLM-assigned entity_type (authoritative) ──
+            # Graphiti stores the domain-specific type from config.yaml
+            # in the entity_type property (e.g., "Stakeholder", "Department")
+            graphiti_type = str(props.get('entity_type', '')).strip()
 
-            # Known locations — NOT people
-            LOCATIONS = {'new buffalo', 'hartford', 'dowagiac', 'south bend', 'four winds'}
-            # Known documents/reports — NOT people
-            DOC_INDICATORS = ['document', 'report', 'dataset', 'checklist', 'template', 'spreadsheet',
-                              'analysis', '.xlsx', '.pdf', '.docx', 'combined', 'all stats']
-            # Known operational concepts — NOT people
-            CONCEPT_INDICATORS = ['shift', 'coverage', 'scheduling', 'staffing', 'volume', 'model',
-                                  'issuance', 'activity', 'incident report', 'coin-in', 'admission',
-                                  'wagering', 'drop', 'count', 'seal', 'shipment']
-            # Known organizational units — departments
-            DEPARTMENTS = {'internal audit', 'audit department', 'compliance & enforcement',
-                          'compliance and enforcement', 'c&e', 'compliance & enforcement (c&e)',
-                          'compliance and enforcement department', 'licensing & investigations',
-                          'licensing and investigations', 'licensing department', 'compliance department',
-                          'gaming technology', 'gaming technology department', 'gtu',
-                          'executive', 'executive office', 'casino operations', 'surveillance',
-                          'pokagon band gaming commission', 'pbgc', 'information technology',
-                          'licensing and investigation division', 'human resources'}
-            # Known systems
-            SYSTEMS = ['permitrak', 'filemaker', 'fmp', 'teammate', 'teamrisk', 'teamschedule',
-                       'key traka', 'traka', 'igt', 'table manager', 'premisys', 'sharefile',
-                       'active directory', 'vmware', 'adp', 'zendesk', 'kambi', 'crossmatch',
-                       'barracuda', 'infogenesis', 'itraq', 'kiteworks', 'powerkiosk', 'geocomply',
-                       'pala interactive', 'casino cash trac', 'ai integration']
+            GRAPHITI_TYPE_MAP = {
+                # People
+                'stakeholder': 'person',
+                'consultant': 'person',
+                # Organization
+                'department': 'department',
+                'role': 'role',
+                # Process & Technology
+                'process': 'process',
+                'system': 'system',
+                # Insights
+                'finding': 'theme',
+                'painpoint': 'pain_point',
+                'pain_point': 'pain_point',
+                # Opportunities
+                'opportunity': 'opportunity',
+                'goal': 'opportunity',
+                # Compliance
+                'regulation': 'regulation',
+                'policy': 'policy',
+                # Strategy
+                'decision': 'process',
+                'risk': 'pain_point',
+                'metric': 'metric',
+                # Deliverables
+                'deliverable': 'entity',
+            }
 
-            if mapped_type == 'entity' or mapped_type == 'entitynode':
-                # 1. Department (strict allowlist)
+            if graphiti_type and graphiti_type.lower() in GRAPHITI_TYPE_MAP:
+                mapped_type = GRAPHITI_TYPE_MAP[graphiti_type.lower()]
+            elif mapped_type in ('entity', 'entitynode'):
+                # ── Step 3: Heuristic fallback for nodes without entity_type ──
+                name_lower = name.lower().strip()
+                summary = str(props.get('summary', '')).lower()
+
+                DEPARTMENTS = {'internal audit', 'audit department', 'compliance & enforcement',
+                              'compliance and enforcement', 'c&e', 'compliance & enforcement (c&e)',
+                              'licensing & investigations', 'licensing and investigations',
+                              'gaming technology', 'gtu', 'executive', 'executive office',
+                              'casino operations', 'surveillance', 'pokagon band gaming commission',
+                              'pbgc', 'information technology', 'human resources'}
+
+                SYSTEMS = {'permitrak', 'filemaker', 'fmp', 'teammate', 'teamrisk', 'teamschedule',
+                          'key traka', 'traka', 'premisys', 'sharefile', 'active directory', 'vmware',
+                          'adp', 'zendesk', 'kambi', 'crossmatch', 'barracuda', 'infogenesis',
+                          'itraq', 'kiteworks', 'powerkiosk', 'geocomply', 'pala interactive',
+                          'casino cash trac', 'table manager', 'igt'}
+
                 if name_lower in DEPARTMENTS:
                     mapped_type = 'department'
-                # 2. Location
-                elif any(loc in name_lower for loc in LOCATIONS):
-                    mapped_type = 'entity'  # keep as generic entity, not person
-                # 3. Document/report
-                elif any(d in name_lower for d in DOC_INDICATORS):
-                    mapped_type = 'entity'
-                # 4. Operational concept
-                elif any(c in name_lower for c in CONCEPT_INDICATORS):
-                    mapped_type = 'process'
-                # 5. System
-                elif any(s in name_lower for s in SYSTEMS):
+                elif name_lower in SYSTEMS:
                     mapped_type = 'system'
-                # 6. Person — only if the name looks like a person name
-                #    (First Last pattern, or explicit role title prefix)
-                elif ' ' in name and len(name.split()) <= 4 and not any(c.isdigit() for c in name):
-                    # Check if summary says this is a person
-                    if any(w in summary for w in ['holds this role', 'holds the position', 'serves as',
-                                                   'reporting to', 'is a ', 'is the ']):
-                        mapped_type = 'person'
-                    # Check if it's a known role title
-                    elif any(name_lower.startswith(p) for p in ['director of', 'chief ', 'commissioner ']):
-                        mapped_type = 'person'
-                    # Otherwise check if summary strongly indicates a person (by name reference)
-                    elif any(w in summary for w in [' he ', ' she ', ' his ', ' her ', ' they ']):
-                        mapped_type = 'person'
-                # 7. Summary-based inference for remaining entities
-                if mapped_type == 'entity':
-                    if any(w in summary for w in ['pain', 'problem', 'crisis', 'failure', 'gap']):
-                        mapped_type = 'pain_point'
-                    elif any(w in summary for w in ['opportunity', 'should consider', 'recommend', 'potential']):
-                        mapped_type = 'opportunity'
-                    elif any(w in summary for w in ['process', 'workflow', 'procedure', 'lifecycle', 'protocol']):
-                        mapped_type = 'process'
+                elif any(w in summary for w in ['pain', 'problem', 'crisis', 'failure', 'gap']):
+                    mapped_type = 'pain_point'
+                elif any(w in summary for w in ['opportunity', 'should consider', 'recommend']):
+                    mapped_type = 'opportunity'
+                elif any(w in summary for w in ['process', 'workflow', 'procedure', 'protocol']):
+                    mapped_type = 'process'
 
             if node_id not in node_ids:
                 node_ids.add(node_id)
