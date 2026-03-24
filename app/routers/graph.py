@@ -159,42 +159,63 @@ async def get_graph_data(req: GraphDataRequest):
                           'hms', 'spasoft', 'filemakergo', 'filemaker go',
                           'igc skins', 'ez pay', 'campo'}
 
-                # ── Regulations (exact or keyword) ──
+                # ── Regulations / compliance items (name prefix or exact) ──
+                REGULATION_PREFIXES = ['sc-', 'fips ', 'fips-', 'cjis ', 'title 31',
+                                       'title-31', 'nist ', 'nigc ']
                 REGULATIONS = {'tribal gaming compact', 'gaming regulatory act',
                               'cjis security policy', 'nigc', 'title 31', 'title-31',
-                              'bsa', 'bank secrecy act', 'fips'}
+                              'bsa', 'bank secrecy act'}
 
+                # ── Policy / configuration items (name contains) ──
+                POLICY_INDICATORS = ['policy', 'lockout', 'configuration',
+                                     'audit checklist', 'security checklist',
+                                     'sop', 'standard operating']
+
+                # 1. Department (exact)
                 if name_lower in DEPARTMENTS:
                     mapped_type = 'department'
+                # 2. System (exact)
                 elif name_lower in SYSTEMS:
                     mapped_type = 'system'
-                elif name_lower in REGULATIONS:
+                # 3. Regulation (exact or prefix — BEFORE summary-based system)
+                elif name_lower in REGULATIONS or any(name_lower.startswith(p) for p in REGULATION_PREFIXES):
                     mapped_type = 'regulation'
-                # Summary-based: prioritize strong signals
+                # 4. Policy (name contains indicator — BEFORE summary-based system)
+                elif any(p in name_lower for p in POLICY_INDICATORS):
+                    mapped_type = 'policy'
+                # 5. Pain points (strong signals)
                 elif any(w in summary for w in ['failed', 'broken', 'defect', 'error',
                         'falsified', 'breach', 'vulnerability', 'violation']):
                     mapped_type = 'pain_point'
                 elif any(w in summary for w in ['pain point', 'problem', 'crisis',
                         'gap', 'missing', 'absent', 'no documentation']):
                     mapped_type = 'pain_point'
+                # 6. Opportunity
                 elif any(w in summary for w in ['opportunity', 'should consider',
                         'recommend', 'potential benefit', 'could improve']):
                     mapped_type = 'opportunity'
+                # 7. Regulation (summary-based — BEFORE system)
+                elif any(w in summary for w in ['regulation', 'compliance standard',
+                        'regulatory requirement', 'compact', 'statute',
+                        'cjis', 'nist', 'security policy area']):
+                    mapped_type = 'regulation'
+                # 8. Policy (summary-based — BEFORE system)
+                elif any(w in summary for w in ['policy', 'standard operating',
+                        'internal rule', 'directive', 'security control',
+                        'configuration requirement']):
+                    mapped_type = 'policy'
+                # 9. System (summary-based)
                 elif any(w in summary for w in ['software', 'platform', 'application',
-                        'database', 'module', 'system used', 'technology']):
+                        'database', 'system used']):
                     mapped_type = 'system'
+                # 10. Process
                 elif any(w in summary for w in ['process', 'workflow', 'procedure',
-                        'protocol', 'lifecycle', 'checklist', 'steps to']):
+                        'protocol', 'lifecycle', 'steps to']):
                     mapped_type = 'process'
+                # 11. Department (summary-based)
                 elif any(w in summary for w in ['department', 'division', 'team',
                         'unit within', 'organizational']):
                     mapped_type = 'department'
-                elif any(w in summary for w in ['regulation', 'compliance standard',
-                        'regulatory requirement', 'compact', 'statute']):
-                    mapped_type = 'regulation'
-                elif any(w in summary for w in ['policy', 'standard operating',
-                        'internal rule', 'directive']):
-                    mapped_type = 'policy'
 
             if node_id not in node_ids:
                 node_ids.add(node_id)
