@@ -90,10 +90,16 @@ async def get_graph_data(req: GraphDataRequest):
             }
             mapped_type = LABEL_MAP.get(node_type, node_type)
 
-            # ── Step 2: Use Graphiti LLM-assigned entity_type (authoritative) ──
-            # Graphiti stores the domain-specific type from config.yaml
-            # in the entity_type property (e.g., "Stakeholder", "Department")
-            graphiti_type = str(props.get('entity_type', '')).strip()
+            # ── Step 2: Use Graphiti LLM-assigned type (authoritative) ──
+            # Graphiti stores domain-specific types from config.yaml in the
+            # 'labels' property (e.g., "Stakeholder", "Department", "System")
+            # This is distinct from node.labels which is the FalkorDB graph label.
+            graphiti_labels = props.get('labels', '')
+            # labels may be a string or list; normalize to string
+            if isinstance(graphiti_labels, list):
+                graphiti_type = graphiti_labels[0] if graphiti_labels else ''
+            else:
+                graphiti_type = str(graphiti_labels).strip()
 
             GRAPHITI_TYPE_MAP = {
                 # People
