@@ -159,51 +159,56 @@ async def get_graph_data(req: GraphDataRequest):
                           'hms', 'spasoft', 'filemakergo', 'filemaker go',
                           'igc skins', 'ez pay', 'campo'}
 
-                # ── Regulations / compliance items (name prefix or exact) ──
-                REGULATION_PREFIXES = ['sc-', 'fips ', 'fips-', 'cjis ', 'title 31',
-                                       'title-31', 'nist ', 'nigc ']
+                # ── Regulations (NIST/CJIS security controls by name prefix) ──
+                REGULATION_PREFIXES = ['sc-', 'ac-', 'ia-', 'au-', 'at-',
+                                       'si-', 'ma-', 'mp-', 'pe-', 'ps-',
+                                       'cm-', 'cp-', 'ir-', 'ra-', 'ca-',
+                                       'pl-', 'sa-', 'pm-']  # NIST 800-53 families
                 REGULATIONS = {'tribal gaming compact', 'gaming regulatory act',
-                              'cjis security policy', 'nigc', 'title 31', 'title-31',
-                              'bsa', 'bank secrecy act'}
+                              'cjis security policy', 'nist sp 800-53',
+                              'title 31', 'title-31', 'bsa', 'bank secrecy act'}
 
-                # ── Policy / configuration items (name contains) ──
-                POLICY_INDICATORS = ['policy', 'lockout', 'configuration',
-                                     'audit checklist', 'security checklist',
-                                     'sop', 'standard operating']
+                # ── Technologies (NOT regulations even if mentioned alongside CJIS) ──
+                TECHNOLOGIES = {'javascript', 'java applets', 'html5', 'vbscript',
+                               'webgl', 'vpn', 'virtual private network', 'dnssec',
+                               'public key infrastructure', 'dmz', 'aes',
+                               'demilitarized zone network', 'tls', 'ssl'}
 
-                # 1. Department (exact)
-                if name_lower in DEPARTMENTS:
+                # ── Policy items (name contains) ──
+                POLICY_INDICATORS = ['policy', 'lockout control', 'audit checklist',
+                                     'security checklist', 'sample audit']
+
+                # 1. Department (exact or partial match)
+                if name_lower in DEPARTMENTS or any(d in name_lower for d in
+                        ['gaming commission', 'internal audit', 'compliance & enforcement',
+                         'licensing & investigations', 'gaming technology']):
                     mapped_type = 'department'
                 # 2. System (exact)
-                elif name_lower in SYSTEMS:
+                elif name_lower in SYSTEMS or name_lower in TECHNOLOGIES:
                     mapped_type = 'system'
-                # 3. Regulation (exact or prefix — BEFORE summary-based system)
-                elif name_lower in REGULATIONS or any(name_lower.startswith(p) for p in REGULATION_PREFIXES):
+                # 3. Regulation (NIST control prefix like SC-28, AC-2)
+                elif any(name_lower.startswith(p) for p in REGULATION_PREFIXES):
                     mapped_type = 'regulation'
-                # 4. Policy (name contains indicator — BEFORE summary-based system)
+                # 4. Regulation (exact name match)
+                elif name_lower in REGULATIONS:
+                    mapped_type = 'regulation'
+                # 5. FIPS standards
+                elif name_lower.startswith('fips'):
+                    mapped_type = 'regulation'
+                # 6. Policy (name contains indicator)
                 elif any(p in name_lower for p in POLICY_INDICATORS):
                     mapped_type = 'policy'
-                # 5. Pain points (strong signals)
+                # 7. Pain points (strong signals)
                 elif any(w in summary for w in ['failed', 'broken', 'defect', 'error',
                         'falsified', 'breach', 'vulnerability', 'violation']):
                     mapped_type = 'pain_point'
                 elif any(w in summary for w in ['pain point', 'problem', 'crisis',
                         'gap', 'missing', 'absent', 'no documentation']):
                     mapped_type = 'pain_point'
-                # 6. Opportunity
+                # 8. Opportunity
                 elif any(w in summary for w in ['opportunity', 'should consider',
                         'recommend', 'potential benefit', 'could improve']):
                     mapped_type = 'opportunity'
-                # 7. Regulation (summary-based — BEFORE system)
-                elif any(w in summary for w in ['regulation', 'compliance standard',
-                        'regulatory requirement', 'compact', 'statute',
-                        'cjis', 'nist', 'security policy area']):
-                    mapped_type = 'regulation'
-                # 8. Policy (summary-based — BEFORE system)
-                elif any(w in summary for w in ['policy', 'standard operating',
-                        'internal rule', 'directive', 'security control',
-                        'configuration requirement']):
-                    mapped_type = 'policy'
                 # 9. System (summary-based)
                 elif any(w in summary for w in ['software', 'platform', 'application',
                         'database', 'system used']):
@@ -213,9 +218,17 @@ async def get_graph_data(req: GraphDataRequest):
                         'protocol', 'lifecycle', 'steps to']):
                     mapped_type = 'process'
                 # 11. Department (summary-based)
-                elif any(w in summary for w in ['department', 'division', 'team',
+                elif any(w in summary for w in ['department', 'division',
                         'unit within', 'organizational']):
                     mapped_type = 'department'
+                # 12. Regulation (summary-based — last resort, narrow terms)
+                elif any(w in summary for w in ['regulation', 'compliance standard',
+                        'regulatory requirement', 'statute']):
+                    mapped_type = 'regulation'
+                # 13. Policy (summary-based — last resort)
+                elif any(w in summary for w in ['standard operating procedure',
+                        'internal rule', 'directive']):
+                    mapped_type = 'policy'
 
             if node_id not in node_ids:
                 node_ids.add(node_id)
