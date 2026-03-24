@@ -61,9 +61,9 @@ async def get_graph_data(req: GraphDataRequest):
         )
         graph = db.select_graph(graph_name)
 
-        # Query all nodes
+        # Query entity and community nodes (skip episodes — too heavy for viz)
         node_result = graph.query(
-            f"MATCH (n) RETURN n LIMIT {req.max_nodes}"
+            f"MATCH (n) WHERE NOT n:Episodic RETURN n LIMIT {req.max_nodes}"
         )
 
         nodes: list[GraphNode] = []
@@ -162,10 +162,12 @@ async def get_graph_data(req: GraphDataRequest):
 
             if node_id not in node_ids:
                 node_ids.add(node_id)
-                # Clean properties for JSON serialization
+                # Clean properties for JSON serialization (skip heavy fields)
+                SKIP_PROPS = {'uuid', 'id', 'name', 'label', 'content',
+                              'name_embedding', 'entity_edges', 'source'}
                 clean_props = {}
                 for k, v in props.items():
-                    if k not in ('uuid', 'id', 'name', 'label'):
+                    if k not in SKIP_PROPS:
                         try:
                             clean_props[k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
                         except:
