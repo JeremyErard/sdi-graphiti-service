@@ -132,33 +132,69 @@ async def get_graph_data(req: GraphDataRequest):
             if graphiti_type and graphiti_type.lower() in GRAPHITI_TYPE_MAP:
                 mapped_type = GRAPHITI_TYPE_MAP[graphiti_type.lower()]
             elif mapped_type in ('entity', 'entitynode'):
-                # ── Step 3: Heuristic fallback for nodes without entity_type ──
+                # ── Step 3: Heuristic classification ──
+                # Graphiti stores all entity nodes with generic 'Entity' label,
+                # so we must infer types from name + summary content.
                 name_lower = name.lower().strip()
                 summary = str(props.get('summary', '')).lower()
 
+                # ── Departments (exact match) ──
                 DEPARTMENTS = {'internal audit', 'audit department', 'compliance & enforcement',
                               'compliance and enforcement', 'c&e', 'compliance & enforcement (c&e)',
                               'licensing & investigations', 'licensing and investigations',
-                              'gaming technology', 'gtu', 'executive', 'executive office',
-                              'casino operations', 'surveillance', 'pokagon band gaming commission',
-                              'pbgc', 'information technology', 'human resources'}
+                              'licensing and investigations (l&i)', 'gaming technology', 'gtu',
+                              'executive', 'executive office', 'casino operations', 'surveillance',
+                              'pokagon band gaming commission', 'pbgc', 'information technology',
+                              'human resources', 'gaming technology unit'}
 
-                SYSTEMS = {'permitrak', 'filemaker', 'fmp', 'teammate', 'teamrisk', 'teamschedule',
-                          'key traka', 'traka', 'premisys', 'sharefile', 'active directory', 'vmware',
-                          'adp', 'zendesk', 'kambi', 'crossmatch', 'barracuda', 'infogenesis',
-                          'itraq', 'kiteworks', 'powerkiosk', 'geocomply', 'pala interactive',
-                          'casino cash trac', 'table manager', 'igt'}
+                # ── Systems (exact match on full name) ──
+                SYSTEMS = {'permitrak', 'filemaker', 'filemaker pro', 'fmp', 'teammate',
+                          'teamrisk', 'teamschedule', 'teamtec', 'teamcentral',
+                          'key traka', 'trakaweb', 'premisys', 'sharefile',
+                          'active directory', 'vmware', 'adp', 'zendesk', 'kambi',
+                          'crossmatch', 'barracuda', 'infogenesis', 'itraq', 'kiteworks',
+                          'powerkiosk', 'geocomply', 'pala interactive', 'casino cash trac',
+                          'table manager', 'igt', 'iris', 'merydyan prime', 'pryme',
+                          'casino insight', 'advantage monitor', 'servicenow',
+                          'hms', 'spasoft', 'filemakergo', 'filemaker go',
+                          'igc skins', 'ez pay', 'campo'}
+
+                # ── Regulations (exact or keyword) ──
+                REGULATIONS = {'tribal gaming compact', 'gaming regulatory act',
+                              'cjis security policy', 'nigc', 'title 31', 'title-31',
+                              'bsa', 'bank secrecy act', 'fips'}
 
                 if name_lower in DEPARTMENTS:
                     mapped_type = 'department'
                 elif name_lower in SYSTEMS:
                     mapped_type = 'system'
-                elif any(w in summary for w in ['pain', 'problem', 'crisis', 'failure', 'gap']):
+                elif name_lower in REGULATIONS:
+                    mapped_type = 'regulation'
+                # Summary-based: prioritize strong signals
+                elif any(w in summary for w in ['failed', 'broken', 'defect', 'error',
+                        'falsified', 'breach', 'vulnerability', 'violation']):
                     mapped_type = 'pain_point'
-                elif any(w in summary for w in ['opportunity', 'should consider', 'recommend']):
+                elif any(w in summary for w in ['pain point', 'problem', 'crisis',
+                        'gap', 'missing', 'absent', 'no documentation']):
+                    mapped_type = 'pain_point'
+                elif any(w in summary for w in ['opportunity', 'should consider',
+                        'recommend', 'potential benefit', 'could improve']):
                     mapped_type = 'opportunity'
-                elif any(w in summary for w in ['process', 'workflow', 'procedure', 'protocol']):
+                elif any(w in summary for w in ['software', 'platform', 'application',
+                        'database', 'module', 'system used', 'technology']):
+                    mapped_type = 'system'
+                elif any(w in summary for w in ['process', 'workflow', 'procedure',
+                        'protocol', 'lifecycle', 'checklist', 'steps to']):
                     mapped_type = 'process'
+                elif any(w in summary for w in ['department', 'division', 'team',
+                        'unit within', 'organizational']):
+                    mapped_type = 'department'
+                elif any(w in summary for w in ['regulation', 'compliance standard',
+                        'regulatory requirement', 'compact', 'statute']):
+                    mapped_type = 'regulation'
+                elif any(w in summary for w in ['policy', 'standard operating',
+                        'internal rule', 'directive']):
+                    mapped_type = 'policy'
 
             if node_id not in node_ids:
                 node_ids.add(node_id)
