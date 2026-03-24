@@ -216,25 +216,23 @@ async def get_graph_data(req: GraphDataRequest):
                     properties=clean_props,
                 ))
 
-        # Query all edges between the retrieved nodes
+        # Query edges — only between non-episode nodes, return minimal data
         edge_result = graph.query(
-            f"MATCH (a)-[r]->(b) RETURN a, r, b LIMIT {req.max_nodes * 3}"
+            "MATCH (a)-[r]->(b) "
+            "WHERE NOT a:Episodic AND NOT b:Episodic "
+            f"RETURN a.uuid, a.id, id(a), r, b.uuid, b.id, id(b) LIMIT {req.max_nodes * 2}"
         )
 
         edges: list[GraphEdge] = []
         edge_ids: set[str] = set()
 
         for record in edge_result.result_set:
-            src_node = record[0]
-            rel = record[1]
-            tgt_node = record[2]
+            # Extract source/target IDs from returned properties
+            src_id = str(record[0] or record[1] or record[2])
+            rel = record[3]
+            tgt_id = str(record[4] or record[5] or record[6])
 
-            src_props = dict(src_node.properties) if hasattr(src_node, 'properties') else {}
-            tgt_props = dict(tgt_node.properties) if hasattr(tgt_node, 'properties') else {}
             rel_props = dict(rel.properties) if hasattr(rel, 'properties') else {}
-
-            src_id = str(src_props.get('uuid', src_props.get('id', src_node.id)))
-            tgt_id = str(tgt_props.get('uuid', tgt_props.get('id', tgt_node.id)))
             rel_type = rel.relation if hasattr(rel, 'relation') else 'RELATED_TO'
 
             edge_id = f"{src_id}-{rel_type}-{tgt_id}"
@@ -246,21 +244,13 @@ async def get_graph_data(req: GraphDataRequest):
 
             # Only include edges where both nodes are in our node set
             if src_id in node_ids and tgt_id in node_ids:
-                clean_props = {}
-                for k, v in rel_props.items():
-                    if k != 'fact':
-                        try:
-                            clean_props[k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
-                        except:
-                            clean_props[k] = str(v)
-
                 edges.append(GraphEdge(
                     id=edge_id,
                     source=src_id,
                     target=tgt_id,
                     label=rel_type,
                     fact=fact,
-                    properties=clean_props,
+                    properties={},
                 ))
 
         logger.info(f"[graph] Retrieved {len(nodes)} nodes, {len(edges)} edges from {graph_name}")
