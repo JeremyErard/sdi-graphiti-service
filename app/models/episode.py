@@ -18,6 +18,7 @@ class EpisodeType(str, Enum):
     STATUS_UPDATE = "status_update"
     ENGAGEMENT_SETUP = "engagement_setup"
     BOOTSTRAP = "bootstrap"
+    INSIGHT_REPORT = "insight_report"
 
 
 class IngestEpisodeRequest(BaseModel):
