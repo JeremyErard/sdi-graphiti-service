@@ -104,6 +104,52 @@ async def init_graph(client_slug: str) -> str:
     return graph_name
 
 
+async def reset_graph(client_slug: str) -> dict[str, Any]:
+    """DESTRUCTIVE: wipe all nodes + relationships from a client's graph,
+    then re-initialize indices + constraints. Used for clean-slate backfills.
+
+    Returns { graph_name, nodes_deleted }.
+    """
+    graph_name = _graph_name_for_client(client_slug)
+    logger.warning(f"[graphiti] RESETTING graph: {graph_name}")
+
+    # Drop the cached client so the next operation reconnects fresh after wipe.
+    if graph_name in _clients:
+        try:
+            await _clients[graph_name].close()
+        except Exception:
+            pass
+        del _clients[graph_name]
+
+    # Use FalkorDB's underlying Redis connection to issue GRAPH.DELETE, which
+    # removes all data for the named graph in a single atomic op. Reaching
+    # through the graphiti FalkorDriver gives us the password + connection.
+    driver = _create_driver(graph_name)
+    try:
+        # falkordb-py exposes driver.client (Redis connection) and a Graph API.
+        # The simplest portable approach is to issue a raw command.
+        redis_client = driver.client if hasattr(driver, "client") else driver._client
+        try:
+            redis_client.execute_command("GRAPH.DELETE", graph_name)
+            logger.info(f"[graphiti] GRAPH.DELETE {graph_name} succeeded")
+        except Exception as del_err:
+            # If the graph doesn't exist yet, GRAPH.DELETE errors. That's fine
+            # for our reset-or-init semantics — just log and continue.
+            logger.info(f"[graphiti] GRAPH.DELETE {graph_name}: {del_err} (expected if graph was empty)")
+    finally:
+        try:
+            await driver.close()
+        except Exception:
+            pass
+
+    # Re-init: creates indices + constraints on the now-empty graph.
+    fresh_client = await get_client(client_slug)
+    await fresh_client.build_indices_and_constraints()
+
+    logger.warning(f"[graphiti] Graph reset complete: {graph_name}")
+    return {"graph_name": graph_name, "status": "reset_and_reinitialized"}
+
+
 async def add_episode(
     client_slug: str,
     engagement_id: str,
