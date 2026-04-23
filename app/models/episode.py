@@ -19,6 +19,16 @@ class EpisodeType(str, Enum):
     ENGAGEMENT_SETUP = "engagement_setup"
     BOOTSTRAP = "bootstrap"
     INSIGHT_REPORT = "insight_report"
+    # Insight Engine Upgrade 2026-04-23 — per-perspective archive + approved-artifact tracking.
+    # These types let the client graph accumulate the structural knowledge that the SOP/map
+    # pipelines produce, and preserve each reduce-phase model's independent view before reconciliation.
+    SOP_APPROVED = "sop_approved"
+    PROCESS_MAP_APPROVED = "process_map_approved"
+    PROCESS_FEEDBACK_RESOLVED = "process_feedback_resolved"
+    INSIGHT_OPUS_PERSPECTIVE = "insight_opus_perspective"
+    INSIGHT_GEMINI_PERSPECTIVE = "insight_gemini_perspective"
+    INSIGHT_GPT_PERSPECTIVE = "insight_gpt_perspective"
+    INSIGHT_RECONCILIATION = "insight_reconciliation"
 
 
 class IngestEpisodeRequest(BaseModel):
