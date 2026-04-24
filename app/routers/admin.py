@@ -110,8 +110,17 @@ async def delete_graph(req: DeleteGraphRequest):
         driver = gc._create_driver(graph_name)
         try:
             redis_client = driver.client if hasattr(driver, "client") else driver._client
-            redis_client.execute_command("GRAPH.DELETE", graph_name)
-            logger.warning(f"[graphiti] GRAPH.DELETE {graph_name} succeeded (full delete)")
+            # GRAPH.DELETE removes graph data. DEL removes the underlying key so
+            # the graph no longer appears in GRAPH.LIST.
+            try:
+                redis_client.execute_command("GRAPH.DELETE", graph_name)
+            except Exception as graph_err:
+                logger.info(f"[graphiti] GRAPH.DELETE {graph_name}: {graph_err} (continuing to DEL)")
+            try:
+                redis_client.execute_command("DEL", graph_name)
+            except Exception as del_err:
+                logger.info(f"[graphiti] DEL {graph_name}: {del_err}")
+            logger.warning(f"[graphiti] Graph fully deleted: {graph_name}")
         finally:
             try:
                 await driver.close()
