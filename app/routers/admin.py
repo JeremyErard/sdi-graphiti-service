@@ -31,6 +31,16 @@ class ResetGraphResponse(BaseModel):
     status: str
 
 
+class DeleteGraphRequest(BaseModel):
+    client_slug: str
+    confirm: str  # must equal "I understand this wipes all data"
+
+
+class DeleteGraphResponse(BaseModel):
+    graph_name: str
+    status: str
+
+
 @router.post("/init-graph", response_model=InitGraphResponse)
 async def init_graph(req: InitGraphRequest):
     """Initialize a new knowledge graph for a client.
@@ -70,3 +80,45 @@ async def reset_graph(req: ResetGraphRequest):
         raise HTTPException(
             status_code=500, detail=f"Graph reset failed: {str(e)}"
         )
+
+
+@router.post("/delete-graph", response_model=DeleteGraphResponse)
+async def delete_graph(req: DeleteGraphRequest):
+    """DESTRUCTIVE: drop a client's graph entirely (no re-init).
+
+    Use for removing obsolete or test graphs. Unlike /admin/reset-graph, this
+    leaves the graph fully deleted — no indices, no empty shell, no entry in
+    /health's `graphs` list.
+    """
+    if req.confirm != "I understand this wipes all data":
+        raise HTTPException(
+            status_code=400,
+            detail='Confirmation required: set confirm="I understand this wipes all data"',
+        )
+    try:
+        from app.services import graphiti_client as gc
+
+        graph_name = gc._graph_name_for_client(req.client_slug)
+        # Evict cached Graphiti client so a new one won't reference a stale graph.
+        if graph_name in gc._clients:
+            try:
+                await gc._clients[graph_name].close()
+            except Exception:
+                pass
+            del gc._clients[graph_name]
+
+        driver = gc._create_driver(graph_name)
+        try:
+            redis_client = driver.client if hasattr(driver, "client") else driver._client
+            redis_client.execute_command("GRAPH.DELETE", graph_name)
+            logger.warning(f"[graphiti] GRAPH.DELETE {graph_name} succeeded (full delete)")
+        finally:
+            try:
+                await driver.close()
+            except Exception:
+                pass
+
+        return DeleteGraphResponse(graph_name=graph_name, status="deleted")
+    except Exception as e:
+        logger.error(f"[graphiti] Graph delete failed for {req.client_slug}: {e}")
+        raise HTTPException(status_code=500, detail=f"Graph delete failed: {str(e)}")

@@ -95,16 +95,26 @@ async def get_graph_data(req: GraphDataRequest):
             # 'labels' property (e.g., "Stakeholder", "Department", "System")
             # This is distinct from node.labels which is the FalkorDB graph label.
             graphiti_labels = props.get('labels', '')
-            # labels may be a string or list; normalize to string
+            # The 'labels' property may be stored as either a Python list, or as
+            # a string that looks like a repr'd list ("['Role']", "['Role', 'System']")
+            # depending on which ingestion path wrote the node. Normalize to the
+            # first type-string inside.
             if isinstance(graphiti_labels, list):
                 graphiti_type = graphiti_labels[0] if graphiti_labels else ''
             else:
-                graphiti_type = str(graphiti_labels).strip()
+                raw = str(graphiti_labels).strip()
+                if raw.startswith('[') and raw.endswith(']'):
+                    inner = raw[1:-1].strip()
+                    first = inner.split(',', 1)[0].strip()
+                    graphiti_type = first.strip("'\"")
+                else:
+                    graphiti_type = raw
 
             GRAPHITI_TYPE_MAP = {
                 # People
                 'stakeholder': 'person',
                 'consultant': 'person',
+                'person': 'person',
                 # Organization
                 'department': 'department',
                 'role': 'role',
@@ -125,8 +135,10 @@ async def get_graph_data(req: GraphDataRequest):
                 'decision': 'process',
                 'risk': 'pain_point',
                 'metric': 'metric',
-                # Deliverables
+                # Deliverables & artifacts
                 'deliverable': 'entity',
+                'document': 'entity',
+                'location': 'entity',
             }
 
             if graphiti_type and graphiti_type.lower() in GRAPHITI_TYPE_MAP:
