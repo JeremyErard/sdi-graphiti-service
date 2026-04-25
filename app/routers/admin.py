@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from app.config import settings
 from app.services import graphiti_client
 
 logger = logging.getLogger("graphiti_service")
@@ -97,6 +98,7 @@ async def delete_graph(req: DeleteGraphRequest):
         )
     try:
         from app.services import graphiti_client as gc
+        from falkordb import FalkorDB
 
         graph_name = gc._graph_name_for_client(req.client_slug)
         # Evict cached Graphiti client so a new one won't reference a stale graph.
@@ -107,25 +109,23 @@ async def delete_graph(req: DeleteGraphRequest):
                 pass
             del gc._clients[graph_name]
 
-        driver = gc._create_driver(graph_name)
+        # Use the falkordb-py library directly. graphiti_core's FalkorDriver
+        # wraps the connection in a way that doesn't expose raw Redis commands,
+        # so reaching through driver.client.execute_command silently fails for
+        # graph-key cleanup. The native FalkorDB().select_graph(name).delete()
+        # API issues GRAPH.DELETE properly and removes the graph from GRAPH.LIST.
+        db = FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+        graph = db.select_graph(graph_name)
         try:
-            redis_client = driver.client if hasattr(driver, "client") else driver._client
-            # GRAPH.DELETE removes graph data. DEL removes the underlying key so
-            # the graph no longer appears in GRAPH.LIST.
-            try:
-                redis_client.execute_command("GRAPH.DELETE", graph_name)
-            except Exception as graph_err:
-                logger.info(f"[graphiti] GRAPH.DELETE {graph_name}: {graph_err} (continuing to DEL)")
-            try:
-                redis_client.execute_command("DEL", graph_name)
-            except Exception as del_err:
-                logger.info(f"[graphiti] DEL {graph_name}: {del_err}")
-            logger.warning(f"[graphiti] Graph fully deleted: {graph_name}")
-        finally:
-            try:
-                await driver.close()
-            except Exception:
-                pass
+            graph.delete()
+            logger.warning(f"[graphiti] Graph deleted via falkordb-py: {graph_name}")
+        except Exception as del_err:
+            # Most common reason for delete to error: graph already gone.
+            logger.info(f"[graphiti] graph.delete() {graph_name}: {del_err} (likely already absent)")
 
         return DeleteGraphResponse(graph_name=graph_name, status="deleted")
     except Exception as e:
