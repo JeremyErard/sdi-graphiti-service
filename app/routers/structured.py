@@ -150,6 +150,9 @@ async def ingest_structured(req: StructuredIngestRequest):
                 # matching what graphiti_core writes (which downstream graph.py
                 # inspects for type mapping).
                 label_value = ent.type.strip() if ent.type else "Entity"
+                # `labels` is a Cypher list — same reason as `episodes` above.
+                # The downstream graph.py heuristic now parses both list and
+                # repr'd-list strings, but native lists are the right shape.
                 graph.query(
                     """
                     CREATE (e:Entity {
@@ -167,7 +170,7 @@ async def ingest_structured(req: StructuredIngestRequest):
                         "summary": summary,
                         "group_id": graph_name,
                         "created_at": now_iso,
-                        "labels": f"['{label_value}']",
+                        "labels": [label_value],
                     },
                 )
                 name_to_uuid[name_norm] = new_uuid
@@ -218,6 +221,9 @@ async def ingest_structured(req: StructuredIngestRequest):
 
             edge_uuid = str(uuidlib.uuid4())
             fact = rel.fact or rel.relation or ""
+            # `episodes` must be a real Cypher list — graphiti_core's EntityEdge
+            # Pydantic model rejects stringified lists with a validation error,
+            # which causes /search/context to 500 on edges we wrote.
             graph.query(
                 """
                 MATCH (s:Entity {uuid: $src}), (t:Entity {uuid: $tgt})
@@ -236,7 +242,7 @@ async def ingest_structured(req: StructuredIngestRequest):
                     "edge_uuid": edge_uuid,
                     "name": rel.relation.strip() if rel.relation else "relates_to",
                     "fact": fact,
-                    "episodes": f"['{episode_uuid}']",
+                    "episodes": [episode_uuid],
                     "created_at": now_iso,
                     "group_id": graph_name,
                 },
