@@ -48,51 +48,47 @@ logger = logging.getLogger("graphiti_service")
 
 
 def install() -> None:
-    """Install runtime patches. Idempotent — safe to call once at startup."""
-    _patched = 0
+    """Install runtime patches. Idempotent — safe to call once at startup.
 
+    The first attempt at this fix patched the parser functions
+    (record_parsers.episodic_node_from_record and
+    nodes.get_episodic_node_from_record). That didn't work because the
+    falkor and neo4j operation modules each do
+        from graphiti_core.driver.record_parsers import episodic_node_from_record
+    at module load time, capturing a *local reference* to the original
+    function. Replacing the source-module attribute later does not affect
+    callers that already imported the function by name.
+
+    Instead we patch EpisodicNode.__init__ itself — which catches every
+    construction path, regardless of how the caller obtained the model
+    class. Coerce record.get('entity_edges') from None to [] BEFORE
+    Pydantic v2 validation runs.
+    """
     try:
-        from graphiti_core import nodes as _nodes_mod
+        from graphiti_core.nodes import EpisodicNode
 
-        _orig_get = _nodes_mod.get_episodic_node_from_record
+        if getattr(EpisodicNode.__init__, "_sdi_patched", False):
+            logger.info("[graphiti-patch] EpisodicNode.__init__ already patched; skipping")
+            return
 
-        def _safe_get_episodic_node_from_record(record):
-            if record is not None and record.get("entity_edges") is None:
-                # Don't mutate the caller's record; copy and patch.
-                record = dict(record)
-                record["entity_edges"] = []
-            return _orig_get(record)
+        _orig_init = EpisodicNode.__init__
 
-        _nodes_mod.get_episodic_node_from_record = (
-            _safe_get_episodic_node_from_record
-        )
-        _patched += 1
+        def _patched_init(self, **data):  # type: ignore[no-untyped-def]
+            # Coerce entity_edges=None to [] so Pydantic's
+            # `entity_edges: list[str]` validator doesn't reject the model.
+            # Some FalkorDB rows persist this property as null when the
+            # episode was written before the field was tracked, or when the
+            # field was explicitly cleared. The Field() default_factory only
+            # applies when the key is omitted, not when it's present-with-None.
+            if data.get("entity_edges") is None:
+                data["entity_edges"] = []
+            _orig_init(self, **data)
+
+        _patched_init._sdi_patched = True  # type: ignore[attr-defined]
+        EpisodicNode.__init__ = _patched_init  # type: ignore[method-assign]
+        logger.info("[graphiti-patch] EpisodicNode.__init__ patched: entity_edges None -> []")
     except Exception as e:  # noqa: BLE001
         logger.warning(
-            "[graphiti-patch] could not patch nodes.get_episodic_node_from_record: %s",
+            "[graphiti-patch] could not patch EpisodicNode.__init__: %s",
             e,
         )
-
-    try:
-        from graphiti_core.driver import record_parsers as _rp_mod
-
-        _orig_parse = _rp_mod.episodic_node_from_record
-
-        def _safe_episodic_node_from_record(record):
-            if record is not None and record.get("entity_edges") is None:
-                record = dict(record)
-                record["entity_edges"] = []
-            return _orig_parse(record)
-
-        _rp_mod.episodic_node_from_record = _safe_episodic_node_from_record
-        _patched += 1
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[graphiti-patch] could not patch record_parsers.episodic_node_from_record: %s",
-            e,
-        )
-
-    logger.info(
-        "[graphiti-patch] installed entity_edges-null guard on %d parser(s)",
-        _patched,
-    )
