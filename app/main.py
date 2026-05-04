@@ -7,7 +7,11 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.routers import admin, graph, health, ingest, search, structured
-from app.services import graphiti_client
+from app.services import graphiti_client, graphiti_patches
+
+# Install runtime patches over graphiti-core BEFORE any router import paths
+# trigger an ingestion / read. See graphiti_patches.py for the bug detail.
+graphiti_patches.install()
 
 # Configure logging
 logging.basicConfig(
