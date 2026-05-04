@@ -64,31 +64,67 @@ def install() -> None:
     class. Coerce record.get('entity_edges') from None to [] BEFORE
     Pydantic v2 validation runs.
     """
+    import ast
+
+    def _coerce_list(value):
+        """Coerce a value that should be a list into one.
+
+        Handles three real-world failure modes from FalkorDB:
+        - None  -> []                      (property never set / cleared)
+        - "['a','b']" -> ['a','b']         (Falkor sometimes returns the str
+                                            repr of a list rather than a real
+                                            array; happens for some properties)
+        - "[]"  -> []                      (str repr of empty list)
+        Anything that's already a list passes through. Anything else we
+        leave alone and let Pydantic validate.
+        """
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str) and value.startswith("[") and value.endswith("]"):
+            try:
+                parsed = ast.literal_eval(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except (ValueError, SyntaxError):
+                pass
+        return value
+
     try:
         from graphiti_core.nodes import EpisodicNode
 
-        if getattr(EpisodicNode.__init__, "_sdi_patched", False):
-            logger.info("[graphiti-patch] EpisodicNode.__init__ already patched; skipping")
-            return
+        if not getattr(EpisodicNode.__init__, "_sdi_patched", False):
+            _orig_episodic_init = EpisodicNode.__init__
 
-        _orig_init = EpisodicNode.__init__
+            def _patched_episodic_init(self, **data):  # type: ignore[no-untyped-def]
+                # entity_edges: list[str] — FalkorDB returns None for legacy
+                # episodes; Pydantic Field(default_factory=list) only applies
+                # when the key is omitted, not present-with-None.
+                data["entity_edges"] = _coerce_list(data.get("entity_edges"))
+                _orig_episodic_init(self, **data)
 
-        def _patched_init(self, **data):  # type: ignore[no-untyped-def]
-            # Coerce entity_edges=None to [] so Pydantic's
-            # `entity_edges: list[str]` validator doesn't reject the model.
-            # Some FalkorDB rows persist this property as null when the
-            # episode was written before the field was tracked, or when the
-            # field was explicitly cleared. The Field() default_factory only
-            # applies when the key is omitted, not when it's present-with-None.
-            if data.get("entity_edges") is None:
-                data["entity_edges"] = []
-            _orig_init(self, **data)
-
-        _patched_init._sdi_patched = True  # type: ignore[attr-defined]
-        EpisodicNode.__init__ = _patched_init  # type: ignore[method-assign]
-        logger.info("[graphiti-patch] EpisodicNode.__init__ patched: entity_edges None -> []")
+            _patched_episodic_init._sdi_patched = True  # type: ignore[attr-defined]
+            EpisodicNode.__init__ = _patched_episodic_init  # type: ignore[method-assign]
+            logger.info("[graphiti-patch] EpisodicNode.__init__ patched: entity_edges None|str -> list")
     except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[graphiti-patch] could not patch EpisodicNode.__init__: %s",
-            e,
-        )
+        logger.warning("[graphiti-patch] could not patch EpisodicNode: %s", e)
+
+    try:
+        from graphiti_core.edges import EntityEdge
+
+        if not getattr(EntityEdge.__init__, "_sdi_patched", False):
+            _orig_entity_edge_init = EntityEdge.__init__
+
+            def _patched_entity_edge_init(self, **data):  # type: ignore[no-untyped-def]
+                # episodes: list[str] — FalkorDB returns this property as the
+                # string representation of a list ("['uuid-1','uuid-2']")
+                # rather than a real array, which Pydantic rejects.
+                data["episodes"] = _coerce_list(data.get("episodes"))
+                _orig_entity_edge_init(self, **data)
+
+            _patched_entity_edge_init._sdi_patched = True  # type: ignore[attr-defined]
+            EntityEdge.__init__ = _patched_entity_edge_init  # type: ignore[method-assign]
+            logger.info("[graphiti-patch] EntityEdge.__init__ patched: episodes None|str -> list")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[graphiti-patch] could not patch EntityEdge: %s", e)
