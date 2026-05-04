@@ -23,6 +23,7 @@ class EpisodeType(str, Enum):
     # These types let the client graph accumulate the structural knowledge that the SOP/map
     # pipelines produce, and preserve each reduce-phase model's independent view before reconciliation.
     SOP_APPROVED = "sop_approved"
+    SOP_REGENERATION = "sop_regeneration"
     PROCESS_MAP_APPROVED = "process_map_approved"
     PROCESS_FEEDBACK_RESOLVED = "process_feedback_resolved"
     INSIGHT_OPUS_PERSPECTIVE = "insight_opus_perspective"
