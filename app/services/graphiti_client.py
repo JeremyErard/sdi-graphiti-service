@@ -44,11 +44,41 @@ def _load_entity_types() -> list[dict[str, str]]:
 
 
 def _create_llm_client() -> AnthropicClient:
-    """Create Anthropic LLM client for entity extraction (Sonnet 4.6)."""
+    """Create the Anthropic LLM client for entity extraction.
+
+    Model comes from settings.graphiti_llm_model (GRAPHITI_LLM_MODEL), which must
+    be a string graphiti-core's token map recognizes, or the output silently caps
+    at 16384. Default is claude-sonnet-4-5-latest (recognized, 65536 cap).
+    """
     return AnthropicClient(
         config=LLMConfig(
             api_key=settings.anthropic_api_key,
             model=settings.graphiti_llm_model,
+        )
+    )
+
+
+def _create_embedder():
+    """Return an explicit embedder.
+
+    Voyage when VOYAGE_API_KEY is set (removes the implicit OpenAI default that is
+    currently the single embedding point of failure for every client's graph);
+    otherwise None, which Graphiti falls back to its OpenAI default for — so this
+    is INERT and behavior-identical until a Voyage key is configured.
+
+    Note: Voyage and OpenAI produce different vector spaces, so cutting over to
+    Voyage requires re-embedding existing graphs before retrieval works again.
+    """
+    if not settings.voyage_api_key:
+        return None
+    # Lazy import: the voyageai SDK is only needed when Voyage is actually used.
+    from graphiti_core.embedder.voyage import VoyageAIEmbedder, VoyageAIEmbedderConfig
+
+    return VoyageAIEmbedder(
+        config=VoyageAIEmbedderConfig(
+            api_key=settings.voyage_api_key,
+            embedding_model=settings.embedding_model,
+            embedding_dim=settings.embedding_dim,
         )
     )
 
@@ -75,7 +105,7 @@ async def get_client(client_slug: str) -> Graphiti:
         logger.info(f"[graphiti] Initializing graph: {graph_name}")
         driver = _create_driver(graph_name)
         llm_client = _create_llm_client()
-        client = Graphiti(graph_driver=driver, llm_client=llm_client)
+        client = Graphiti(graph_driver=driver, llm_client=llm_client, embedder=_create_embedder())
         _clients[graph_name] = client
 
     return _clients[graph_name]
@@ -89,7 +119,7 @@ async def get_segment_client(industry: str) -> Graphiti:
         logger.info(f"[graphiti] Initializing segment graph: {graph_name}")
         driver = _create_driver(graph_name)
         llm_client = _create_llm_client()
-        client = Graphiti(graph_driver=driver, llm_client=llm_client)
+        client = Graphiti(graph_driver=driver, llm_client=llm_client, embedder=_create_embedder())
         _clients[graph_name] = client
 
     return _clients[graph_name]
