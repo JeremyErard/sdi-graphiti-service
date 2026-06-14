@@ -29,6 +29,17 @@ import urllib.request
 
 CONFIRM = "I understand this overwrites all embeddings"
 
+# Exit-code contract (so an operator/automation can tell apart failure classes):
+#   0 success/verified | 1 transient (max_rounds — re-run) | 2 search empty (deploy
+#   but retrieval limited) | 3 CRITICAL (content invariant / no progress — do not
+#   blindly re-run) | 4 HTTP/infra error (inspect, often a deploy in flight)
+EXIT_OK, EXIT_TRANSIENT, EXIT_EMPTY, EXIT_CRITICAL, EXIT_HTTP = 0, 1, 2, 3, 4
+
+
+def die(msg: str, code: int):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
 
 def _post(base: str, path: str, body: dict, timeout: int = 120) -> dict:
     req = urllib.request.Request(
@@ -42,7 +53,7 @@ def _post(base: str, path: str, body: dict, timeout: int = 120) -> dict:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         detail = e.read().decode()[:500]
-        raise SystemExit(f"HTTP {e.code} on {path}: {detail}")
+        die(f"HTTP {e.code} on {path}: {detail}", EXIT_HTTP)
 
 
 def backup_content(base: str, slug: str, path: str) -> tuple[int, int]:
@@ -62,7 +73,7 @@ def reembed_until_done(base: str, slug: str, dry_run: bool, max_items: int, max_
     while True:
         rounds += 1
         if rounds > max_rounds:
-            raise SystemExit(f"[abort] exceeded max_rounds={max_rounds}; last={last}")
+            die(f"[abort] exceeded max_rounds={max_rounds}; last={last}", EXIT_TRANSIENT)
         last = _post(
             base,
             "/admin/reembed-graph",
@@ -77,9 +88,10 @@ def reembed_until_done(base: str, slug: str, dry_run: bool, max_items: int, max_
         if totals_lock is None:
             totals_lock = cur
         elif cur != totals_lock:
-            raise SystemExit(
+            die(
                 f"[abort] content invariant violated: totals changed {totals_lock} -> {cur} "
-                "(re-embed must not add/remove nodes or edges)"
+                "(re-embed must not add/remove nodes or edges)",
+                EXIT_CRITICAL,
             )
         print(
             f"  round {rounds:>2}: +{n} nodes +{e} edges | "
@@ -92,10 +104,11 @@ def reembed_until_done(base: str, slug: str, dry_run: bool, max_items: int, max_
             print("  [dry-run] stopping after one pass")
             break
         if n + e == 0:
-            raise SystemExit(
+            die(
                 f"[abort] no progress this round but not done "
                 f"(stale n={last['stale_nodes_remaining']} e={last['stale_edges_remaining']}, "
-                f"failures={last['failures']}) — likely persistent write/embed failure"
+                f"failures={last['failures']}) — likely persistent write/embed failure",
+                EXIT_CRITICAL,
             )
     print(
         f"[reembed] {slug}: re-embedded {total_n} nodes + {total_e} edges in {rounds} round(s); "
@@ -154,7 +167,7 @@ def main():
         print(f"[content] entity totals from endpoint: {post} (backup viz snapshot: {pre[0]} nodes / {pre[1]} edges)")
 
     print(f"[done] {args.client_slug} cutover {'VERIFIED' if ok else 'NEEDS REVIEW'} in {time.time()-t0:.0f}s")
-    sys.exit(0 if ok else 2)
+    sys.exit(EXIT_OK if ok else EXIT_EMPTY)
 
 
 if __name__ == "__main__":

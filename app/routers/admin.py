@@ -224,6 +224,23 @@ async def reembed_graph(req: ReembedGraphRequest):
     def _count(q: str) -> int:
         return graph.query(q, {"marker": marker}).result_set[0][0]
 
+    def _assert_dim(vectors: list) -> None:
+        # The emb_model marker encodes the dimension; if the embedder ever returns
+        # a different dimension than configured (e.g. embedding_dim set above what
+        # the model can produce, so truncation can't reach it), writing would
+        # stamp a marker that lies about the vector. Abort before any such write
+        # so the graph can never end up mixed-dimension. Never triggers when
+        # model + embedding_dim agree (voyage-4-large -> 1024 == 1024).
+        if vectors and len(vectors[0]) != settings.embedding_dim:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Embedder produced {len(vectors[0])}-dim vectors but config "
+                    f"embedding_dim={settings.embedding_dim} (marker '{marker}'); "
+                    "aborting to keep the graph single-dimension."
+                ),
+            )
+
     try:
         from falkordb import FalkorDB
 
@@ -263,6 +280,7 @@ async def reembed_graph(req: ReembedGraphRequest):
                     logger.error(f"[graphiti] reembed node batch embed failed ({graph_name}): {e}")
                     failures += len(batch)
                     continue
+                _assert_dim(vectors)
                 for uuid, name, vec in zip(uuids, texts, vectors):
                     if not sample:
                         sample = {"kind": "node", "uuid": uuid, "name": name, "new_dim": len(vec)}
@@ -296,6 +314,7 @@ async def reembed_graph(req: ReembedGraphRequest):
                     logger.error(f"[graphiti] reembed edge batch embed failed ({graph_name}): {e}")
                     failures += len(batch)
                     continue
+                _assert_dim(vectors)
                 for uuid, fact, vec in zip(uuids, texts, vectors):
                     if req.dry_run:
                         edges_done += 1
