@@ -48,6 +48,20 @@ async def health_check():
             status["falkordb"]["graphs"] = []
             status["falkordb"]["graph_count"] = 0
 
+        # Version visibility — redis-compat version + the FalkorDB module version,
+        # so we can tell at a glance whether the engine is current (relevant to
+        # vector-index support and known fixes).
+        try:
+            srv = await r.info("server")
+            status["falkordb"]["redis_version"] = srv.get("redis_version", "unknown")
+        except Exception:
+            pass
+        try:
+            mods = await r.execute_command("MODULE LIST")
+            status["falkordb"]["modules"] = str(mods)[:300]
+        except Exception:
+            pass
+
         await r.aclose()
     except Exception as e:
         status["status"] = "degraded"
