@@ -104,7 +104,21 @@ async def _probe_falkordb() -> dict:
 
 
 async def _probe_embedder() -> dict:
-    """One real embedding call, single attempt. Raises on failure."""
+    """One real embedding call, single attempt. Raises on failure.
+
+    Probes whichever embedder the service is actually configured to use: Voyage
+    when VOYAGE_API_KEY is set (the post-cutover path), else the OpenAI default.
+    This keeps /ready truthful about the embedder retrieval really depends on —
+    otherwise it would keep pinging exhausted OpenAI and report degraded even
+    when Voyage is healthy.
+    """
+    if settings.voyage_api_key:
+        import voyageai
+
+        client = voyageai.AsyncClient(api_key=settings.voyage_api_key, max_retries=0, timeout=8)
+        await client.embed(["readiness probe"], model=settings.embedding_model)
+        return {"ok": True, "provider": "voyage", "model": settings.embedding_model}
+
     from openai import AsyncOpenAI
 
     # `or None` so an empty config falls back to the OPENAI_API_KEY env var the
@@ -172,9 +186,10 @@ async def readiness_check():
             return out
         return x  # type: ignore[return-value]
 
+    emb_provider = "voyage" if settings.voyage_api_key else "openai"
     checks = {
         "falkordb": _coerce(fdb, None),
-        "embedder": _coerce(emb, "openai"),
+        "embedder": _coerce(emb, emb_provider),
         "llm": _coerce(llm, "anthropic"),
     }
 
