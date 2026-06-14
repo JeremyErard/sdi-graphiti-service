@@ -3,6 +3,7 @@
 import logging
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
@@ -18,6 +19,25 @@ logger = logging.getLogger("graphiti_service")
 
 # Cache of initialized Graphiti clients per graph name
 _clients: dict[str, Graphiti] = {}
+
+# Graphs for which we've already ensured the RELATES_TO fact_embedding vector
+# index exists this process-lifetime (so we don't re-issue CREATE every search).
+_edge_vindex_ensured: set[str] = set()
+
+
+def _parse_dt(v: Any) -> datetime | None:
+    """Best-effort parse of a stored temporal value to datetime, else None.
+
+    Graphiti stores valid_at/invalid_at/expired_at as ISO strings. Never raises —
+    a bad/odd value yields None rather than failing a whole search response."""
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def _graph_name_for_client(client_slug: str) -> str:
@@ -229,36 +249,122 @@ async def add_episode(
     }
 
 
+def _ensure_edge_vector_index(graph, graph_name: str) -> None:
+    """Idempotently ensure a FalkorDB HNSW vector index on RELATES_TO.fact_embedding.
+
+    graphiti-core only builds range + fulltext indexes for FalkorDB, so its cosine
+    search is an O(N) full scan (~28s on a 7k-edge graph). A native vector index
+    makes it O(log N). Creating when one exists raises (caught); an unsupported
+    FalkorDB version also raises here and again on query, so the caller falls back
+    to graphiti's scan — no regression either way. Cached per process.
+    """
+    if graph_name in _edge_vindex_ensured:
+        return
+    dim = int(settings.embedding_dim)
+    try:
+        graph.query(
+            f"CREATE VECTOR INDEX FOR ()-[r:RELATES_TO]->() ON (r.fact_embedding) "
+            f"OPTIONS {{dimension:{dim}, similarityFunction:'cosine'}}"
+        )
+        logger.info(f"[graphiti] created RELATES_TO.fact_embedding vector index on {graph_name} (dim={dim})")
+    except Exception as e:
+        logger.debug(f"[graphiti] vector index ensure on {graph_name}: {e}")
+    _edge_vindex_ensured.add(graph_name)
+
+
+async def _search_fast(client_slug: str, query: str, max_results: int) -> list[Any]:
+    """Edge search via the FalkorDB native vector (HNSW) index — O(log N).
+
+    Embeds the query with the SAME configured embedder used for stored vectors
+    (no query/document asymmetry), then asks the index for the k nearest edges by
+    fact_embedding. Returns lightweight edge-like objects exposing the same
+    attributes search.py reads (fact, name, source/target uuid, temporals).
+    Raises on any failure so search() can fall back to graphiti's hybrid search.
+    """
+    embedder = _create_embedder()
+    if embedder is None:
+        raise RuntimeError("fast search requires an explicit (Voyage) embedder")
+    qvec = await embedder.create(input_data=[query.replace("\n", " ")])
+
+    graph_name = _graph_name_for_client(client_slug)
+    from falkordb import FalkorDB
+
+    db = FalkorDB(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+    )
+    graph = db.select_graph(graph_name)
+    _ensure_edge_vector_index(graph, graph_name)
+
+    # k literal-inlined (int, ours); query vector passed as a param (graphiti's
+    # proven vecf32($param) idiom). Each client is its own FalkorDB graph, so no
+    # group_id filter is needed (and vector queries don't combine with filters).
+    res = graph.query(
+        f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {int(max_results)}, vecf32($q)) "
+        "YIELD relationship AS e, score "
+        "RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, "
+        "e.source_uuid AS src, e.target_uuid AS tgt, "
+        "e.valid_at AS valid_at, e.invalid_at AS invalid_at, e.expired_at AS expired_at",
+        {"q": qvec},
+    )
+    edges: list[Any] = []
+    for row in res.result_set:
+        edges.append(
+            SimpleNamespace(
+                uuid=row[0],
+                fact=row[1] or "",
+                name=row[2] or "",
+                source_node_uuid=row[3] or "",
+                target_node_uuid=row[4] or "",
+                valid_at=_parse_dt(row[5]),
+                invalid_at=_parse_dt(row[6]),
+                expired_at=_parse_dt(row[7]),
+            )
+        )
+    return edges
+
+
 async def search(
     client_slug: str,
     query: str,
     max_results: int = 10,
 ) -> list[Any]:
-    """Search the client's knowledge graph.
+    """Search the client's knowledge graph for the most relevant facts (edges).
 
-    Returns list of EntityEdge objects. Each edge has:
-    - fact: human-readable fact string
-    - name: relationship label
-    - source_node_uuid / target_node_uuid
-    - valid_at / invalid_at / expired_at (temporal)
-    - episodes: list of source episode UUIDs
+    Tries the vector-index fast path first; on ANY error OR an empty result (e.g.
+    the index is still building, or this FalkorDB lacks vector indexes) falls back
+    to graphiti's hybrid (BM25 + full-scan cosine + RRF) search. The fallback is
+    why this is zero-regression: worst case is the prior behavior.
+
+    Returns edge-like objects exposing: fact, name, source_node_uuid,
+    target_node_uuid, valid_at / invalid_at / expired_at.
     """
-    client = await get_client(client_slug)
     graph_name = _graph_name_for_client(client_slug)
-
     start = time.time()
 
+    try:
+        edges = await _search_fast(client_slug, query, max_results)
+        if edges:
+            logger.info(
+                f"[graphiti] Search(fast) in {graph_name}: {len(edges)} edges "
+                f"({(time.time() - start) * 1000:.0f}ms)"
+            )
+            return edges
+        logger.info(f"[graphiti] fast search returned 0 on {graph_name}; falling back to hybrid")
+    except Exception as e:
+        logger.warning(f"[graphiti] fast search failed on {graph_name} ({e}); falling back to hybrid")
+
+    client = await get_client(client_slug)
     edges = await client.search(
         query=query,
         num_results=max_results,
         group_ids=[graph_name],
     )
-
-    elapsed_ms = (time.time() - start) * 1000
     logger.info(
-        f"[graphiti] Search in {graph_name}: {len(edges)} edges ({elapsed_ms:.0f}ms)"
+        f"[graphiti] Search(hybrid-fallback) in {graph_name}: {len(edges)} edges "
+        f"({(time.time() - start) * 1000:.0f}ms)"
     )
-
     return edges
 
 
