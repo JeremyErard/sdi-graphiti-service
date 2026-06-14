@@ -272,14 +272,53 @@ def _ensure_edge_vector_index(graph, graph_name: str) -> None:
     _edge_vindex_ensured.add(graph_name)
 
 
+# RRF rank constant. graphiti uses 1; 60 is the canonical RRF default and slightly
+# smoother. The exact value barely changes the top-K. Kept explicit for clarity.
+_RRF_K = 60
+
+# Columns returned for an edge so we can build a search.py-compatible object.
+_EDGE_RETURN = (
+    "RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, "
+    "e.source_uuid AS src, e.target_uuid AS tgt, "
+    "e.valid_at AS va, e.invalid_at AS ia, e.expired_at AS ea"
+)
+
+
+def _lucene_sanitize(q: str) -> str:
+    """Strip RediSearch/fulltext special chars so a natural-language query never
+    breaks the BM25 parser (e.g. '&', '-', ':'). Mirrors graphiti's intent."""
+    out = []
+    for ch in q:
+        out.append(ch if (ch.isalnum() or ch.isspace()) else " ")
+    return " ".join("".join(out).split())
+
+
+def _row_to_edge(row) -> Any:
+    return SimpleNamespace(
+        uuid=row[0],
+        fact=row[1] or "",
+        name=row[2] or "",
+        source_node_uuid=row[3] or "",
+        target_node_uuid=row[4] or "",
+        valid_at=_parse_dt(row[5]),
+        invalid_at=_parse_dt(row[6]),
+        expired_at=_parse_dt(row[7]),
+    )
+
+
 async def _search_fast(client_slug: str, query: str, max_results: int) -> list[Any]:
-    """Edge search via the FalkorDB native vector (HNSW) index — O(log N).
+    """Hybrid edge search using FalkorDB native indexes — the same shape as
+    graphiti's EDGE_HYBRID_SEARCH_RRF (BM25 + cosine + RRF) but fast:
+
+      - cosine via the HNSW vector index (O(log N), not the O(N) scan)
+      - BM25 via the existing fulltext index
+      - reciprocal-rank-fusion of the two ranked lists
 
     Embeds the query with the SAME configured embedder used for stored vectors
-    (no query/document asymmetry), then asks the index for the k nearest edges by
-    fact_embedding. Returns lightweight edge-like objects exposing the same
-    attributes search.py reads (fact, name, source/target uuid, temporals).
-    Raises on any failure so search() can fall back to graphiti's hybrid search.
+    (no query/document asymmetry). Returns lightweight edge-like objects exposing
+    the attributes search.py reads. Raises on vector-path failure so search() can
+    fall back to graphiti's own hybrid search; a BM25 failure degrades to
+    vector-only within this function (still fast and relevant).
     """
     embedder = _create_embedder()
     if embedder is None:
@@ -297,32 +336,52 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     graph = db.select_graph(graph_name)
     _ensure_edge_vector_index(graph, graph_name)
 
-    # k literal-inlined (int, ours); query vector passed as a param (graphiti's
-    # proven vecf32($param) idiom). Each client is its own FalkorDB graph, so no
-    # group_id filter is needed (and vector queries don't combine with filters).
-    res = graph.query(
-        f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {int(max_results)}, vecf32($q)) "
-        "YIELD relationship AS e, score "
-        "RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, "
-        "e.source_uuid AS src, e.target_uuid AS tgt, "
-        "e.valid_at AS valid_at, e.invalid_at AS invalid_at, e.expired_at AS expired_at",
+    # Pull a candidate pool 2x the requested size from each method, then fuse.
+    pool = max(int(max_results) * 2, int(max_results))
+
+    by_uuid: dict[str, Any] = {}
+
+    def _collect(rows) -> list[str]:
+        order: list[str] = []
+        for row in rows:
+            uuid = row[0]
+            if uuid and uuid not in by_uuid:
+                by_uuid[uuid] = _row_to_edge(row)
+            if uuid:
+                order.append(uuid)
+        return order
+
+    # Cosine via HNSW (k inlined int; vector passed as the proven vecf32($param)).
+    vres = graph.query(
+        f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
+        f"YIELD relationship AS e, score {_EDGE_RETURN}",
         {"q": qvec},
     )
-    edges: list[Any] = []
-    for row in res.result_set:
-        edges.append(
-            SimpleNamespace(
-                uuid=row[0],
-                fact=row[1] or "",
-                name=row[2] or "",
-                source_node_uuid=row[3] or "",
-                target_node_uuid=row[4] or "",
-                valid_at=_parse_dt(row[5]),
-                invalid_at=_parse_dt(row[6]),
-                expired_at=_parse_dt(row[7]),
+    vorder = _collect(vres.result_set)
+
+    # BM25 via the fulltext index. Resilient: a parser hiccup degrades to
+    # vector-only rather than failing the whole search.
+    border: list[str] = []
+    safe_q = _lucene_sanitize(query)
+    if safe_q:
+        try:
+            bres = graph.query(
+                f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
+                f"YIELD relationship AS e, score {_EDGE_RETURN} LIMIT {pool}",
+                {"query": safe_q},
             )
-        )
-    return edges
+            border = _collect(bres.result_set)
+        except Exception as e:
+            logger.debug(f"[graphiti] fast BM25 leg skipped on {graph_name}: {e}")
+
+    # Reciprocal rank fusion of the two ranked lists.
+    scores: dict[str, float] = {}
+    for ordered in (vorder, border):
+        for rank, uuid in enumerate(ordered):
+            scores[uuid] = scores.get(uuid, 0.0) + 1.0 / (rank + _RRF_K)
+
+    ranked = sorted(scores, key=lambda u: scores[u], reverse=True)[: int(max_results)]
+    return [by_uuid[u] for u in ranked]
 
 
 async def search(
