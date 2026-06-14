@@ -119,10 +119,18 @@ def reembed_until_done(base: str, slug: str, dry_run: bool, max_items: int, max_
 
 def search_check(base: str, slug: str, query: str) -> bool:
     print(f"[verify] /search/context {slug!r} query={query!r}")
+    # engagement_id is required by the request model but unused by the search
+    # logic (search filters by client graph, not engagement) — pass a placeholder.
     r = _post(
         base,
         "/search/context",
-        {"client_slug": slug, "query": query, "max_results": 5, "include_segment": False},
+        {
+            "client_slug": slug,
+            "engagement_id": "cutover-verify",
+            "query": query,
+            "max_results": 5,
+            "include_segment": False,
+        },
     )
     facts = r.get("facts", [])
     print(f"[verify] returned {len(facts)} facts in {r.get('search_time_ms', 0):.0f}ms")
