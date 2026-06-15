@@ -365,3 +365,50 @@ async def reembed_graph(req: ReembedGraphRequest):
     except Exception as e:
         logger.error(f"[graphiti] reembed failed for {req.client_slug}: {e}")
         raise HTTPException(status_code=500, detail=f"Re-embed failed: {str(e)}")
+
+
+@router.post("/falkordb-save")
+async def falkordb_save():
+    """Force an RDB snapshot (BGSAVE) so the current in-memory state — graphs,
+    re-embeddings, vector indexes — is flushed to the mounted persistent disk.
+    Use before any FalkorDB restart/upgrade. Returns post-save persistence stats."""
+    import asyncio
+
+    import redis.asyncio as redis
+
+    r = redis.Redis(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+        decode_responses=True,
+    )
+    try:
+        try:
+            await r.bgsave()
+        except Exception as e:
+            # A bgsave already in progress is fine; surface other errors below.
+            logger.info(f"[graphiti] bgsave: {e}")
+        for _ in range(40):
+            info = await r.info("persistence")
+            if not int(info.get("rdb_bgsave_in_progress", 0) or 0):
+                break
+            await asyncio.sleep(0.5)
+        info = await r.info("persistence")
+        cfg = await r.config_get("dir")
+        result = {
+            "status": "saved",
+            "dir": cfg.get("dir", ""),
+            "rdb_last_save_time": info.get("rdb_last_save_time"),
+            "rdb_changes_since_last_save": info.get("rdb_changes_since_last_save"),
+            "rdb_last_bgsave_status": info.get("rdb_last_bgsave_status"),
+        }
+        logger.warning(f"[graphiti] forced RDB save: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[graphiti] falkordb-save failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
+    finally:
+        try:
+            await r.aclose()
+        except Exception:
+            pass

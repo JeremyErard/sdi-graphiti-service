@@ -150,6 +150,22 @@ async def init_graph(client_slug: str) -> str:
     client = await get_client(client_slug)
     await client.build_indices_and_constraints()
     graph_name = _graph_name_for_client(client_slug)
+
+    # Create the native vector index now, while the graph is empty, so new clients
+    # get incremental HNSW indexing from the first edge onward — avoiding the
+    # one-time bulk build that older graphs paid on their first search. Best-effort.
+    try:
+        from falkordb import FalkorDB
+
+        db = FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+        _ensure_edge_vector_index(db.select_graph(graph_name), graph_name)
+    except Exception as e:
+        logger.warning(f"[graphiti] vector index init skipped for {graph_name}: {e}")
+
     logger.info(f"[graphiti] Graph initialized: {graph_name}")
     return graph_name
 
