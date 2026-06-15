@@ -469,8 +469,35 @@ async def export_graph(req: ExportGraphRequest):
                  "valid_at": r[7], "invalid_at": r[8], "expired_at": r[9], "episodes": r[10]}
                 for r in rows
             ]
+        elif req.kind == "all_nodes":
+            # FULL-FIDELITY: every node of every label, all properties (embeddings
+            # stripped — regenerated verbatim by re-embed). ORDER BY id(n) for
+            # stable pagination.
+            total = graph.query("MATCH (n) RETURN count(n)").result_set[0][0]
+            rows = graph.query(
+                f"MATCH (n) RETURN labels(n) AS labels, properties(n) AS props "
+                f"ORDER BY id(n) SKIP {off} LIMIT {lim}"
+            ).result_set
+            out = []
+            for r in rows:
+                props = dict(r[1]) if r[1] else {}
+                props.pop("name_embedding", None)
+                out.append({"labels": list(r[0] or []), "props": props})
+        elif req.kind == "all_edges":
+            total = graph.query("MATCH ()-[e]->() RETURN count(e)").result_set[0][0]
+            rows = graph.query(
+                f"MATCH (a)-[e]->(b) RETURN type(e) AS t, properties(e) AS props, "
+                f"a.uuid AS src, b.uuid AS tgt ORDER BY id(e) SKIP {off} LIMIT {lim}"
+            ).result_set
+            out = []
+            for r in rows:
+                props = dict(r[1]) if r[1] else {}
+                props.pop("fact_embedding", None)
+                out.append({"type": r[0], "props": props, "src": r[2], "tgt": r[3]})
         else:
-            raise HTTPException(status_code=400, detail="kind must be 'nodes' or 'edges'")
+            raise HTTPException(
+                status_code=400, detail="kind must be nodes|edges|all_nodes|all_edges"
+            )
 
         return {
             "graph_name": graph_name,
@@ -486,6 +513,88 @@ async def export_graph(req: ExportGraphRequest):
     except Exception as e:
         logger.error(f"[graphiti] export-graph failed for {req.client_slug}: {e}")
         raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+def _san_label(s: str) -> str:
+    return "".join(c for c in str(s) if c.isalnum() or c == "_")
+
+
+class ImportGraphRequest(BaseModel):
+    client_slug: str
+    kind: str  # "nodes" | "edges"
+    rows: list[dict]
+    confirm: str  # must equal "import"
+
+
+@router.post("/import-graph")
+async def import_graph(req: ImportGraphRequest):
+    """Recreate nodes/edges from a full-fidelity export (all_nodes / all_edges).
+
+    Nodes are grouped by label-set and bulk-CREATEd with their full property map
+    (labels inlined + sanitized — graphiti labels are alphanumeric/underscore).
+    Edges are grouped by type and connected by endpoint uuid. Embeddings are NOT
+    restored here (regenerated afterward by /admin/reembed-graph). Import nodes
+    before edges so the endpoint MATCHes resolve. Idempotent on a fresh graph.
+    """
+    if req.confirm != "import":
+        raise HTTPException(status_code=400, detail='Confirmation required: confirm="import"')
+
+    from collections import defaultdict
+
+    from falkordb import FalkorDB
+
+    graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+    db = FalkorDB(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+    )
+    graph = db.select_graph(graph_name)
+    imported = 0
+    skipped = 0
+
+    try:
+        if req.kind == "nodes":
+            groups: dict[tuple, list] = defaultdict(list)
+            for row in req.rows:
+                labels = tuple(
+                    _san_label(x) for x in (row.get("labels") or []) if _san_label(x)
+                )
+                groups[labels].append(row.get("props") or {})
+            for labels, propslist in groups.items():
+                lbl = "".join(f":{x}" for x in labels) or ":Entity"
+                graph.query(
+                    f"UNWIND $rows AS p CREATE (n{lbl}) SET n = p", {"rows": propslist}
+                )
+                imported += len(propslist)
+        elif req.kind == "edges":
+            groups_e: dict[str, list] = defaultdict(list)
+            for row in req.rows:
+                t = _san_label(row.get("type") or "RELATES_TO")
+                if not row.get("src") or not row.get("tgt"):
+                    skipped += 1
+                    continue
+                groups_e[t].append(
+                    {"props": row.get("props") or {}, "src": row["src"], "tgt": row["tgt"]}
+                )
+            for t, items in groups_e.items():
+                res = graph.query(
+                    f"UNWIND $rows AS r MATCH (a {{uuid: r.src}}) MATCH (b {{uuid: r.tgt}}) "
+                    f"CREATE (a)-[e:{t}]->(b) SET e = r.props",
+                    {"rows": items},
+                )
+                # relationships_created tells us how many actually connected.
+                created = getattr(res, "relationships_created", None)
+                imported += created if created is not None else len(items)
+        else:
+            raise HTTPException(status_code=400, detail="kind must be 'nodes' or 'edges'")
+
+        return {"graph_name": graph_name, "kind": req.kind, "imported": imported, "skipped": skipped}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[graphiti] import-graph failed for {req.client_slug}: {e}")
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
 
 
 class PersistToDiskRequest(BaseModel):
