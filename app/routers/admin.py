@@ -416,9 +416,10 @@ async def falkordb_save():
 
 class ExportGraphRequest(BaseModel):
     client_slug: str
-    kind: str  # "nodes" | "edges"
+    kind: str  # "nodes" | "edges" | "all_nodes" | "all_edges"
     offset: int = 0
     limit: int = 500
+    graph_name: str | None = None  # raw graph name override (e.g. segment_*)
 
 
 @router.post("/export-graph")
@@ -430,7 +431,7 @@ async def export_graph(req: ExportGraphRequest):
     """
     from falkordb import FalkorDB
 
-    graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+    graph_name = req.graph_name or graphiti_client._graph_name_for_client(req.client_slug)
     db = FalkorDB(
         host=settings.falkordb_host,
         port=settings.falkordb_port,
@@ -529,6 +530,7 @@ class ImportGraphRequest(BaseModel):
     kind: str  # "nodes" | "edges"
     rows: list[dict]
     confirm: str  # must equal "import"
+    graph_name: str | None = None  # raw graph name override (e.g. segment_*)
 
 
 @router.post("/import-graph")
@@ -548,7 +550,7 @@ async def import_graph(req: ImportGraphRequest):
 
     from falkordb import FalkorDB
 
-    graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+    graph_name = req.graph_name or graphiti_client._graph_name_for_client(req.client_slug)
     db = FalkorDB(
         host=settings.falkordb_host,
         port=settings.falkordb_port,
