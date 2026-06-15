@@ -62,6 +62,21 @@ async def health_check():
         except Exception:
             pass
 
+        # Persistence visibility — proves data would survive a restart/upgrade
+        # (RDB enabled, writing to the mounted disk dir, recent save).
+        try:
+            persist = await r.info("persistence")
+            cfg = await r.config_get("dir")
+            status["falkordb"]["persistence"] = {
+                "dir": cfg.get("dir", "unknown"),
+                "rdb_last_save_time": persist.get("rdb_last_save_time"),
+                "rdb_changes_since_last_save": persist.get("rdb_changes_since_last_save"),
+                "rdb_last_bgsave_status": persist.get("rdb_last_bgsave_status"),
+                "aof_enabled": persist.get("aof_enabled"),
+            }
+        except Exception:
+            pass
+
         await r.aclose()
     except Exception as e:
         status["status"] = "degraded"
