@@ -412,3 +412,159 @@ async def falkordb_save():
             await r.aclose()
         except Exception:
             pass
+
+
+class ExportGraphRequest(BaseModel):
+    client_slug: str
+    kind: str  # "nodes" | "edges"
+    offset: int = 0
+    limit: int = 500
+
+
+@router.post("/export-graph")
+async def export_graph(req: ExportGraphRequest):
+    """Paginated content export of a graph's Entity nodes and RELATES_TO edges
+    (uuid + text + structural props; embeddings omitted — they are regenerable
+    verbatim via re-embed from the same text + embedder). A safety-net backup
+    that can fully reconstruct the searchable substrate if needed. Read-only.
+    """
+    from falkordb import FalkorDB
+
+    graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+    db = FalkorDB(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+    )
+    graph = db.select_graph(graph_name)
+    off, lim = int(req.offset), int(req.limit)
+
+    try:
+        if req.kind == "nodes":
+            total = graph.query("MATCH (n:Entity) RETURN count(n)").result_set[0][0]
+            rows = graph.query(
+                "MATCH (n:Entity) RETURN n.uuid AS uuid, n.name AS name, n.summary AS summary, "
+                "n.group_id AS group_id, n.created_at AS created_at, labels(n) AS labels "
+                f"ORDER BY n.uuid SKIP {off} LIMIT {lim}"
+            ).result_set
+            out = [
+                {"uuid": r[0], "name": r[1], "summary": r[2], "group_id": r[3],
+                 "created_at": r[4], "labels": r[5]}
+                for r in rows
+            ]
+        elif req.kind == "edges":
+            total = graph.query(
+                "MATCH ()-[e:RELATES_TO]->() RETURN count(e)"
+            ).result_set[0][0]
+            rows = graph.query(
+                "MATCH ()-[e:RELATES_TO]->() RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, "
+                "e.source_uuid AS src, e.target_uuid AS tgt, e.group_id AS group_id, "
+                "e.created_at AS created_at, e.valid_at AS valid_at, e.invalid_at AS invalid_at, "
+                "e.expired_at AS expired_at, e.episodes AS episodes "
+                f"ORDER BY e.uuid SKIP {off} LIMIT {lim}"
+            ).result_set
+            out = [
+                {"uuid": r[0], "fact": r[1], "name": r[2], "source_uuid": r[3],
+                 "target_uuid": r[4], "group_id": r[5], "created_at": r[6],
+                 "valid_at": r[7], "invalid_at": r[8], "expired_at": r[9], "episodes": r[10]}
+                for r in rows
+            ]
+        else:
+            raise HTTPException(status_code=400, detail="kind must be 'nodes' or 'edges'")
+
+        return {
+            "graph_name": graph_name,
+            "kind": req.kind,
+            "total": total,
+            "offset": off,
+            "count": len(out),
+            "done": off + len(out) >= total,
+            "rows": out,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[graphiti] export-graph failed for {req.client_slug}: {e}")
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+class PersistToDiskRequest(BaseModel):
+    confirm: str  # must equal "persist to /data"
+    target_dir: str = "/data"
+
+
+@router.post("/falkordb-persist-to-disk")
+async def falkordb_persist_to_disk(req: PersistToDiskRequest):
+    """Point FalkorDB's persistence dir at the mounted disk and flush RDB + AOF
+    there, so the data is durable on the disk before a mount-path fix/restart.
+
+    This is the in-place prep for relocating the disk to where FalkorDB writes:
+    after this runs, the persistent disk holds a full copy; remounting that disk
+    to FalkorDB's default data dir then lets a restart auto-restore. Idempotent.
+    """
+    if req.confirm != "persist to /data":
+        raise HTTPException(status_code=400, detail='Confirmation required: confirm="persist to /data"')
+
+    import asyncio
+
+    import redis.asyncio as redis
+
+    r = redis.Redis(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+        decode_responses=True,
+    )
+    try:
+        before = {
+            "dir": (await r.config_get("dir")).get("dir"),
+            "dbfilename": (await r.config_get("dbfilename")).get("dbfilename"),
+            "appendonly": (await r.config_get("appendonly")).get("appendonly"),
+            "appenddirname": (await r.config_get("appenddirname")).get("appenddirname"),
+        }
+        # Repoint persistence at the mounted disk.
+        await r.config_set("dir", req.target_dir)
+
+        aof_on = str(before.get("appendonly", "no")).lower() == "yes"
+        if aof_on:
+            try:
+                await r.execute_command("BGREWRITEAOF")
+            except Exception as e:
+                logger.info(f"[graphiti] bgrewriteaof: {e}")
+        try:
+            await r.bgsave()
+        except Exception as e:
+            logger.info(f"[graphiti] bgsave: {e}")
+
+        # Wait for both rewrite + save to finish.
+        for _ in range(120):
+            info = await r.info("persistence")
+            busy = int(info.get("rdb_bgsave_in_progress", 0) or 0) or int(
+                info.get("aof_rewrite_in_progress", 0) or 0
+            )
+            if not busy:
+                break
+            await asyncio.sleep(0.5)
+
+        info = await r.info("persistence")
+        after_dir = (await r.config_get("dir")).get("dir")
+        result = {
+            "status": "persisted",
+            "before": before,
+            "after_dir": after_dir,
+            "aof_enabled": info.get("aof_enabled"),
+            "aof_last_bgrewrite_status": info.get("aof_last_bgrewrite_status"),
+            "rdb_last_bgsave_status": info.get("rdb_last_bgsave_status"),
+            "rdb_last_save_time": info.get("rdb_last_save_time"),
+            "rdb_changes_since_last_save": info.get("rdb_changes_since_last_save"),
+        }
+        logger.warning(f"[graphiti] persist-to-disk: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[graphiti] persist-to-disk failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Persist failed: {str(e)}")
+    finally:
+        try:
+            await r.aclose()
+        except Exception:
+            pass
