@@ -3,8 +3,9 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
+from app.auth import require_scope, validate_auth_configuration
 from app.config import settings
 from app.routers import admin, graph, health, ingest, search, structured
 from app.services import graphiti_client, graphiti_patches
@@ -24,6 +25,13 @@ logger = logging.getLogger("graphiti_service")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
+    validate_auth_configuration()
+    if settings.graphiti_auth_mode != "required":
+        logger.warning(
+            "[graphiti-auth] service perimeter is %s; set "
+            "GRAPHITI_AUTH_MODE=required after the coordinated credential rollout",
+            settings.graphiti_auth_mode,
+        )
     logger.info(
         f"[graphiti] Starting service — FalkorDB at "
         f"{settings.falkordb_host}:{settings.falkordb_port}"
@@ -41,8 +49,33 @@ app = FastAPI(
 )
 
 app.include_router(health.router, tags=["health"])
-app.include_router(ingest.router, prefix="/ingest", tags=["ingestion"])
-app.include_router(structured.router, prefix="/ingest", tags=["ingestion"])
-app.include_router(search.router, prefix="/search", tags=["search"])
-app.include_router(admin.router, prefix="/admin", tags=["admin"])
-app.include_router(graph.router, prefix="/graph", tags=["graph"])
+app.include_router(
+    ingest.router,
+    prefix="/ingest",
+    tags=["ingestion"],
+    dependencies=[Depends(require_scope("ingest"))],
+)
+app.include_router(
+    structured.router,
+    prefix="/ingest",
+    tags=["ingestion"],
+    dependencies=[Depends(require_scope("ingest"))],
+)
+app.include_router(
+    search.router,
+    prefix="/search",
+    tags=["search"],
+    dependencies=[Depends(require_scope("search"))],
+)
+app.include_router(
+    admin.router,
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_scope("admin"))],
+)
+app.include_router(
+    graph.router,
+    prefix="/graph",
+    tags=["graph"],
+    dependencies=[Depends(require_scope("search"))],
+)

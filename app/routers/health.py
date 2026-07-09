@@ -15,74 +15,36 @@ router = APIRouter()
 
 @router.get("/health")
 async def health_check():
-    """Health check with FalkorDB connectivity and memory stats."""
+    """Minimal public liveness check; never expose tenants or infrastructure."""
     import redis.asyncio as redis
 
     status = {
         "status": "ok",
         "service": "sdi-graphiti-service",
-        "falkordb": {"host": settings.falkordb_host, "port": settings.falkordb_port},
+        "falkordb": {"connected": False},
     }
 
+    r = None
     try:
         r = redis.Redis(
             host=settings.falkordb_host,
             port=settings.falkordb_port,
             password=settings.falkordb_password or None,
             decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
         )
-        info = await r.info("memory")
+        await r.ping()
         status["falkordb"]["connected"] = True
-        status["falkordb"]["used_memory_human"] = info.get("used_memory_human", "unknown")
-        status["falkordb"]["used_memory_peak_human"] = info.get(
-            "used_memory_peak_human", "unknown"
-        )
-        status["falkordb"]["maxmemory_human"] = info.get("maxmemory_human", "unknown")
-
-        # Get list of graphs (FalkorDB-specific command)
-        try:
-            graphs = await r.execute_command("GRAPH.LIST")
-            status["falkordb"]["graphs"] = graphs if graphs else []
-            status["falkordb"]["graph_count"] = len(graphs) if graphs else 0
-        except Exception:
-            status["falkordb"]["graphs"] = []
-            status["falkordb"]["graph_count"] = 0
-
-        # Version visibility — redis-compat version + the FalkorDB module version,
-        # so we can tell at a glance whether the engine is current (relevant to
-        # vector-index support and known fixes).
-        try:
-            srv = await r.info("server")
-            status["falkordb"]["redis_version"] = srv.get("redis_version", "unknown")
-        except Exception:
-            pass
-        try:
-            mods = await r.execute_command("MODULE LIST")
-            status["falkordb"]["modules"] = str(mods)[:300]
-        except Exception:
-            pass
-
-        # Persistence visibility — proves data would survive a restart/upgrade
-        # (RDB enabled, writing to the mounted disk dir, recent save).
-        try:
-            persist = await r.info("persistence")
-            cfg = await r.config_get("dir")
-            status["falkordb"]["persistence"] = {
-                "dir": cfg.get("dir", "unknown"),
-                "rdb_last_save_time": persist.get("rdb_last_save_time"),
-                "rdb_changes_since_last_save": persist.get("rdb_changes_since_last_save"),
-                "rdb_last_bgsave_status": persist.get("rdb_last_bgsave_status"),
-                "aof_enabled": persist.get("aof_enabled"),
-            }
-        except Exception:
-            pass
-
-        await r.aclose()
     except Exception as e:
         status["status"] = "degraded"
-        status["falkordb"]["connected"] = False
-        status["falkordb"]["error"] = str(e)
         logger.error(f"[graphiti] Health check — FalkorDB connection failed: {e}")
+    finally:
+        if r is not None:
+            try:
+                await r.aclose()
+            except Exception:
+                pass
 
     return status
 
@@ -232,10 +194,15 @@ async def readiness_check():
         and checks["falkordb"].get("low_headroom") is not True
     )
 
+    public_checks = {
+        "data_store": {"ready": bool(checks["falkordb"].get("ok"))},
+        "retrieval": {"ready": bool(checks["embedder"].get("ok"))},
+        "generation": {"ready": bool(checks["llm"].get("ok"))},
+    }
     body = {
         "status": "ready" if critical_ok else "degraded",
         "service": "sdi-graphiti-service",
-        "checks": checks,
+        "checks": public_checks,
     }
     status_code = 200 if critical_ok else 503
     if not critical_ok:

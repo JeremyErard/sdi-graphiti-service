@@ -1,5 +1,7 @@
 """Application configuration from environment variables."""
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 
 
@@ -32,6 +34,16 @@ class Settings(BaseSettings):
     # Service settings
     port: int = 8000
     log_level: str = "info"
+
+    # Engage -> Graphiti service authentication. ``off`` preserves the current
+    # production contract during a coordinated rollout; ``optional`` accepts
+    # unsigned legacy traffic but verifies any signed request; ``required``
+    # rejects every non-health request that is not scope- and tenant-bound.
+    graphiti_auth_mode: Literal["off", "optional", "required"] = "off"
+    graphiti_search_secret: str = ""
+    graphiti_ingest_secret: str = ""
+    graphiti_admin_secret: str = ""
+    graphiti_auth_max_clock_skew_seconds: int = 300
 
     class Config:
         env_file = ".env"

@@ -9,7 +9,9 @@ Run: .venv/bin/python -m pytest tests/test_reembed.py -q
 """
 
 import asyncio
+import os
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -45,6 +47,7 @@ def test_chunk_helper_partitions_exactly():
     assert list(admin._chunk([], 128)) == []
 
 
+@pytest.mark.skipif(not os.getenv("VOYAGE_API_KEY"), reason="requires the live Voyage integration key")
 def test_voyage_embedder_path_produces_1024_dim_vectors():
     """Prove the configured embedder (the one /reembed will use) works end-to-end:
     _create_embedder() returns a Voyage client and create_batch yields 1024-dim
