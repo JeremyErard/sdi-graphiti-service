@@ -14,6 +14,7 @@ from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.config import LLMConfig
 
 from app.config import settings
+from app.graph_names import graph_name_for_client, segment_graph_name
 
 logger = logging.getLogger("graphiti_service")
 
@@ -41,15 +42,13 @@ def _parse_dt(v: Any) -> datetime | None:
 
 
 def _graph_name_for_client(client_slug: str) -> str:
-    """Map client slug to isolated graph name."""
-    safe_slug = "".join(c for c in client_slug if c.isalnum() or c == "_").lower()
-    return f"client_{safe_slug}"
+    """Backwards-compatible import surface for the central tenant mapper."""
+    return graph_name_for_client(client_slug)
 
 
 def _segment_graph_name(industry: str) -> str:
-    """Map industry to segment graph name."""
-    safe_industry = "".join(c for c in industry if c.isalnum() or c == "_").lower()
-    return f"segment_{safe_industry}"
+    """Backwards-compatible import surface for the central segment mapper."""
+    return segment_graph_name(industry)
 
 
 def _load_entity_types() -> list[dict[str, str]]:

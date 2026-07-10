@@ -13,12 +13,15 @@ import sys
 import urllib.error
 import urllib.request
 
+from graphiti_http import signed_headers
+
 
 def _post(base, path, body, timeout=120):
+    data = json.dumps(body).encode()
     req = urllib.request.Request(
         base.rstrip("/") + path,
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
+        data=data,
+        headers=signed_headers(path, data, body.get("client_slug", "*")),
         method="POST",
     )
     try:

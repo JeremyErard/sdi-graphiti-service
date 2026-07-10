@@ -27,6 +27,8 @@ import time
 import urllib.error
 import urllib.request
 
+from graphiti_http import signed_headers
+
 CONFIRM = "I understand this overwrites all embeddings"
 
 # Exit-code contract (so an operator/automation can tell apart failure classes):
@@ -42,10 +44,11 @@ def die(msg: str, code: int):
 
 
 def _post(base: str, path: str, body: dict, timeout: int = 120) -> dict:
+    data = json.dumps(body).encode()
     req = urllib.request.Request(
         base.rstrip("/") + path,
-        data=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
+        data=data,
+        headers=signed_headers(path, data, body.get("client_slug", "*")),
         method="POST",
     )
     try:

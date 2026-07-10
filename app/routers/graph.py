@@ -7,15 +7,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
+from app.graph_names import graph_name_for_client
 
 logger = logging.getLogger("graphiti_service")
 
 router = APIRouter()
-
-
-def _graph_name_for_client(client_slug: str) -> str:
-    safe_slug = "".join(c for c in client_slug if c.isalnum() or c == "_").lower()
-    return f"client_{safe_slug}"
 
 
 class GraphDataRequest(BaseModel):
@@ -50,7 +46,7 @@ class GraphDataResponse(BaseModel):
 @router.post("/nodes-and-edges", response_model=GraphDataResponse)
 async def get_graph_data(req: GraphDataRequest):
     """Return all nodes and edges from a client's knowledge graph for visualization."""
-    graph_name = _graph_name_for_client(req.client_slug)
+    graph_name = graph_name_for_client(req.client_slug)
 
     try:
         from falkordb import FalkorDB
