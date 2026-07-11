@@ -690,3 +690,51 @@ async def falkordb_persist_to_disk(req: PersistToDiskRequest):
             await r.aclose()
         except Exception:
             pass
+
+
+class GraphStat(BaseModel):
+    graph_name: str
+    nodes: int
+    edges: int
+
+
+class GraphStatsResponse(BaseModel):
+    graphs: list[GraphStat]
+    graph_count: int
+
+
+@router.get("/graph-stats", response_model=GraphStatsResponse)
+async def graph_stats(client_slug: str | None = None):
+    """Read-only node/edge totals per graph (COUNT queries only).
+
+    Fills the observability gap where totals were previously obtainable only
+    via the mutating /admin/reembed-graph or the heavyweight /admin/export-graph
+    — routine monitoring and the ingestion completeness audit (substrate P0)
+    need a cheap answer. Optionally scoped to one client's graph; otherwise
+    covers every graph on the instance. Inherits the admin router's auth scope.
+    """
+    try:
+        from falkordb import FalkorDB
+
+        db = FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+        if client_slug:
+            names = [graphiti_client._graph_name_for_client(client_slug)]
+        else:
+            names = sorted(db.list_graphs())
+
+        stats: list[GraphStat] = []
+        for name in names:
+            graph = db.select_graph(name)
+            nodes = graph.query("MATCH (n) RETURN count(n)").result_set[0][0]
+            edges = graph.query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
+            stats.append(GraphStat(graph_name=name, nodes=int(nodes), edges=int(edges)))
+        return GraphStatsResponse(graphs=stats, graph_count=len(stats))
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - connection-level failures
+        logger.error("graph-stats failed: %s", exc)
+        raise HTTPException(status_code=502, detail=f"graph-stats failed: {exc}")
