@@ -4,7 +4,7 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.services import graphiti_client
@@ -703,15 +703,22 @@ class GraphStatsResponse(BaseModel):
     graph_count: int
 
 
-@router.get("/graph-stats", response_model=GraphStatsResponse)
-async def graph_stats(client_slug: str | None = None):
+class GraphStatsRequest(BaseModel):
+    client_slug: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
+
+
+@router.post("/graph-stats", response_model=GraphStatsResponse)
+async def graph_stats(req: GraphStatsRequest):
     """Read-only node/edge totals per graph (COUNT queries only).
 
     Fills the observability gap where totals were previously obtainable only
     via the mutating /admin/reembed-graph or the heavyweight /admin/export-graph
     — routine monitoring and the ingestion completeness audit (substrate P0)
-    need a cheap answer. Optionally scoped to one client's graph; otherwise
-    covers every graph on the instance. Inherits the admin router's auth scope.
+    need a cheap answer. The optional client slug is carried in the signed JSON
+    body, not an unsigned query string; otherwise every graph is counted. Uses
+    POST so the existing backend/operator HMAC clients bind the exact method,
+    body, scope, and tenant without inventing a second canonicalization contract.
+    Inherits the admin router's auth scope.
     """
     try:
         from falkordb import FalkorDB
@@ -721,8 +728,8 @@ async def graph_stats(client_slug: str | None = None):
             port=settings.falkordb_port,
             password=settings.falkordb_password or None,
         )
-        if client_slug:
-            names = [graphiti_client._graph_name_for_client(client_slug)]
+        if req.client_slug:
+            names = [graphiti_client._graph_name_for_client(req.client_slug)]
         else:
             names = sorted(db.list_graphs())
 
