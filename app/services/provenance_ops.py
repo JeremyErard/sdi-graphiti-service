@@ -41,10 +41,23 @@ _ANCHOR_FIELDS = (
     "producer_contract_version",
 )
 APPLY_BLOCKED_CODE = "APPLY_BLOCKED_CARDINALITY_GUARD_UNVERIFIED"
+AUDIT_GRAPH_NOT_FOUND_CODE = "AUDIT_GRAPH_NOT_FOUND"
+AUDIT_EPISODE_ROW_LIMIT_CODE = "AUDIT_EPISODE_ROW_LIMIT_EXCEEDED"
+AUDIT_EDGE_ROW_LIMIT_CODE = "AUDIT_EDGE_ROW_LIMIT_EXCEEDED"
+AUDIT_READ_SHAPE_CODE = "AUDIT_READ_SHAPE_INVALID"
+_MAX_EPISODES_PER_FACT = 64
+_MAX_EPISODE_STORAGE_BYTES = 100_000
+_MAX_AUDIT_ROWS = 100_000
 
 
 class ApplyBlockedError(RuntimeError):
     pass
+
+
+class ProvenanceAuditReadError(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 
 
 @dataclass(frozen=True)
@@ -192,13 +205,19 @@ def normalize_provable_episode_list(
     candidate = value
     representation_is_list = isinstance(candidate, list)
     if isinstance(candidate, str):
-        if len(candidate) > 100_000:
+        try:
+            storage_bytes = len(candidate.encode("utf-8"))
+        except UnicodeError:
+            return None, False
+        if storage_bytes > _MAX_EPISODE_STORAGE_BYTES:
             return None, False
         try:
             candidate = ast.literal_eval(candidate)
         except (SyntaxError, ValueError, MemoryError, RecursionError):
             return None, False
-    if not isinstance(candidate, list):
+    if not isinstance(candidate, (list, tuple)):
+        return None, False
+    if len(candidate) > _MAX_EPISODES_PER_FACT:
         return None, False
 
     normalized: list[str] = []
@@ -479,8 +498,14 @@ def run_provenance_audit(
         port=settings.falkordb_port,
         password=settings.falkordb_password or None,
     )
+    graph_names = db.list_graphs()
+    if (
+        not isinstance(graph_names, (list, tuple, set, frozenset))
+        or graph_name not in graph_names
+    ):
+        raise ProvenanceAuditReadError(AUDIT_GRAPH_NOT_FOUND_CODE)
     graph = db.select_graph(graph_name)
-    episode_rows = graph.query(
+    episode_result = graph.ro_query(
         """
         MATCH (episode:Episodic)
         WHERE episode.group_id = $group_id
@@ -488,18 +513,31 @@ def run_provenance_audit(
                episode.source_id, episode.source_type, episode.engagement_id,
                episode.episode_type, episode.anchor_mode,
                episode.producer_contract_version
+        LIMIT 100001
         """,
         params={"group_id": graph_name},
-    ).result_set
-    edge_rows = graph.query(
+    )
+    episode_rows = getattr(episode_result, "result_set", None)
+    if not isinstance(episode_rows, list):
+        raise ProvenanceAuditReadError(AUDIT_READ_SHAPE_CODE)
+    if len(episode_rows) > _MAX_AUDIT_ROWS:
+        raise ProvenanceAuditReadError(AUDIT_EPISODE_ROW_LIMIT_CODE)
+
+    edge_result = graph.ro_query(
         """
         MATCH (source:Entity)-[edge:RELATES_TO]->(target:Entity)
         WHERE edge.group_id = $group_id
         RETURN edge.uuid, edge.source_uuid, edge.target_uuid,
                source.uuid, target.uuid, edge.episodes
+        LIMIT 100001
         """,
         params={"group_id": graph_name},
-    ).result_set
+    )
+    edge_rows = getattr(edge_result, "result_set", None)
+    if not isinstance(edge_rows, list):
+        raise ProvenanceAuditReadError(AUDIT_READ_SHAPE_CODE)
+    if len(edge_rows) > _MAX_AUDIT_ROWS:
+        raise ProvenanceAuditReadError(AUDIT_EDGE_ROW_LIMIT_CODE)
     plan = build_provenance_plan(
         _episode_records(episode_rows),
         _edge_records(edge_rows),

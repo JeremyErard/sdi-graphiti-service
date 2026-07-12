@@ -4,11 +4,16 @@ import json
 
 import pytest
 
+from app.services import provenance_ops
 from app.services.provenance_ops import (
     APPLY_BLOCKED_CODE,
+    AUDIT_EDGE_ROW_LIMIT_CODE,
+    AUDIT_EPISODE_ROW_LIMIT_CODE,
+    AUDIT_GRAPH_NOT_FOUND_CODE,
     ApplyBlockedError,
     EdgeRecord,
     EpisodeRecord,
+    ProvenanceAuditReadError,
     _apply_plan,
     build_provenance_plan,
     normalize_provable_episode_list,
@@ -135,11 +140,36 @@ def test_only_provable_existing_episode_lists_are_normalized():
     ) == (None, False)
     assert normalize_provable_episode_list(
         (EPISODE_ID,), known_episode_ids=known
-    ) == (None, False)
+    ) == ((EPISODE_ID,), False)
     assert normalize_provable_episode_list(
         "['70000000-0000-4000-8000-000000000099']",
         known_episode_ids=known,
     ) == (None, False)
+    assert normalize_provable_episode_list(
+        [EPISODE_ID] * 65,
+        known_episode_ids=known,
+    ) == (None, False)
+    assert normalize_provable_episode_list(
+        " " * 100_001,
+        known_episode_ids=known,
+    ) == (None, False)
+
+
+def test_episode_storage_limit_is_utf8_bytes_and_precedes_parsing(monkeypatch):
+    called = False
+
+    def forbidden_parse(_value):
+        nonlocal called
+        called = True
+        raise AssertionError("oversized storage must not be parsed")
+
+    monkeypatch.setattr(provenance_ops.ast, "literal_eval", forbidden_parse)
+
+    assert normalize_provable_episode_list(
+        "é" * 50_001,
+        known_episode_ids=frozenset({EPISODE_ID}),
+    ) == (None, False)
+    assert called is False
 
 
 def test_plan_repairs_derivable_endpoints_and_converges_idempotently():
@@ -185,6 +215,10 @@ class _Graph:
         self.calls.append((query, params or {}))
         if "SET episode.source_id" in query or "SET edge.source_uuid" in query:
             return _Result([[1]])
+        raise AssertionError("audit reads must use ro_query")
+
+    def ro_query(self, query, params=None):
+        self.calls.append((query, params or {}))
         if "RETURN episode.uuid, episode.name" in query:
             return _Result(
                 [[EPISODE_ID, NAME, DESCRIPTION, None, None, None, None, None, None]]
@@ -204,6 +238,9 @@ class _DB:
     def select_graph(self, graph_name):
         self.selected.append(graph_name)
         return self.graph
+
+    def list_graphs(self):
+        return ["client_pokagon"]
 
 
 def test_default_audit_mode_performs_no_mutation_and_emits_no_graph_values():
@@ -227,6 +264,7 @@ def test_default_audit_mode_performs_no_mutation_and_emits_no_graph_values():
         "apply_conflicts": 0,
     }
     assert len(graph.calls) == 2
+    assert all("LIMIT 100001" in query for query, _ in graph.calls)
     assert not any(" SET " in " ".join(query.split()) for query, _ in graph.calls)
     serialized = json.dumps(result)
     for forbidden in (NAME, DESCRIPTION, "doc-456", EPISODE_ID, EDGE_ID):
@@ -352,6 +390,20 @@ def test_real_apply_entrypoint_is_blocked_before_database_access(capsys):
     }
 
 
+def test_cli_read_failure_emits_only_fixed_code(monkeypatch, capsys):
+    def fail_read(*_args, **_kwargs):
+        raise ProvenanceAuditReadError(AUDIT_GRAPH_NOT_FOUND_CODE)
+
+    monkeypatch.setattr(provenance_audit, "run_provenance_audit", fail_read)
+
+    assert provenance_audit.main(["pokagon"]) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "mode": "audit",
+        "counts": {},
+        "codes": {AUDIT_GRAPH_NOT_FOUND_CODE: 1},
+    }
+
+
 def test_invalid_slug_is_rejected_before_graph_access():
     called = False
 
@@ -362,3 +414,55 @@ def test_invalid_slug_is_rejected_before_graph_access():
     with pytest.raises(ValueError):
         run_provenance_audit("*", apply=True, db_factory=forbidden_db)
     assert called is False
+
+
+def test_missing_graph_is_fixed_code_and_never_selected():
+    graph = _Graph()
+    db = _DB(graph)
+    db.list_graphs = lambda: ["client_other"]
+
+    with pytest.raises(ProvenanceAuditReadError) as failure:
+        run_provenance_audit(
+            "pokagon",
+            db_factory=lambda **_kwargs: db,
+        )
+
+    assert failure.value.code == AUDIT_GRAPH_NOT_FOUND_CODE
+    assert db.selected == []
+    assert graph.calls == []
+
+
+@pytest.mark.parametrize(
+    ("episode_count", "edge_count", "code"),
+    [
+        (100_001, 0, AUDIT_EPISODE_ROW_LIMIT_CODE),
+        (0, 100_001, AUDIT_EDGE_ROW_LIMIT_CODE),
+    ],
+)
+def test_audit_row_sentinel_hard_fails_without_a_partial_plan(
+    episode_count, edge_count, code
+):
+    class _BoundGraph:
+        def __init__(self):
+            self.calls = []
+
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("audit reads must never use query")
+
+        def ro_query(self, query, params=None):
+            self.calls.append((query, params or {}))
+            if "MATCH (episode:Episodic)" in query:
+                return _Result([[None] * 9] * episode_count)
+            return _Result([[None] * 6] * edge_count)
+
+    graph = _BoundGraph()
+    db = _DB(graph)
+
+    with pytest.raises(ProvenanceAuditReadError) as failure:
+        run_provenance_audit(
+            "pokagon",
+            db_factory=lambda **_kwargs: db,
+        )
+
+    assert failure.value.code == code
+    assert all("LIMIT 100001" in query for query, _ in graph.calls)

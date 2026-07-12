@@ -16,6 +16,7 @@ from app.config import settings
 SEARCH_SECRET = "search-secret-that-is-at-least-32-characters"
 INGEST_SECRET = "ingest-secret-that-is-at-least-32-characters"
 ADMIN_SECRET = "admin-secret-that-is-at-least-32-characters"
+SIDE_EFFECTS = {"ingest": 0, "admin": 0, "graph": 0}
 
 
 class TenantRequest(BaseModel):
@@ -38,12 +39,20 @@ async def search_echo(req: TenantRequest):
 
 @app.post("/ingest/episode", dependencies=[Depends(require_scope("ingest"))])
 async def ingest_echo(req: TenantRequest):
+    SIDE_EFFECTS["ingest"] += 1
     return req.model_dump()
 
 
 @app.post("/admin/save", dependencies=[Depends(require_scope("admin"))])
 async def admin_echo():
+    SIDE_EFFECTS["admin"] += 1
     return {"status": "saved"}
+
+
+@app.post("/graph/data", dependencies=[Depends(require_scope("search"))])
+async def graph_echo(req: TenantRequest):
+    SIDE_EFFECTS["graph"] += 1
+    return req.model_dump()
 
 
 client = TestClient(app)
@@ -56,6 +65,9 @@ def required_auth(monkeypatch):
     monkeypatch.setattr(settings, "graphiti_ingest_secret", INGEST_SECRET)
     monkeypatch.setattr(settings, "graphiti_admin_secret", ADMIN_SECRET)
     monkeypatch.setattr(settings, "graphiti_auth_max_clock_skew_seconds", 300)
+    monkeypatch.setattr(settings, "graphiti_acceptance_probe_mode", False)
+    for key in SIDE_EFFECTS:
+        SIDE_EFFECTS[key] = 0
     seen: set[tuple[str, str]] = set()
 
     async def consume(scope: str, nonce: str) -> bool:
@@ -143,6 +155,47 @@ def test_valid_signature_reaches_route_and_preserves_body():
     )
     assert response.status_code == 200
     assert response.json() == {"client_slug": "pokagon", "value": "preserved"}
+
+
+def test_probe_process_blocks_ingest_admin_and_graph_before_side_effects(monkeypatch):
+    monkeypatch.setattr(settings, "graphiti_acceptance_probe_mode", True)
+    requests = (
+        (
+            "/ingest/episode",
+            "ingest",
+            "pokagon",
+            INGEST_SECRET,
+            encoded({"client_slug": "pokagon"}),
+        ),
+        ("/admin/save", "admin", "*", ADMIN_SECRET, b""),
+        (
+            "/graph/data",
+            "search",
+            "pokagon",
+            SEARCH_SECRET,
+            encoded({"client_slug": "pokagon"}),
+        ),
+    )
+
+    for path, scope, client_slug, secret, body in requests:
+        response = client.post(
+            path,
+            content=body,
+            headers=headers(
+                path=path,
+                scope=scope,
+                client_slug=client_slug,
+                body=body,
+                secret=secret,
+            ),
+        )
+        assert response.status_code == 403
+        assert response.json() == {
+            "detail": "Acceptance probe process permits only the search probe endpoint"
+        }
+
+    assert SIDE_EFFECTS == {"ingest": 0, "admin": 0, "graph": 0}
+    assert client.get("/health").status_code == 200
 
 
 def test_scope_cannot_be_reused_for_ingest():

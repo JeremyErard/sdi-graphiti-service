@@ -142,7 +142,12 @@ def _patch_search(
     return calls
 
 
-def _request(*, max_results: int = 1, include_segment=None) -> dict:
+def _request(
+    *,
+    max_results: int = 1,
+    include_segment=None,
+    acceptance_probe=None,
+) -> dict:
     payload = {
         "client_slug": "pokagon",
         "engagement_id": "engagement-123",
@@ -151,6 +156,8 @@ def _request(*, max_results: int = 1, include_segment=None) -> dict:
     }
     if include_segment is not None:
         payload["include_segment"] = include_segment
+    if acceptance_probe is not None:
+        payload["acceptance_probe"] = acceptance_probe
     return payload
 
 
@@ -338,6 +345,7 @@ def test_rollout_configuration_defaults_safe_and_rejects_unknown_modes():
     defaults = Settings(_env_file=None)
     assert defaults.graphiti_provenance_mode == "legacy"
     assert defaults.graphiti_structured_v2_write_mode == "off"
+    assert defaults.graphiti_acceptance_probe_mode is False
     with pytest.raises(ValidationError):
         Settings(_env_file=None, graphiti_provenance_mode="unknown")
     with pytest.raises(ValidationError):
@@ -354,6 +362,27 @@ def test_rollout_configuration_defaults_safe_and_rejects_unknown_modes():
         graphiti_structured_v2_write_mode="staged",
     )
     assert staged.graphiti_structured_v2_write_mode == "staged"
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            graphiti_acceptance_probe_mode=True,
+            graphiti_provenance_mode="shadow",
+            graphiti_auth_mode="required",
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            graphiti_acceptance_probe_mode=True,
+            graphiti_provenance_mode="enforce",
+            graphiti_auth_mode="optional",
+        )
+    probe = Settings(
+        _env_file=None,
+        graphiti_acceptance_probe_mode=True,
+        graphiti_provenance_mode="enforce",
+        graphiti_auth_mode="required",
+    )
+    assert probe.graphiti_acceptance_probe_mode is True
 
 
 def test_legacy_mode_makes_one_k_sized_search_and_preserves_old_wire_cap(
@@ -540,6 +569,50 @@ def test_enforce_mode_makes_only_the_bounded_overfetch_call(monkeypatch):
 
     assert response.status_code == 200
     assert calls["search"]["max_results"] == 6
+
+
+def test_acceptance_probe_boolean_is_a_bidirectional_process_fence(monkeypatch):
+    called = False
+
+    async def forbidden_search(**_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("mismatched probe fence must precede graph access")
+
+    monkeypatch.setattr(graphiti_client, "search_with_path", forbidden_search)
+    response = _client().post(
+        "/search/context",
+        json=_request(acceptance_probe=True),
+    )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Acceptance probe request/process mode mismatch"
+    }
+    assert called is False
+
+    monkeypatch.setattr(search_router.settings, "graphiti_acceptance_probe_mode", True)
+    response = _client().post("/search/context", json=_request())
+    assert response.status_code == 409
+    assert called is False
+
+    response = _client().post(
+        "/search/context",
+        json={**_request(), "acceptance_probe": "true"},
+    )
+    assert response.status_code == 422
+    assert called is False
+
+    _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(FACT_IDS[0])],
+        resolved={FACT_IDS[0]: _edge(FACT_IDS[0])},
+    )
+    response = _client().post(
+        "/search/context",
+        json=_request(acceptance_probe=True),
+    )
+    assert response.status_code == 200
+    assert response.json()["provenance_summary"]["retrieval_path"] == "fast"
 
 
 def test_segment_defaults_off_and_true_is_rejected_before_graph_access(monkeypatch):
@@ -1236,6 +1309,146 @@ def test_malformed_fallback_shape_reaches_router_telemetry_boundary(monkeypatch)
 
     assert edges is None
     assert path == "hybrid_fallback"
+
+
+def test_probe_fast_search_and_resolution_use_only_existing_graph_ro_queries(
+    monkeypatch,
+):
+    edge_row, source_row = _resolution_rows()
+    fast_row = [
+        edge_row[0],
+        edge_row[6],
+        edge_row[3],
+        edge_row[1],
+        edge_row[2],
+        edge_row[4],
+        edge_row[5],
+        edge_row[7],
+        edge_row[8],
+        edge_row[9],
+        edge_row[10],
+    ]
+
+    class _Embedder:
+        async def create(self, *, input_data):
+            assert input_data == ["monthly close"]
+            return [0.1, 0.2]
+
+    class _ProbeGraph:
+        def __init__(self):
+            self.reads: list[tuple[str, dict]] = []
+
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("probe graph access must never use query")
+
+        def ro_query(self, query, params=None):
+            self.reads.append((query, params or {}))
+            if "db.idx.vector.queryRelationships" in query:
+                return _QueryResult([fast_row])
+            if "db.idx.fulltext.queryRelationships" in query:
+                return _QueryResult([fast_row])
+            if "MATCH (subject:Entity)" in query:
+                return _QueryResult([edge_row])
+            if "MATCH (episode:Episodic)" in query:
+                return _QueryResult([source_row])
+            raise AssertionError(f"unexpected read-only query: {query}")
+
+    class _ProbeDB:
+        def __init__(self, graph):
+            self.graph = graph
+            self.selected: list[str] = []
+
+        def list_graphs(self):
+            return ["client_pokagon"]
+
+        def select_graph(self, graph_name):
+            self.selected.append(graph_name)
+            return self.graph
+
+    graph = _ProbeGraph()
+    db = _ProbeDB(graph)
+
+    async def forbidden_client(*_args, **_kwargs):
+        raise AssertionError("probe mode must never initialize Graphiti")
+
+    def forbidden_index(*_args, **_kwargs):
+        raise AssertionError("probe mode must never ensure or build an index")
+
+    def forbidden_llm(*_args, **_kwargs):
+        raise AssertionError("probe mode must never initialize a generative client")
+
+    monkeypatch.setattr(graphiti_client.settings, "graphiti_acceptance_probe_mode", True)
+    monkeypatch.setattr(graphiti_client, "_create_embedder", lambda: _Embedder())
+    monkeypatch.setattr(graphiti_client, "_ensure_edge_vector_index", forbidden_index)
+    monkeypatch.setattr(graphiti_client, "_create_llm_client", forbidden_llm)
+    monkeypatch.setattr(graphiti_client, "get_client", forbidden_client)
+    monkeypatch.setattr(falkordb, "FalkorDB", lambda **_kwargs: db)
+
+    edges, path = asyncio.run(
+        graphiti_client.search_with_path("pokagon", "monthly close", 3)
+    )
+    resolved, events = asyncio.run(
+        graphiti_client.resolve_search_provenance(
+            "pokagon",
+            edges,
+        )
+    )
+
+    assert path == "fast"
+    assert events == 0
+    assert resolved[FACT_IDS[0]] == _edge(FACT_IDS[0])
+    assert db.selected == ["client_pokagon", "client_pokagon"]
+    assert len(graph.reads) == 4
+
+
+@pytest.mark.parametrize("fast_failure", [None, RuntimeError("unavailable")])
+def test_probe_fast_empty_or_failure_never_falls_back_or_gets_client(
+    monkeypatch, fast_failure
+):
+    async def fake_fast(*_args, **_kwargs):
+        if fast_failure is not None:
+            raise fast_failure
+        return []
+
+    async def forbidden_client(*_args, **_kwargs):
+        raise AssertionError("probe mode must never enter Graphiti fallback")
+
+    monkeypatch.setattr(graphiti_client.settings, "graphiti_acceptance_probe_mode", True)
+    monkeypatch.setattr(graphiti_client, "_search_fast", fake_fast)
+    monkeypatch.setattr(graphiti_client, "get_client", forbidden_client)
+
+    with pytest.raises(graphiti_client.AcceptanceProbeReadError):
+        asyncio.run(
+            graphiti_client.search_with_path("pokagon", "monthly close", 3)
+        )
+
+
+def test_probe_missing_graph_fails_before_select_embedding_or_index(monkeypatch):
+    class _MissingDB:
+        def __init__(self):
+            self.selected = []
+
+        def list_graphs(self):
+            return ["client_other"]
+
+        def select_graph(self, graph_name):
+            self.selected.append(graph_name)
+            raise AssertionError("missing graph must never be selected")
+
+    db = _MissingDB()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("missing graph preflight must fail first")
+
+    monkeypatch.setattr(graphiti_client.settings, "graphiti_acceptance_probe_mode", True)
+    monkeypatch.setattr(graphiti_client, "_create_embedder", forbidden)
+    monkeypatch.setattr(graphiti_client, "_ensure_edge_vector_index", forbidden)
+    monkeypatch.setattr(falkordb, "FalkorDB", lambda **_kwargs: db)
+
+    with pytest.raises(graphiti_client.AcceptanceProbeReadError):
+        asyncio.run(graphiti_client._search_fast("pokagon", "monthly close", 3))
+
+    assert db.selected == []
 
 
 def test_fast_row_projection_retains_endpoint_uuid_name_and_episode_list():

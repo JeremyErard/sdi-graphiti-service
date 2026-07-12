@@ -20,9 +20,25 @@ from app.services.provenance_ops import canonical_uuid, normalize_provable_episo
 
 StructuralStatus = Literal["chained", "pre_chain", "malformed"]
 UNRESOLVED_DIMENSION = "unresolved"
+PROVENANCE_STATS_EPISODE_ROW_LIMIT_CODE = (
+    "PROVENANCE_STATS_EPISODE_ROW_LIMIT_EXCEEDED"
+)
+PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE = "PROVENANCE_STATS_EDGE_ROW_LIMIT_EXCEEDED"
+PROVENANCE_STATS_ENGAGEMENT_BUCKET_LIMIT_CODE = (
+    "PROVENANCE_STATS_ENGAGEMENT_BUCKET_LIMIT_EXCEEDED"
+)
+PROVENANCE_STATS_READ_SHAPE_CODE = "PROVENANCE_STATS_READ_SHAPE_INVALID"
+_MAX_STATS_ROWS = 100_000
+_MAX_ENGAGEMENT_BUCKETS = 256
 _KIND_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,239}")
 _EPISODE_TYPES = frozenset(item.value for item in EpisodeType)
+
+
+class ProvenanceStatsReadError(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
 
 
 @dataclass(frozen=True)
@@ -46,12 +62,33 @@ class StatsEdge:
 
 
 def _text(value: Any) -> str | None:
+    """Return text safe to echo as a bounded aggregate dimension."""
+
     if not isinstance(value, str):
         return None
     normalized = value.strip()
     if not normalized or len(normalized) > 240:
         return None
     if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+        return None
+    return normalized
+
+
+def _structural_text(value: Any, maximum: int) -> str | None:
+    """Mirror search completeness without asserting dimension-render safety."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or any(
+            (ord(character) < 32 and character not in "\t\n\r")
+            or ord(character) == 127
+            for character in normalized
+        )
+    ):
         return None
     return normalized
 
@@ -80,13 +117,13 @@ def _episode_type(value: Any) -> str | None:
 
 
 def _source_complete(source: StatsEpisode) -> bool:
-    source_type = _kind(source.source_type)
-    source_id = _identifier(source.source_id)
-    engagement_id = _identifier(source.engagement_id)
-    episode_type = _episode_type(source.episode_type)
-    anchor_mode = _text(source.anchor_mode)
-    producer = _text(source.producer_contract_version)
-    write_state = _text(source.provenance_write_state)
+    source_type = _structural_text(source.source_type, 64)
+    source_id = _structural_text(source.source_id, 240)
+    engagement_id = _structural_text(source.engagement_id, 240)
+    episode_type = _structural_text(source.episode_type, 64)
+    anchor_mode = _structural_text(source.anchor_mode, 64)
+    producer = _structural_text(source.producer_contract_version, 64)
+    write_state = _structural_text(source.provenance_write_state, 32)
     if not all(
         (
             _present_flag(source.has_name),
@@ -121,13 +158,13 @@ def _source_complete(source: StatsEpisode) -> bool:
 def _source_claims_malformed(source: StatsEpisode, *, duplicate: bool) -> bool:
     if duplicate:
         return True
-    producer = _text(source.producer_contract_version)
-    anchor_mode = _text(source.anchor_mode)
+    producer = _structural_text(source.producer_contract_version, 64)
+    anchor_mode = _structural_text(source.anchor_mode, 64)
     if producer == LEGACY_STRUCTURED_CONTRACT_VERSION:
         return False
     if (
         producer == STRUCTURED_PROVENANCE_CONTRACT_VERSION
-        and _text(source.provenance_write_state) == "staging"
+        and _structural_text(source.provenance_write_state, 32) == "staging"
     ):
         return False
     return bool(
@@ -232,6 +269,11 @@ def build_provenance_aggregates(
         for engagement_id in engagements:
             engagement_counts[(status, engagement_id)] += 1
 
+    if len(engagement_counts) > _MAX_ENGAGEMENT_BUCKETS:
+        raise ProvenanceStatsReadError(
+            PROVENANCE_STATS_ENGAGEMENT_BUCKET_LIMIT_CODE
+        )
+
     return {
         "facts_total": sum(status_counts.values()),
         "malformed_response_events": min(
@@ -295,7 +337,7 @@ def _edge_records(rows: Iterable[Any]) -> tuple[StatsEdge, ...]:
 
 
 def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
-    episode_rows = graph.query(
+    episode_result = graph.ro_query(
         """
         MATCH (episode:Episodic)
         WHERE episode.group_id = $group_id
@@ -307,17 +349,30 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
                episode.episode_type, episode.anchor_mode,
                episode.producer_contract_version,
                episode.provenance_write_state
+        LIMIT 100001
         """,
         params={"group_id": graph_name},
-    ).result_set
-    edge_rows = graph.query(
+    )
+    episode_rows = getattr(episode_result, "result_set", None)
+    if not isinstance(episode_rows, list):
+        raise ProvenanceStatsReadError(PROVENANCE_STATS_READ_SHAPE_CODE)
+    if len(episode_rows) > _MAX_STATS_ROWS:
+        raise ProvenanceStatsReadError(PROVENANCE_STATS_EPISODE_ROW_LIMIT_CODE)
+
+    edge_result = graph.ro_query(
         """
         MATCH ()-[edge:RELATES_TO]->()
         WHERE edge.group_id = $group_id
         RETURN edge.uuid, edge.episodes
+        LIMIT 100001
         """,
         params={"group_id": graph_name},
-    ).result_set
+    )
+    edge_rows = getattr(edge_result, "result_set", None)
+    if not isinstance(edge_rows, list):
+        raise ProvenanceStatsReadError(PROVENANCE_STATS_READ_SHAPE_CODE)
+    if len(edge_rows) > _MAX_STATS_ROWS:
+        raise ProvenanceStatsReadError(PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE)
     episodes = _episode_records(episode_rows)
     edges = _edge_records(edge_rows)
     return build_provenance_aggregates(episodes, edges)

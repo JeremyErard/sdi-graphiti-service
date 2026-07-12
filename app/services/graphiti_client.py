@@ -29,7 +29,7 @@ _clients: dict[str, Graphiti] = {}
 # index exists this process-lifetime (so we don't re-issue CREATE every search).
 _edge_vindex_ensured: set[str] = set()
 
-_MAX_EPISODE_STORAGE_CHARS = 100_000
+_MAX_EPISODE_STORAGE_BYTES = 100_000
 _MAX_EPISODES_PER_FACT = 64
 
 
@@ -69,6 +69,32 @@ class ResolvedSearchEdge:
 RetrievalPath = Literal["fast", "hybrid_fallback"]
 
 
+class AcceptanceProbeReadError(RuntimeError):
+    """Fixed-boundary failure for a dedicated read-only probe process."""
+
+
+def _select_existing_probe_graph(db: Any, graph_name: str) -> Any:
+    """Select only an exact graph already reported by ``GRAPH.LIST``.
+
+    FalkorDB's normal graph selection followed by ``GRAPH.QUERY`` can create an
+    empty graph key. Probe mode must never turn a missing-tenant observation
+    into graph state, so membership is proven before selection.
+    """
+
+    names = db.list_graphs()
+    if not isinstance(names, (list, tuple, set, frozenset)) or graph_name not in names:
+        raise AcceptanceProbeReadError("acceptance probe graph is unavailable")
+    return db.select_graph(graph_name)
+
+
+def _graph_read(graph: Any, query: str, params: dict[str, Any] | None = None) -> Any:
+    """Use FalkorDB's read-only command in acceptance-probe processes."""
+
+    if settings.graphiti_acceptance_probe_mode:
+        return graph.ro_query(query, params)
+    return graph.query(query, params)
+
+
 def _parse_dt(v: Any) -> datetime | None:
     """Best-effort parse of a stored temporal value to datetime, else None.
 
@@ -102,11 +128,15 @@ def _episode_uuid_list(value: Any) -> tuple[tuple[str, ...], bool]:
     if candidate is None:
         return (), True
     if isinstance(candidate, str):
-        if len(candidate) > _MAX_EPISODE_STORAGE_CHARS:
+        try:
+            storage_bytes = len(candidate.encode("utf-8"))
+        except UnicodeError:
+            return (), False
+        if storage_bytes > _MAX_EPISODE_STORAGE_BYTES:
             return (), False
         try:
             candidate = ast.literal_eval(candidate)
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, MemoryError, RecursionError):
             return (), False
     if not isinstance(candidate, (list, tuple)):
         return (), False
@@ -506,11 +536,6 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     fall back to graphiti's own hybrid search; a BM25 failure degrades to
     vector-only within this function (still fast and relevant).
     """
-    embedder = _create_embedder()
-    if embedder is None:
-        raise RuntimeError("fast search requires an explicit (Voyage) embedder")
-    qvec = await embedder.create(input_data=[query.replace("\n", " ")])
-
     graph_name = _graph_name_for_client(client_slug)
     from falkordb import FalkorDB
 
@@ -519,8 +544,20 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         port=settings.falkordb_port,
         password=settings.falkordb_password or None,
     )
-    graph = db.select_graph(graph_name)
-    _ensure_edge_vector_index(graph, graph_name)
+    graph = (
+        _select_existing_probe_graph(db, graph_name)
+        if settings.graphiti_acceptance_probe_mode
+        else db.select_graph(graph_name)
+    )
+    if not settings.graphiti_acceptance_probe_mode:
+        _ensure_edge_vector_index(graph, graph_name)
+
+    embedder = _create_embedder()
+    if embedder is None:
+        raise RuntimeError("fast search requires an explicit (Voyage) embedder")
+    # This is a query-embedding call only. Probe mode never constructs Graphiti
+    # or an extraction/generative client.
+    qvec = await embedder.create(input_data=[query.replace("\n", " ")])
 
     # Pull a candidate pool 2x the requested size from each method, then fuse.
     pool = max(int(max_results) * 2, int(max_results))
@@ -538,7 +575,8 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         return order
 
     # Cosine via HNSW (k inlined int; vector passed as the proven vecf32($param)).
-    vres = graph.query(
+    vres = _graph_read(
+        graph,
         f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
         f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
         {"q": qvec, "group_id": graph_name},
@@ -551,7 +589,8 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     safe_q = _lucene_sanitize(query)
     if safe_q:
         try:
-            bres = graph.query(
+            bres = _graph_read(
+                graph,
                 f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
                 f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN} LIMIT {pool}",
                 {"query": safe_q, "group_id": graph_name},
@@ -592,6 +631,7 @@ async def search_with_path(
     graph_name = _graph_name_for_client(client_slug)
     start = time.time()
 
+    probe_mode = settings.graphiti_acceptance_probe_mode
     try:
         edges = await _search_fast(client_slug, query, max_results)
         if edges:
@@ -600,8 +640,24 @@ async def search_with_path(
                 f"({(time.time() - start) * 1000:.0f}ms)"
             )
             return edges, "fast"
+        if probe_mode:
+            raise AcceptanceProbeReadError(
+                "acceptance probe fast search returned no results"
+            )
         logger.info(f"[graphiti] fast search returned 0 on {graph_name}; falling back to hybrid")
     except Exception as error:
+        if probe_mode:
+            logger.warning(
+                "[graphiti] acceptance probe fast search failed on %s "
+                "error_type=%s",
+                graph_name,
+                type(error).__name__,
+            )
+            if isinstance(error, AcceptanceProbeReadError):
+                raise
+            raise AcceptanceProbeReadError(
+                "acceptance probe fast search is unavailable"
+            ) from error
         logger.warning(
             "[graphiti] fast search failed on %s error_type=%s; falling back "
             "to hybrid",
@@ -674,8 +730,13 @@ async def resolve_search_provenance(
         port=settings.falkordb_port,
         password=settings.falkordb_password or None,
     )
-    graph = db.select_graph(graph_name)
-    edge_rows = graph.query(
+    graph = (
+        _select_existing_probe_graph(db, graph_name)
+        if settings.graphiti_acceptance_probe_mode
+        else db.select_graph(graph_name)
+    )
+    edge_rows = _graph_read(
+        graph,
         """
         MATCH (subject:Entity)-[edge:RELATES_TO]->(object:Entity)
         WHERE edge.uuid IN $edge_uuids AND edge.group_id = $group_id
@@ -745,7 +806,8 @@ async def resolve_search_provenance(
     source_by_episode: dict[str, ResolvedEpisodeAnchor] = {}
     corrupted_episode_ids: set[str] = set()
     if episode_ids:
-        source_rows = graph.query(
+        source_rows = _graph_read(
+            graph,
             """
             MATCH (episode:Episodic)
             WHERE episode.uuid IN $episode_uuids AND episode.group_id = $group_id

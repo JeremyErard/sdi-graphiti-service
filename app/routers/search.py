@@ -332,6 +332,11 @@ def _failed_shadow_summary(
 async def search_context(req: SearchContextRequest):
     """Serve compatibility, non-enforcing shadow, or enforced v3 provenance."""
 
+    if req.acceptance_probe is not settings.graphiti_acceptance_probe_mode:
+        raise HTTPException(
+            status_code=409,
+            detail="Acceptance probe request/process mode mismatch",
+        )
     if req.include_segment:
         raise HTTPException(
             status_code=409,

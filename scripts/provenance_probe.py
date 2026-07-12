@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -23,6 +24,9 @@ import urllib.parse
 import urllib.request
 import uuid as uuidlib
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -32,11 +36,81 @@ from pydantic import (
     model_validator,
 )
 
+from app.graph_names import graph_name_for_client
+
 
 SEARCH_PATH = "/search/context"
 MANIFEST_CONTRACT_VERSION = "graphiti_p1_probe_manifest_v1"
 RESPONSE_CONTRACT_VERSION = "graphiti_search_context_v3"
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_SOURCES_PER_FACT = 64
+MAX_SOURCES_PER_RESPONSE = 500
+OVERFETCH_FACTOR = 3
+MAX_OVERFETCH = 150
+
+_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "contract_version",
+        "facts",
+        "segment_insights",
+        "graph_name",
+        "search_time_ms",
+        "provenance_summary",
+    }
+)
+_FACT_FIELDS = frozenset(
+    {
+        "fact_id",
+        "subject",
+        "subject_name",
+        "predicate",
+        "object",
+        "object_name",
+        "fact",
+        "episodes",
+        "sources",
+        "chain_status",
+        "valid_from",
+        "valid_to",
+        "expired_at",
+    }
+)
+_SOURCE_FIELDS = frozenset(
+    {
+        "episode_uuid",
+        "episode_name",
+        "source_description",
+        "source_type",
+        "source_id",
+        "engagement_id",
+        "episode_type",
+        "anchor_mode",
+        "producer_contract_version",
+        "valid_at",
+    }
+)
+_SUMMARY_FIELDS = frozenset(
+    {
+        "contract_version",
+        "candidates",
+        "service_forwarded",
+        "malformed_item_suppressed",
+        "expired_suppressed",
+        "pre_chain_suppressed",
+        "cross_engagement_suppressed",
+        "malformed_response_events",
+        "retrieval_path",
+        "requested_results",
+        "overfetch_limit",
+        "starved_at_service",
+    }
+)
+_SUPPRESSION_FIELDS = (
+    "malformed_item_suppressed",
+    "expired_suppressed",
+    "pre_chain_suppressed",
+    "cross_engagement_suppressed",
+)
 
 
 class RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -75,10 +149,36 @@ class ExpectedIdentity(BaseModel):
     episode_uuid: uuidlib.UUID
     source_type: str
     source_id: str
+    episode_type: str
+    anchor_mode: str
+    producer_contract_version: str
 
-    @field_validator("source_type", "source_id")
+    @field_validator("fact_id", "episode_uuid", mode="before")
     @classmethod
-    def validate_source_identity(cls, value: str) -> str:
+    def validate_canonical_uuid(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError("expected UUID identity must be canonical text")
+        try:
+            canonical = str(uuidlib.UUID(value))
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("expected UUID identity is invalid") from None
+        if canonical != value:
+            raise ValueError("expected UUID identity must be canonical text")
+        return value
+
+    @field_validator(
+        "source_type",
+        "episode_type",
+        "anchor_mode",
+        "producer_contract_version",
+    )
+    @classmethod
+    def validate_source_kind(cls, value: str) -> str:
+        return _bounded_text(value, "source identity", 64)
+
+    @field_validator("source_id")
+    @classmethod
+    def validate_source_id(cls, value: str) -> str:
         return _bounded_text(value, "source identity", 240)
 
 
@@ -89,6 +189,7 @@ class PinnedProbe(BaseModel):
     query: str
     max_results: int = Field(ge=1, le=50)
     minimum_results: int = Field(ge=1, le=50)
+    retrieval_path: Literal["fast"]
     expected: list[ExpectedIdentity] = Field(min_length=1, max_length=50)
 
     @field_validator("query")
@@ -104,7 +205,15 @@ class PinnedProbe(BaseModel):
         if len(distinct_fact_ids) > self.max_results:
             raise ValueError("expected fact identities exceed max_results")
         identities = [
-            (str(item.fact_id), str(item.episode_uuid), item.source_type, item.source_id)
+            (
+                str(item.fact_id),
+                str(item.episode_uuid),
+                item.source_type,
+                item.source_id,
+                item.episode_type,
+                item.anchor_mode,
+                item.producer_contract_version,
+            )
             for item in self.expected
         ]
         if len(identities) != len(set(identities)):
@@ -226,18 +335,45 @@ def _nonempty_wire_text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _wire_text(value: Any, maximum: int) -> bool:
+    return _nonempty_wire_text(value) and len(value) <= maximum
+
+
+def _nullable_wire_time(value: Any) -> bool:
+    return value is None or _wire_text(value, 128)
+
+
+def _nonnegative_wire_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _exact_fields(value: Any, fields: frozenset[str]) -> bool:
+    return isinstance(value, dict) and set(value) == fields
+
+
 def _validate_probe_response(
     manifest: ProbeManifest,
     probe: PinnedProbe,
     response: dict[str, Any],
 ) -> None:
+    if set(response) != _TOP_LEVEL_FIELDS:
+        raise ProbeFailure("RESPONSE_TOP_LEVEL_SHAPE_INVALID")
     if response.get("contract_version") != RESPONSE_CONTRACT_VERSION:
         raise ProbeFailure("RESPONSE_CONTRACT_MISMATCH")
+    if response.get("graph_name") != graph_name_for_client(manifest.client_slug):
+        raise ProbeFailure("RESPONSE_GRAPH_MISMATCH")
     if response.get("segment_insights") != []:
         raise ProbeFailure("SEGMENT_CHANNEL_NONEMPTY")
+    search_time_ms = response.get("search_time_ms")
+    if (
+        type(search_time_ms) not in (int, float)
+        or not math.isfinite(search_time_ms)
+        or search_time_ms < 0
+    ):
+        raise ProbeFailure("SEARCH_TIME_INVALID")
     summary = response.get("provenance_summary")
     if (
-        not isinstance(summary, dict)
+        not _exact_fields(summary, _SUMMARY_FIELDS)
         or summary.get("contract_version") != "graphiti_provenance_summary_v1"
     ):
         raise ProbeFailure("SUMMARY_CONTRACT_MISMATCH")
@@ -249,9 +385,46 @@ def _validate_probe_response(
     if len(facts) > probe.max_results:
         raise ProbeFailure("FACTS_EXCEED_PINNED_LIMIT")
 
+    count_fields = (
+        "candidates",
+        "service_forwarded",
+        *_SUPPRESSION_FIELDS,
+        "malformed_response_events",
+        "requested_results",
+        "overfetch_limit",
+    )
+    if any(not _nonnegative_wire_int(summary.get(field)) for field in count_fields):
+        raise ProbeFailure("SUMMARY_COUNT_INVALID")
+    expected_overfetch = min(probe.max_results * OVERFETCH_FACTOR, MAX_OVERFETCH)
+    if (
+        summary["requested_results"] != probe.max_results
+        or summary["overfetch_limit"] != expected_overfetch
+    ):
+        raise ProbeFailure("SUMMARY_REQUEST_MISMATCH")
+    if summary["retrieval_path"] != probe.retrieval_path:
+        raise ProbeFailure("SUMMARY_RETRIEVAL_PATH_MISMATCH")
+    suppressed = sum(summary[field] for field in _SUPPRESSION_FIELDS)
+    if summary["candidates"] != summary["service_forwarded"] + suppressed:
+        raise ProbeFailure("SUMMARY_ACCOUNTING_INVALID")
+    if (
+        summary["service_forwarded"] != len(facts)
+        or summary["service_forwarded"] > probe.max_results
+        or summary["candidates"] > expected_overfetch
+        or summary["malformed_response_events"] > expected_overfetch
+    ):
+        raise ProbeFailure("SUMMARY_BOUND_INVALID")
+    expected_starvation = (
+        summary["service_forwarded"] < probe.max_results and suppressed > 0
+    )
+    if type(summary.get("starved_at_service")) is not bool or (
+        summary["starved_at_service"] is not expected_starvation
+    ):
+        raise ProbeFailure("SUMMARY_STARVATION_INVALID")
+
     facts_by_id: dict[str, dict[str, Any]] = {}
+    response_source_count = 0
     for fact in facts:
-        if not isinstance(fact, dict):
+        if not _exact_fields(fact, _FACT_FIELDS):
             raise ProbeFailure("FACT_INVALID_SHAPE")
         if fact.get("chain_status") != "chained":
             raise ProbeFailure("FACT_NOT_CHAINED")
@@ -263,40 +436,68 @@ def _validate_probe_response(
         ) is None:
             raise ProbeFailure("FACT_ENDPOINT_ID_INVALID")
         if not all(
-            _nonempty_wire_text(fact.get(field))
-            for field in ("subject_name", "predicate", "object_name", "fact")
+            _wire_text(fact.get(field), maximum)
+            for field, maximum in (
+                ("subject_name", 2_000),
+                ("predicate", 160),
+                ("object_name", 2_000),
+                ("fact", 16_000),
+            )
         ):
             raise ProbeFailure("FACT_TEXT_SHAPE_INVALID")
+        if any(
+            not _nullable_wire_time(fact.get(field))
+            for field in ("valid_from", "valid_to", "expired_at")
+        ):
+            raise ProbeFailure("FACT_TEMPORAL_SHAPE_INVALID")
         episodes = fact.get("episodes")
         if (
             not isinstance(episodes, list)
             or not episodes
             or any(_canonical_uuid_text(item) is None for item in episodes)
+            or len(episodes) != len(set(episodes))
         ):
             raise ProbeFailure("FACT_EPISODES_INVALID")
+        if len(episodes) > MAX_SOURCES_PER_FACT:
+            raise ProbeFailure("FACT_EPISODE_LIMIT_EXCEEDED")
         sources = fact.get("sources")
         if not isinstance(sources, list) or not sources:
             raise ProbeFailure("FACT_SOURCES_EMPTY")
-        if any(
-            not isinstance(source, dict)
-            or source.get("engagement_id") != manifest.engagement_id
-            or _canonical_uuid_text(source.get("episode_uuid")) is None
-            or source.get("episode_uuid") not in episodes
-            or not all(
-                _nonempty_wire_text(source.get(field))
-                for field in (
-                    "episode_name",
-                    "source_description",
-                    "source_type",
-                    "source_id",
-                    "episode_type",
-                    "anchor_mode",
-                    "producer_contract_version",
+        if len(sources) > MAX_SOURCES_PER_FACT:
+            raise ProbeFailure("FACT_SOURCE_LIMIT_EXCEEDED")
+        source_episode_ids: list[str] = []
+        for source in sources:
+            if not _exact_fields(source, _SOURCE_FIELDS):
+                raise ProbeFailure("FACT_SOURCE_SHAPE_INVALID")
+            episode_uuid = _canonical_uuid_text(source.get("episode_uuid"))
+            if (
+                source.get("engagement_id") != manifest.engagement_id
+                or episode_uuid is None
+                or not all(
+                    _wire_text(source.get(field), maximum)
+                    for field, maximum in (
+                        ("episode_name", 2_000),
+                        ("source_description", 2_000),
+                        ("source_type", 64),
+                        ("source_id", 240),
+                        ("engagement_id", 240),
+                        ("episode_type", 64),
+                        ("anchor_mode", 64),
+                        ("producer_contract_version", 64),
+                    )
                 )
-            )
-            for source in sources
+                or not _nullable_wire_time(source.get("valid_at"))
+            ):
+                raise ProbeFailure("FACT_SOURCE_IDENTITY_INVALID")
+            source_episode_ids.append(episode_uuid)
+        if (
+            len(source_episode_ids) != len(set(source_episode_ids))
+            or set(source_episode_ids) != set(episodes)
         ):
-            raise ProbeFailure("FACT_SOURCE_ENGAGEMENT_MISMATCH")
+            raise ProbeFailure("FACT_SOURCE_EPISODE_SET_MISMATCH")
+        response_source_count += len(sources)
+        if response_source_count > MAX_SOURCES_PER_RESPONSE:
+            raise ProbeFailure("RESPONSE_SOURCE_LIMIT_EXCEEDED")
         facts_by_id[fact_id] = fact
 
     for expected in probe.expected:
@@ -312,6 +513,10 @@ def _validate_probe_response(
             source.get("episode_uuid") == episode_id
             and source.get("source_type") == expected.source_type
             and source.get("source_id") == expected.source_id
+            and source.get("episode_type") == expected.episode_type
+            and source.get("anchor_mode") == expected.anchor_mode
+            and source.get("producer_contract_version")
+            == expected.producer_contract_version
             for source in sources
         ):
             raise ProbeFailure("EXPECTED_SOURCE_MISSING")
@@ -334,8 +539,6 @@ def run_probe_manifest(
     if auth_secret_env != manifest.auth_secret_env:
         raise ProbeFailure("AUTH_INPUT_MISMATCH")
     environment = os.environ if environ is None else environ
-    if environment.get("GRAPHITI_AUTH_MODE") != "required":
-        raise ProbeFailure("AUTH_MODE_NOT_REQUIRED")
     secret = environment.get(auth_secret_env, "")
     if len(secret) < 32:
         raise ProbeFailure("AUTH_SECRET_MISSING")
@@ -350,6 +553,7 @@ def run_probe_manifest(
                 "query": probe.query,
                 "max_results": probe.max_results,
                 "include_segment": False,
+                "acceptance_probe": True,
             },
             separators=(",", ":"),
         ).encode("utf-8")

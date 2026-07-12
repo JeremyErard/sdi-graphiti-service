@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from app.provenance_contract import (
     PROVENANCE_SUMMARY_CONTRACT_VERSION,
@@ -23,6 +23,13 @@ class SearchContextRequest(BaseModel):
         description=(
             "Reserved segment channel. P1 rejects activation until a governed "
             "pattern contract exists."
+        ),
+    )
+    acceptance_probe: StrictBool = Field(
+        default=False,
+        description=(
+            "Signed request/process fence for a dedicated read-only acceptance "
+            "probe deployment. Ordinary service processes reject true."
         ),
     )
 

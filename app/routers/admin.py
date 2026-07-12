@@ -5,11 +5,14 @@ import time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.config import settings
 from app.services import graphiti_client
-from app.services.provenance_stats import provenance_stats_for_graph
+from app.services.provenance_stats import (
+    ProvenanceStatsReadError,
+    provenance_stats_for_graph,
+)
 
 logger = logging.getLogger("graphiti_service")
 
@@ -731,6 +734,14 @@ class GraphStatsRequest(BaseModel):
     client_slug: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
     include_provenance: bool = False
 
+    @model_validator(mode="after")
+    def require_tenant_for_provenance(self):
+        if self.include_provenance and self.client_slug is None:
+            raise ValueError(
+                "include_provenance=true requires one exact client_slug"
+            )
+        return self
+
 
 @router.post(
     "/graph-stats",
@@ -759,16 +770,26 @@ async def graph_stats(req: GraphStatsRequest):
             port=settings.falkordb_port,
             password=settings.falkordb_password or None,
         )
+        listed_graphs = db.list_graphs()
+        if not isinstance(listed_graphs, (list, tuple, set, frozenset)):
+            raise RuntimeError("unsupported graph inventory response")
+        available_graphs = frozenset(listed_graphs)
         if req.client_slug:
-            names = [graphiti_client._graph_name_for_client(req.client_slug)]
+            requested_name = graphiti_client._graph_name_for_client(req.client_slug)
+            if requested_name not in available_graphs:
+                raise HTTPException(
+                    status_code=404,
+                    detail="GRAPH_STATS_GRAPH_NOT_FOUND",
+                )
+            names = [requested_name]
         else:
-            names = sorted(db.list_graphs())
+            names = sorted(available_graphs)
 
         stats: list[GraphStat] = []
         for name in names:
             graph = db.select_graph(name)
-            nodes = graph.query("MATCH (n) RETURN count(n)").result_set[0][0]
-            edges = graph.query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
+            nodes = graph.ro_query("MATCH (n) RETURN count(n)").result_set[0][0]
+            edges = graph.ro_query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
             provenance = (
                 ProvenanceGraphStats.model_validate(
                     provenance_stats_for_graph(graph, name)
@@ -785,6 +806,8 @@ async def graph_stats(req: GraphStatsRequest):
                 )
             )
         return GraphStatsResponse(graphs=stats, graph_count=len(stats))
+    except ProvenanceStatsReadError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from None
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - connection-level failures

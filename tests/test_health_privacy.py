@@ -4,6 +4,7 @@ import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.routers import health
 
 DEPLOY_COMMIT = "273e49df13ad42854c68d11670a20514ba1bb7c2"
@@ -106,3 +107,29 @@ def test_deploy_commit_is_exact_or_bounded(monkeypatch):
 
     monkeypatch.setenv("RENDER_GIT_COMMIT", "B" * 40)
     assert health._deploy_commit() == "b" * 40
+
+
+def test_probe_process_readiness_never_calls_generative_provider(monkeypatch):
+    async def falkordb_probe():
+        return {"ok": True, "low_headroom": False}
+
+    async def embedder_probe():
+        return {"ok": True, "provider": "embedding", "model": "query-model"}
+
+    async def forbidden_llm_probe():
+        raise AssertionError("probe process must not make a generative call")
+
+    monkeypatch.setattr(settings, "graphiti_acceptance_probe_mode", True)
+    monkeypatch.setattr(health, "_probe_falkordb", falkordb_probe)
+    monkeypatch.setattr(health, "_probe_embedder", embedder_probe)
+    monkeypatch.setattr(health, "_probe_llm", forbidden_llm_probe)
+    monkeypatch.setattr(health, "_ready_cache", None)
+
+    response = client().get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["checks"] == {
+        "data_store": {"ready": True},
+        "retrieval": {"ready": True},
+        "generation": {"ready": False},
+    }

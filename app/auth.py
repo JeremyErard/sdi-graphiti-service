@@ -170,6 +170,16 @@ async def _consume_nonce(scope: AuthScope, nonce: str) -> bool:
 
 
 async def verify_request(request: Request, expected_scope: AuthScope) -> GraphPrincipal:
+    if settings.graphiti_acceptance_probe_mode and (
+        expected_scope != "search" or request.url.path != "/search/context"
+    ):
+        _deny(
+            request,
+            expected_scope,
+            403,
+            "Acceptance probe process permits only the search probe endpoint",
+        )
+
     mode = settings.graphiti_auth_mode
     if mode == "off":
         return GraphPrincipal(scope=expected_scope, client_slug="legacy")

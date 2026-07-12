@@ -57,8 +57,14 @@ class Settings(BaseSettings):
     graphiti_admin_secret: str = ""
     graphiti_auth_max_clock_skew_seconds: int = 300
 
+    # Dedicated acceptance-probe processes expose only the signed, enforced
+    # search contract and use FalkorDB's read-only query command. The default is
+    # deliberately false so ordinary service processes retain their established
+    # retrieval/fallback behavior.
+    graphiti_acceptance_probe_mode: bool = False
+
     @model_validator(mode="after")
-    def validate_provenance_write_pair(self):
+    def validate_mode_combinations(self):
         if (
             self.graphiti_structured_v2_write_mode == "staged"
             and self.graphiti_provenance_mode != "enforce"
@@ -66,6 +72,15 @@ class Settings(BaseSettings):
             raise ValueError(
                 "GRAPHITI_STRUCTURED_V2_WRITE_MODE=staged requires "
                 "GRAPHITI_PROVENANCE_MODE=enforce"
+            )
+        if self.graphiti_acceptance_probe_mode and (
+            self.graphiti_provenance_mode != "enforce"
+            or self.graphiti_auth_mode != "required"
+        ):
+            raise ValueError(
+                "GRAPHITI_ACCEPTANCE_PROBE_MODE=true requires "
+                "GRAPHITI_PROVENANCE_MODE=enforce and "
+                "GRAPHITI_AUTH_MODE=required"
             )
         return self
 

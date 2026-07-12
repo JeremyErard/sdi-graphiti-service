@@ -2,7 +2,13 @@
 
 import json
 
+import pytest
+
 from app.services.provenance_stats import (
+    PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE,
+    PROVENANCE_STATS_ENGAGEMENT_BUCKET_LIMIT_CODE,
+    PROVENANCE_STATS_EPISODE_ROW_LIMIT_CODE,
+    ProvenanceStatsReadError,
     StatsEdge,
     StatsEpisode,
     build_provenance_aggregates,
@@ -184,6 +190,9 @@ def test_graph_query_projects_only_presence_flags_and_safe_anchor_dimensions():
             self.queries = []
 
         def query(self, query, params=None):
+            raise AssertionError("stats reads must use ro_query")
+
+        def ro_query(self, query, params=None):
             self.queries.append((query, params or {}))
             if "MATCH (episode:Episodic)" in query:
                 return _Result(
@@ -210,6 +219,7 @@ def test_graph_query_projects_only_presence_flags_and_safe_anchor_dimensions():
 
     assert _status_counts(result)["chained"] == 1
     assert len(graph.queries) == 2
+    assert all("LIMIT 100001" in query for query, _ in graph.queries)
     episode_query = graph.queries[0][0]
     assert "episode.name IS NOT NULL" in episode_query
     assert "trim(episode.name)" in episode_query
@@ -240,15 +250,97 @@ def test_invalid_dimension_values_are_bucketed_without_echoing_graph_text():
     assert secret not in serialized
     assert result["by_episode_type"] == [
         {
-            "structural_status": "malformed",
+            "structural_status": "chained",
             "episode_type": "unresolved",
             "count": 1,
         }
     ]
     assert result["by_engagement"] == [
         {
-            "structural_status": "malformed",
+            "structural_status": "chained",
             "engagement_id": "unresolved",
             "count": 1,
         }
     ]
+
+
+def test_episode_reference_bound_matches_search_and_never_truncates():
+    episodes = [
+        _episode(
+            f"90000000-0000-4000-8001-{index:012d}",
+        )
+        for index in range(1, 66)
+    ]
+    result = build_provenance_aggregates(
+        episodes,
+        [
+            _edge(
+                EDGE_IDS[0],
+                [episode.uuid for episode in episodes],
+            )
+        ],
+    )
+
+    assert _status_counts(result) == {
+        "chained": 0,
+        "pre_chain": 0,
+        "malformed": 1,
+    }
+
+
+def test_engagement_bucket_bound_fails_instead_of_truncating():
+    episodes = [
+        _episode(
+            f"90000000-0000-4000-8002-{index:012d}",
+            engagement_id=f"engagement-{index}",
+        )
+        for index in range(1, 258)
+    ]
+    edges = [
+        _edge(
+            f"91000000-0000-4000-8002-{index:012d}",
+            [episode.uuid],
+        )
+        for index, episode in enumerate(episodes, 1)
+    ]
+
+    with pytest.raises(ProvenanceStatsReadError) as failure:
+        build_provenance_aggregates(episodes, edges)
+
+    assert failure.value.code == PROVENANCE_STATS_ENGAGEMENT_BUCKET_LIMIT_CODE
+
+
+@pytest.mark.parametrize(
+    ("episode_count", "edge_count", "code"),
+    [
+        (100_001, 0, PROVENANCE_STATS_EPISODE_ROW_LIMIT_CODE),
+        (0, 100_001, PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE),
+    ],
+)
+def test_stats_row_sentinel_hard_fails_without_partial_aggregates(
+    episode_count, edge_count, code
+):
+    class _Result:
+        def __init__(self, rows):
+            self.result_set = rows
+
+    class _BoundGraph:
+        def __init__(self):
+            self.queries = []
+
+        def query(self, *_args, **_kwargs):
+            raise AssertionError("stats reads must never use query")
+
+        def ro_query(self, query, params=None):
+            self.queries.append((query, params or {}))
+            if "MATCH (episode:Episodic)" in query:
+                return _Result([[None] * 10] * episode_count)
+            return _Result([[None] * 2] * edge_count)
+
+    graph = _BoundGraph()
+
+    with pytest.raises(ProvenanceStatsReadError) as failure:
+        provenance_stats_for_graph(graph, "client_pokagon")
+
+    assert failure.value.code == code
+    assert all("LIMIT 100001" in query for query, _ in graph.queries)

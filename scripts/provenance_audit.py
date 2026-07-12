@@ -18,6 +18,7 @@ if __package__ in (None, ""):
 from app.services.provenance_ops import (
     APPLY_BLOCKED_CODE,
     ApplyBlockedError,
+    ProvenanceAuditReadError,
     run_provenance_audit,
 )
 
@@ -51,6 +52,14 @@ def main(argv: list[str] | None = None) -> int:
             "mode": "apply",
             "counts": {},
             "codes": {APPLY_BLOCKED_CODE: 1},
+        }
+        print(json.dumps(result, sort_keys=True))
+        return 2
+    except ProvenanceAuditReadError as error:
+        result = {
+            "mode": "apply" if args.apply else "audit",
+            "counts": {},
+            "codes": {error.code: 1},
         }
         print(json.dumps(result, sort_keys=True))
         return 2

@@ -13,6 +13,10 @@ from app import auth
 from app.auth import build_signature, require_scope
 from app.config import settings
 from app.routers import admin, graph, ingest, search, structured
+from app.services.provenance_stats import (
+    PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE,
+    ProvenanceStatsReadError,
+)
 from scripts.graphiti_http import signed_headers as operator_signed_headers
 
 
@@ -29,6 +33,9 @@ class FakeGraph:
         self.name = name
 
     def query(self, query: str, params: dict | None = None):
+        raise AssertionError("graph-stats reads must use ro_query")
+
+    def ro_query(self, query: str, params: dict | None = None):
         FakeFalkorDB.queries.append((self.name, query, params or {}))
         if "MATCH (n)" in query:
             return FakeQueryResult([[11]])
@@ -208,6 +215,47 @@ def test_provenance_aggregates_are_explicitly_opt_in_and_content_free():
         if forbidden == "fact":
             continue
         assert forbidden not in serialized
+
+
+def test_provenance_opt_in_requires_one_exact_client_before_graph_access():
+    body = encoded({"include_provenance": True})
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="*"),
+    )
+
+    assert response.status_code == 422
+    assert FakeFalkorDB.selected == []
+
+
+def test_missing_exact_graph_fails_with_fixed_code_without_selection():
+    body = encoded({"client_slug": "missing"})
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="missing"),
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "GRAPH_STATS_GRAPH_NOT_FOUND"}
+    assert FakeFalkorDB.selected == []
+
+
+def test_provenance_bound_failure_returns_only_fixed_safe_code(monkeypatch):
+    def fail_stats(*_args, **_kwargs):
+        raise ProvenanceStatsReadError(PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE)
+
+    monkeypatch.setattr(admin, "provenance_stats_for_graph", fail_stats)
+    body = encoded({"client_slug": "pokagon", "include_provenance": True})
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="pokagon"),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE}
 
 
 def test_supported_operator_helper_signs_graph_stats_post(monkeypatch):

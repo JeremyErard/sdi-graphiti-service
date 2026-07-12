@@ -172,13 +172,36 @@ async def readiness_check():
         )
 
     try:
-        fdb, emb, llm = await asyncio.wait_for(
-            asyncio.gather(_probe_falkordb(), _probe_embedder(), _probe_llm(), return_exceptions=True),
-            timeout=12,
-        )
+        if settings.graphiti_acceptance_probe_mode:
+            fdb, emb = await asyncio.wait_for(
+                asyncio.gather(
+                    _probe_falkordb(),
+                    _probe_embedder(),
+                    return_exceptions=True,
+                ),
+                timeout=12,
+            )
+            # Query embeddings are part of accepted retrieval behavior. A probe
+            # process never exercises the generative/extraction provider.
+            llm = {"ok": False, "skipped": True}
+        else:
+            fdb, emb, llm = await asyncio.wait_for(
+                asyncio.gather(
+                    _probe_falkordb(),
+                    _probe_embedder(),
+                    _probe_llm(),
+                    return_exceptions=True,
+                ),
+                timeout=12,
+            )
     except asyncio.TimeoutError:
         deadline = TimeoutError("overall readiness deadline (12s) exceeded")
-        fdb = emb = llm = deadline
+        fdb = emb = deadline
+        llm = (
+            {"ok": False, "skipped": True}
+            if settings.graphiti_acceptance_probe_mode
+            else deadline
+        )
 
     def _coerce(x: object, provider: str | None) -> dict:
         if isinstance(x, BaseException):
