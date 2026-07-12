@@ -2,12 +2,14 @@
 
 import logging
 import time
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.services import graphiti_client
+from app.services.provenance_stats import provenance_stats_for_graph
 
 logger = logging.getLogger("graphiti_service")
 
@@ -692,10 +694,32 @@ async def falkordb_persist_to_disk(req: PersistToDiskRequest):
             pass
 
 
+class ProvenanceStatusCount(BaseModel):
+    structural_status: Literal["chained", "pre_chain", "malformed"]
+    count: int
+
+
+class ProvenanceEpisodeTypeCount(ProvenanceStatusCount):
+    episode_type: str
+
+
+class ProvenanceEngagementCount(ProvenanceStatusCount):
+    engagement_id: str
+
+
+class ProvenanceGraphStats(BaseModel):
+    facts_total: int
+    malformed_response_events: int
+    by_structural_status: list[ProvenanceStatusCount]
+    by_episode_type: list[ProvenanceEpisodeTypeCount]
+    by_engagement: list[ProvenanceEngagementCount]
+
+
 class GraphStat(BaseModel):
     graph_name: str
     nodes: int
     edges: int
+    provenance: ProvenanceGraphStats | None = None
 
 
 class GraphStatsResponse(BaseModel):
@@ -705,11 +729,16 @@ class GraphStatsResponse(BaseModel):
 
 class GraphStatsRequest(BaseModel):
     client_slug: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
+    include_provenance: bool = False
 
 
-@router.post("/graph-stats", response_model=GraphStatsResponse)
+@router.post(
+    "/graph-stats",
+    response_model=GraphStatsResponse,
+    response_model_exclude_none=True,
+)
 async def graph_stats(req: GraphStatsRequest):
-    """Read-only node/edge totals per graph (COUNT queries only).
+    """Read-only node/edge totals and opt-in provenance aggregates per graph.
 
     Fills the observability gap where totals were previously obtainable only
     via the mutating /admin/reembed-graph or the heavyweight /admin/export-graph
@@ -718,7 +747,9 @@ async def graph_stats(req: GraphStatsRequest):
     body, not an unsigned query string; otherwise every graph is counted. Uses
     POST so the existing backend/operator HMAC clients bind the exact method,
     body, scope, and tenant without inventing a second canonicalization contract.
-    Inherits the admin router's auth scope.
+    Inherits the admin router's auth scope. The default path remains the original
+    two COUNT queries. ``include_provenance=true`` adds metadata-only queries and
+    returns no fact text, names, descriptions, or source content.
     """
     try:
         from falkordb import FalkorDB
@@ -738,10 +769,24 @@ async def graph_stats(req: GraphStatsRequest):
             graph = db.select_graph(name)
             nodes = graph.query("MATCH (n) RETURN count(n)").result_set[0][0]
             edges = graph.query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
-            stats.append(GraphStat(graph_name=name, nodes=int(nodes), edges=int(edges)))
+            provenance = (
+                ProvenanceGraphStats.model_validate(
+                    provenance_stats_for_graph(graph, name)
+                )
+                if req.include_provenance
+                else None
+            )
+            stats.append(
+                GraphStat(
+                    graph_name=name,
+                    nodes=int(nodes),
+                    edges=int(edges),
+                    provenance=provenance,
+                )
+            )
         return GraphStatsResponse(graphs=stats, graph_count=len(stats))
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - connection-level failures
-        logger.error("graph-stats failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"graph-stats failed: {exc}")
+        logger.error("graph-stats failed error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="graph-stats failed")

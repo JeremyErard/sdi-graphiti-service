@@ -20,24 +20,32 @@ ADMIN_SECRET = "admin-secret-that-is-at-least-32-characters"
 
 
 class FakeQueryResult:
-    def __init__(self, count: int):
-        self.result_set = [[count]]
+    def __init__(self, rows):
+        self.result_set = rows
 
 
 class FakeGraph:
     def __init__(self, name: str):
         self.name = name
 
-    def query(self, query: str):
+    def query(self, query: str, params: dict | None = None):
+        FakeFalkorDB.queries.append((self.name, query, params or {}))
         if "MATCH (n)" in query:
-            return FakeQueryResult(11)
+            return FakeQueryResult([[11]])
         if "MATCH ()-[r]->()" in query:
-            return FakeQueryResult(22)
+            return FakeQueryResult([[22]])
+        if "MATCH (episode:Episodic)" in query:
+            assert params == {"group_id": self.name}
+            return FakeQueryResult([])
+        if "MATCH ()-[edge:RELATES_TO]" in query:
+            assert params == {"group_id": self.name}
+            return FakeQueryResult([])
         raise AssertionError(f"unexpected graph-stats query: {query}")
 
 
 class FakeFalkorDB:
     selected: list[str] = []
+    queries: list[tuple[str, str, dict]] = []
 
     def __init__(self, **_kwargs):
         pass
@@ -85,6 +93,7 @@ def required_auth(monkeypatch):
     monkeypatch.setattr(settings, "graphiti_auth_max_clock_skew_seconds", 300)
     monkeypatch.setattr(falkordb, "FalkorDB", FakeFalkorDB)
     FakeFalkorDB.selected = []
+    FakeFalkorDB.queries = []
     seen: set[tuple[str, str]] = set()
 
     async def consume(scope: str, nonce: str) -> bool:
@@ -150,6 +159,55 @@ def test_platform_signed_body_counts_all_graphs_without_mutation():
         "graph_count": 2,
     }
     assert FakeFalkorDB.selected == ["client_pokagon", "segment_tribal_gaming"]
+    assert not any(
+        "Episodic" in query or "edge:RELATES_TO" in query
+        for _name, query, _params in FakeFalkorDB.queries
+    )
+
+
+def test_provenance_aggregates_are_explicitly_opt_in_and_content_free():
+    body = encoded({"client_slug": "pokagon", "include_provenance": True})
+
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="pokagon"),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "graphs": [
+            {
+                "graph_name": "client_pokagon",
+                "nodes": 11,
+                "edges": 22,
+                "provenance": {
+                    "facts_total": 0,
+                    "malformed_response_events": 0,
+                    "by_structural_status": [
+                        {"structural_status": "chained", "count": 0},
+                        {"structural_status": "pre_chain", "count": 0},
+                        {"structural_status": "malformed", "count": 0},
+                    ],
+                    "by_episode_type": [],
+                    "by_engagement": [],
+                },
+            }
+        ],
+        "graph_count": 1,
+    }
+    provenance_queries = [
+        query
+        for _name, query, _params in FakeFalkorDB.queries
+        if "Episodic" in query or "edge:RELATES_TO" in query
+    ]
+    assert len(provenance_queries) == 2
+    serialized = response.text.lower()
+    for forbidden in ("fact", "source_description", "episode_name", "content"):
+        # Structural field names such as facts_total are allowed; graph values are not.
+        if forbidden == "fact":
+            continue
+        assert forbidden not in serialized
 
 
 def test_supported_operator_helper_signs_graph_stats_post(monkeypatch):
