@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 import uuid
@@ -11,14 +12,20 @@ import uuid
 import falkordb
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 import pytest
 
+from app.config import Settings
 from app.models.search import (
     FactResult,
     FactSource,
+    LegacyFactResult,
+    LegacySearchContextResponse,
+    ProvenanceShadow,
     ProvenanceSummary,
     SearchContextRequest,
     SearchContextResponse,
+    ShadowSearchContextResponse,
 )
 from app.routers import search as search_router
 from app.services import graphiti_client
@@ -29,6 +36,14 @@ SUBJECT_ID = "50000000-0000-4000-8000-000000000001"
 OBJECT_ID = "50000000-0000-4000-8000-000000000002"
 EPISODE_ID = "60000000-0000-4000-8000-000000000001"
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "graphiti_search_context_v3.json"
+SHADOW_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "graphiti_search_context_shadow_v1.json"
+)
+
+
+@pytest.fixture(autouse=True)
+def _enforced_provenance_mode(monkeypatch):
+    monkeypatch.setattr(search_router.settings, "graphiti_provenance_mode", "enforce")
 
 
 def _client() -> TestClient:
@@ -39,6 +54,19 @@ def _client() -> TestClient:
 
 def _raw(fact_id: str):
     return SimpleNamespace(uuid=fact_id)
+
+
+def _legacy_raw(fact_id: str, *, fact: str | None = None):
+    return SimpleNamespace(
+        uuid=fact_id,
+        source_node_uuid=SUBJECT_ID,
+        target_node_uuid=OBJECT_ID,
+        name="owns",
+        fact=fact or f"Compatibility fact {fact_id}",
+        valid_at=None,
+        invalid_at=None,
+        expired_at=None,
+    )
 
 
 def _source(**overrides) -> graphiti_client.ResolvedEpisodeAnchor:
@@ -52,6 +80,7 @@ def _source(**overrides) -> graphiti_client.ResolvedEpisodeAnchor:
         "episode_type": "document_analysis",
         "anchor_mode": "typed_source",
         "producer_contract_version": "structured_provenance_v2",
+        "provenance_write_state": "complete",
         "valid_at": None,
     }
     values.update(overrides)
@@ -246,6 +275,232 @@ def test_canonical_v3_fixture_is_serialized_by_the_pydantic_contract():
     )
 
 
+def test_canonical_shadow_fixture_preserves_legacy_top_level_and_v3_preview():
+    response = ShadowSearchContextResponse(
+        facts=[
+            LegacyFactResult(
+                subject=SUBJECT_ID,
+                predicate="owns",
+                object=OBJECT_ID,
+                fact="The Finance Team owns the Monthly Close process.",
+            )
+        ],
+        graph_name="client_pokagon",
+        search_time_ms=0.0,
+        provenance_shadow=ProvenanceShadow(
+            facts=[
+                FactResult(
+                    fact_id=FACT_IDS[0],
+                    subject=SUBJECT_ID,
+                    subject_name="Finance Team",
+                    predicate="owns",
+                    object=OBJECT_ID,
+                    object_name="Monthly Close",
+                    fact="The Finance Team owns the Monthly Close process.",
+                    episodes=[EPISODE_ID],
+                    sources=[
+                        FactSource(
+                            episode_uuid=EPISODE_ID,
+                            episode_name="document_analysis: document/doc-456",
+                            source_description="Operating-model source document",
+                            source_type="document",
+                            source_id="doc-456",
+                            engagement_id="engagement-123",
+                            episode_type="document_analysis",
+                            anchor_mode="typed_source",
+                            producer_contract_version="structured_provenance_v2",
+                        )
+                    ],
+                )
+            ],
+            provenance_summary=ProvenanceSummary(
+                candidates=1,
+                service_forwarded=1,
+                retrieval_path="fast",
+                requested_results=1,
+                overfetch_limit=3,
+            ),
+        ),
+    )
+    serialized = json.dumps(
+        response.model_dump(mode="json"), indent=2, sort_keys=True
+    ) + "\n"
+    fixture = SHADOW_FIXTURE_PATH.read_text(encoding="utf-8")
+
+    assert fixture == serialized
+    assert ShadowSearchContextResponse.model_validate_json(fixture) == response
+    assert hashlib.sha256(fixture.encode("utf-8")).hexdigest() == (
+        "8936dae2746e057b35c17953f7fdca205e9e94ce9f14de86252bd44ba18290cc"
+    )
+
+
+def test_rollout_configuration_defaults_safe_and_rejects_unknown_modes():
+    defaults = Settings(_env_file=None)
+    assert defaults.graphiti_provenance_mode == "legacy"
+    assert defaults.graphiti_structured_v2_write_mode == "off"
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, graphiti_provenance_mode="unknown")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, graphiti_structured_v2_write_mode="enabled")
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            graphiti_provenance_mode="shadow",
+            graphiti_structured_v2_write_mode="staged",
+        )
+    staged = Settings(
+        _env_file=None,
+        graphiti_provenance_mode="enforce",
+        graphiti_structured_v2_write_mode="staged",
+    )
+    assert staged.graphiti_structured_v2_write_mode == "staged"
+
+
+def test_legacy_mode_makes_one_k_sized_search_and_preserves_old_wire_cap(
+    monkeypatch,
+):
+    monkeypatch.setattr(search_router.settings, "graphiti_provenance_mode", "legacy")
+    calls: list[int] = []
+    raw_edges = [_legacy_raw(fact_id) for fact_id in FACT_IDS]
+    raw_edges.extend(
+        _legacy_raw(f"40000000-0000-4000-8001-{index:012d}")
+        for index in range(1, 9)
+    )
+
+    async def fake_search_with_path(**kwargs):
+        calls.append(kwargs["max_results"])
+        return raw_edges, "fast"
+
+    async def forbidden_resolver(**_kwargs):
+        raise AssertionError("legacy mode must not run provenance resolution")
+
+    monkeypatch.setattr(graphiti_client, "search_with_path", fake_search_with_path)
+    monkeypatch.setattr(
+        graphiti_client, "resolve_search_provenance", forbidden_resolver
+    )
+    monkeypatch.setattr(search_router, "time", SimpleNamespace(time=lambda: 100.0))
+
+    response = _client().post("/search/context", json=_request(max_results=50))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls == [50]
+    assert list(body) == ["facts", "segment_insights", "graph_name", "search_time_ms"]
+    assert len(body["facts"]) == 15
+    assert [fact["fact"] for fact in body["facts"]] == [
+        edge.fact for edge in raw_edges[:15]
+    ]
+    assert set(body["facts"][0]) == {
+        "subject",
+        "predicate",
+        "object",
+        "fact",
+        "valid_from",
+        "valid_to",
+        "expired_at",
+    }
+
+
+def test_shadow_preserves_legacy_output_and_adds_non_enforcing_v3_preview(
+    monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO, logger="graphiti_service")
+    monkeypatch.setattr(search_router.settings, "graphiti_provenance_mode", "shadow")
+    sentinel = "RAW-COMPATIBILITY-SENTINEL"
+    compatibility_edges = [_legacy_raw(FACT_IDS[0], fact=sentinel)]
+    preview_edges = [_raw(FACT_IDS[0]), _raw(FACT_IDS[1])]
+    calls: list[int] = []
+
+    async def fake_search_with_path(**kwargs):
+        calls.append(kwargs["max_results"])
+        return (
+            (compatibility_edges, "fast")
+            if len(calls) == 1
+            else (preview_edges, "hybrid_fallback")
+        )
+
+    async def fake_resolve(**_kwargs):
+        return {
+            FACT_IDS[0]: _edge(FACT_IDS[0]),
+            FACT_IDS[1]: _edge(FACT_IDS[1], sources=()),
+        }, 0
+
+    monkeypatch.setattr(graphiti_client, "search_with_path", fake_search_with_path)
+    monkeypatch.setattr(graphiti_client, "resolve_search_provenance", fake_resolve)
+    monkeypatch.setattr(search_router, "time", SimpleNamespace(time=lambda: 100.0))
+
+    response = _client().post("/search/context", json=_request(max_results=1))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls == [1, 3]
+    assert body["facts"][0]["fact"] == sentinel
+    assert body["provenance_shadow"]["contract_version"] == (
+        "graphiti_provenance_shadow_v1"
+    )
+    assert body["provenance_shadow"]["enforcement_applied"] is False
+    assert [fact["fact_id"] for fact in body["provenance_shadow"]["facts"]] == [
+        FACT_IDS[0]
+    ]
+    summary = body["provenance_shadow"]["provenance_summary"]
+    assert summary["candidates"] == 1
+    assert summary["service_forwarded"] == 1
+    assert summary["retrieval_path"] == "hybrid_fallback"
+    # An old consumer can validate only the established top-level contract and
+    # ignore the additive nested preview.
+    old_wire = LegacySearchContextResponse.model_validate(body)
+    assert old_wire.facts[0].fact == sentinel
+    assert sentinel not in caplog.text
+
+
+def test_shadow_preview_failure_does_not_change_compatibility_output(monkeypatch):
+    monkeypatch.setattr(search_router.settings, "graphiti_provenance_mode", "shadow")
+    compatibility_edges = [
+        _legacy_raw(
+            f"40000000-0000-4000-8005-{index:012d}",
+            fact=f"legacy survives {index}",
+        )
+        for index in range(1, 17)
+    ]
+    calls = 0
+
+    async def fake_search_with_path(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return compatibility_edges, "fast"
+        raise RuntimeError("preview unavailable")
+
+    monkeypatch.setattr(graphiti_client, "search_with_path", fake_search_with_path)
+    monkeypatch.setattr(search_router, "time", SimpleNamespace(time=lambda: 100.0))
+
+    response = _client().post("/search/context", json=_request(max_results=50))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert calls == 2
+    assert [fact["fact"] for fact in body["facts"]] == [
+        f"legacy survives {index}" for index in range(1, 16)
+    ]
+    assert body["provenance_shadow"]["facts"] == []
+    assert body["provenance_shadow"]["provenance_summary"][
+        "malformed_response_events"
+    ] == 1
+
+
+def test_enforce_mode_makes_only_the_bounded_overfetch_call(monkeypatch):
+    calls = _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(FACT_IDS[0])],
+        resolved={FACT_IDS[0]: _edge(FACT_IDS[0])},
+    )
+
+    response = _client().post("/search/context", json=_request(max_results=2))
+
+    assert response.status_code == 200
+    assert calls["search"]["max_results"] == 6
+
+
 def test_segment_defaults_off_and_true_is_rejected_before_graph_access(monkeypatch):
     assert SearchContextRequest(
         client_slug="pokagon",
@@ -269,6 +524,27 @@ def test_segment_defaults_off_and_true_is_rejected_before_graph_access(monkeypat
     assert response.json() == {
         "detail": "Segment context requires a governed pattern contract"
     }
+    assert called is False
+
+
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "enforce"])
+def test_segment_true_is_rejected_before_graph_access_in_every_mode(
+    monkeypatch, mode
+):
+    monkeypatch.setattr(search_router.settings, "graphiti_provenance_mode", mode)
+    called = False
+
+    async def forbidden_search(**_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("segment rejection must precede all search modes")
+
+    monkeypatch.setattr(graphiti_client, "search_with_path", forbidden_search)
+    response = _client().post(
+        "/search/context", json=_request(include_segment=True)
+    )
+
+    assert response.status_code == 409
     assert called is False
 
 
@@ -465,7 +741,7 @@ def test_independent_valid_source_wins_over_a_corrupt_duplicate_anchor(monkeypat
     ] == [valid_episode_id]
 
 
-def test_short_and_wholly_malformed_pools_report_service_starvation(monkeypatch):
+def test_wholly_malformed_pool_is_an_event_not_filter_starvation(monkeypatch):
     async def fake_search_with_path(**_kwargs):
         return None, "fast"
 
@@ -486,7 +762,121 @@ def test_short_and_wholly_malformed_pools_report_service_starvation(monkeypatch)
     summary = response.json()["provenance_summary"]
     assert summary["candidates"] == 0
     assert summary["malformed_response_events"] == 1
-    assert summary["starved_at_service"] is True
+    assert summary["starved_at_service"] is False
+
+
+def test_naturally_short_exact_response_is_not_filter_starvation(monkeypatch):
+    fact_id = FACT_IDS[0]
+    _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(fact_id)],
+        resolved={fact_id: _edge(fact_id)},
+    )
+
+    response = _client().post(
+        "/search/context", json=_request(max_results=2)
+    )
+
+    assert response.status_code == 200
+    summary = response.json()["provenance_summary"]
+    assert summary["service_forwarded"] == 1
+    assert summary["candidates"] == 1
+    assert summary["starved_at_service"] is False
+
+
+def test_staged_structured_anchor_is_pre_chain_until_finalized(monkeypatch):
+    fact_id = FACT_IDS[0]
+    staged = _edge(
+        fact_id,
+        sources=(_source(provenance_write_state="staging"),),
+    )
+    _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(fact_id)],
+        resolved={fact_id: staged},
+    )
+
+    response = _client().post("/search/context", json=_request())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["facts"] == []
+    assert body["provenance_summary"]["pre_chain_suppressed"] == 1
+
+
+def test_engage_episode_anchor_does_not_require_structured_write_state(monkeypatch):
+    fact_id = FACT_IDS[0]
+    source = _source(
+        producer_contract_version="engage_episode_v2",
+        provenance_write_state=None,
+    )
+    _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(fact_id)],
+        resolved={fact_id: _edge(fact_id, sources=(source,))},
+    )
+
+    response = _client().post("/search/context", json=_request())
+
+    assert response.status_code == 200
+    assert response.json()["provenance_summary"]["service_forwarded"] == 1
+
+
+def _many_sources(start: int, count: int):
+    return tuple(
+        _source(
+            episode_uuid=f"60000000-0000-4000-8002-{index:012d}",
+        )
+        for index in range(start, start + count)
+    )
+
+
+def test_more_than_64_sources_suppresses_the_fact_without_truncating_authority(
+    monkeypatch,
+):
+    fact_id = FACT_IDS[0]
+    _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(fact_id)],
+        resolved={fact_id: _edge(fact_id, sources=_many_sources(1, 65))},
+    )
+
+    response = _client().post("/search/context", json=_request())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["facts"] == []
+    assert body["provenance_summary"]["malformed_item_suppressed"] == 1
+    assert body["provenance_summary"]["starved_at_service"] is True
+
+
+def test_response_never_exceeds_500_aggregate_source_anchors(monkeypatch):
+    fact_ids = [
+        f"40000000-0000-4000-8003-{index:012d}" for index in range(1, 9)
+    ]
+    resolved = {
+        fact_id: _edge(
+            fact_id,
+            sources=_many_sources((index * 64) + 1, 64),
+        )
+        for index, fact_id in enumerate(fact_ids)
+    }
+    _patch_search(
+        monkeypatch,
+        raw_edges=[_raw(fact_id) for fact_id in fact_ids],
+        resolved=resolved,
+    )
+
+    response = _client().post(
+        "/search/context", json=_request(max_results=8)
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert sum(len(fact["sources"]) for fact in body["facts"]) == 448
+    assert body["provenance_summary"]["service_forwarded"] == 7
+    assert body["provenance_summary"]["malformed_item_suppressed"] == 1
+    assert body["provenance_summary"]["starved_at_service"] is True
 
 
 def test_router_caps_an_oversized_producer_pool_and_reports_the_violation(
@@ -575,6 +965,7 @@ def _resolution_rows(fact_id=FACT_IDS[0]):
         "typed_source",
         "structured_provenance_v2",
         None,
+        "complete",
     ]
     return edge_row, source_row
 
@@ -836,3 +1227,18 @@ def test_fast_row_projection_retains_endpoint_uuid_name_and_episode_list():
         "invalid_at": None,
         "expired_at": None,
     }
+
+
+def test_episode_reference_parser_rejects_oversized_storage_without_truncation():
+    too_many = [
+        f"60000000-0000-4000-8004-{index:012d}" for index in range(1, 66)
+    ]
+    assert graphiti_client._episode_uuid_list(too_many) == ((), False)
+    assert graphiti_client._episode_uuid_list("[" + ("x" * 100_001) + "]") == (
+        (),
+        False,
+    )
+    allowed = too_many[:64]
+    parsed, valid = graphiti_client._episode_uuid_list(allowed)
+    assert valid is True
+    assert parsed == tuple(allowed)

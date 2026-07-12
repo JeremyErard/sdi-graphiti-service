@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.routers import ingest as ingest_router
+from app.routers import search as search_router
 from app.routers import structured as structured_router
 from app.services import graphiti_client
 
@@ -35,7 +36,28 @@ class _RecordingGraph:
     def query(self, query: str, params: dict | None = None):
         if self.failure is not None:
             raise self.failure
-        self.calls.append((query, params or {}))
+        resolved_params = params or {}
+        self.calls.append((query, resolved_params))
+        if "RETURN edge.uuid, edge.producer_contract_version" in query:
+            rows = []
+            for prior_query, prior_params in self.calls:
+                if "CREATE (s)-[r:RELATES_TO" not in prior_query:
+                    continue
+                rows.append(
+                    [
+                        prior_params["edge_uuid"],
+                        prior_params["producer_contract_version"],
+                        prior_params["engagement_id"],
+                        prior_params["source_id"],
+                        prior_params["source_type"],
+                        prior_params["episode_type"],
+                        prior_params["anchor_mode"],
+                        prior_params["episodes"],
+                    ]
+                )
+            return _QueryResult(rows)
+        if "SET ep.provenance_write_state = $complete" in query:
+            return _QueryResult([[resolved_params["episode_uuid"]]])
         return _QueryResult()
 
 
@@ -54,6 +76,20 @@ class _FrozenDateTime(datetime):
     def now(cls, tz=None):
         value = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
         return value if tz is not None else value.replace(tzinfo=None)
+
+
+@pytest.fixture(autouse=True)
+def _staged_structured_v2_mode(monkeypatch):
+    monkeypatch.setattr(
+        structured_router.settings,
+        "graphiti_structured_v2_write_mode",
+        "staged",
+    )
+    monkeypatch.setattr(
+        structured_router.settings,
+        "graphiti_provenance_mode",
+        "enforce",
+    )
 
 
 def _structured_client() -> TestClient:
@@ -106,6 +142,47 @@ def _install_fake_db(monkeypatch, graph: _RecordingGraph) -> _RecordingDB:
     return db
 
 
+def test_structured_v2_default_off_rejects_before_any_graph_access(monkeypatch):
+    monkeypatch.setattr(
+        structured_router.settings,
+        "graphiti_structured_v2_write_mode",
+        "off",
+    )
+    graph = _RecordingGraph()
+    db = _install_fake_db(monkeypatch, graph)
+
+    response = _structured_client().post("/ingest/structured/v2", json=_v2_payload())
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Structured v2 writes are disabled"}
+    assert db.selected == []
+    assert graph.calls == []
+
+
+def test_structured_v2_staging_cannot_run_under_non_enforcing_search(monkeypatch):
+    monkeypatch.setattr(
+        structured_router.settings,
+        "graphiti_structured_v2_write_mode",
+        "staged",
+    )
+    monkeypatch.setattr(
+        structured_router.settings,
+        "graphiti_provenance_mode",
+        "shadow",
+    )
+    graph = _RecordingGraph()
+    db = _install_fake_db(monkeypatch, graph)
+
+    response = _structured_client().post("/ingest/structured/v2", json=_v2_payload())
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Structured v2 staged writes require provenance enforcement"
+    }
+    assert db.selected == []
+    assert graph.calls == []
+
+
 def test_structured_v2_writes_strict_anchors_and_stable_fact_id(monkeypatch):
     graph = _RecordingGraph()
     db = _install_fake_db(monkeypatch, graph)
@@ -145,6 +222,8 @@ def test_structured_v2_writes_strict_anchors_and_stable_fact_id(monkeypatch):
         "episode_type": "document_analysis",
         "anchor_mode": "typed_source",
         "producer_contract_version": "structured_provenance_v2",
+        "provenance_write_state": "staging",
+        "expected_fact_count": 1,
         "valid_at": "2026-07-10T09:00:00+00:00",
         "created_at": "2026-07-11T12:00:00+00:00",
         "group_id": "client_pokagon",
@@ -171,6 +250,107 @@ def test_structured_v2_writes_strict_anchors_and_stable_fact_id(monkeypatch):
         "created_at": "2026-07-11T12:00:00+00:00",
         "group_id": "client_pokagon",
     }
+    verification_query, verification_params = next(
+        call
+        for call in graph.calls
+        if "RETURN edge.uuid, edge.producer_contract_version" in call[0]
+    )
+    assert "edge.provenance_write_state" not in verification_query
+    assert verification_params == {
+        "fact_ids": [FACT_ID],
+        "group_id": "client_pokagon",
+    }
+    finalize_query, finalize_params = next(
+        call
+        for call in graph.calls
+        if "SET ep.provenance_write_state = $complete" in call[0]
+    )
+    assert "WHERE ep.provenance_write_state = $staging" in finalize_query
+    assert finalize_params == {
+        "episode_uuid": EPISODE_ID,
+        "group_id": "client_pokagon",
+        "staging": "staging",
+        "complete": "complete",
+        "expected_fact_count": 1,
+        "completed_at": "2026-07-11T12:00:00+00:00",
+    }
+
+
+def test_structured_v2_mid_write_failure_never_finalizes_partial_state(monkeypatch):
+    class _FailSecondEdgeGraph(_RecordingGraph):
+        def __init__(self):
+            super().__init__()
+            self.edge_creates = 0
+
+        def query(self, query: str, params: dict | None = None):
+            if "CREATE (s)-[r:RELATES_TO" in query:
+                self.edge_creates += 1
+                if self.edge_creates == 2:
+                    raise RuntimeError("mid-write failure")
+            return super().query(query, params)
+
+    graph = _FailSecondEdgeGraph()
+    _install_fake_db(monkeypatch, graph)
+    generated_ids = iter((uuid.UUID(SUBJECT_ID), uuid.UUID(OBJECT_ID)))
+    monkeypatch.setattr(structured_router.uuidlib, "uuid4", lambda: next(generated_ids))
+    payload = deepcopy(_v2_payload())
+    payload["relationships"].append(
+        {
+            **payload["relationships"][0],
+            "fact_id": "20000000-0000-4000-8000-000000000002",
+            "relation": "operates",
+        }
+    )
+
+    response = _structured_client().post("/ingest/structured/v2", json=payload)
+
+    assert response.status_code == 500
+    episode_params = next(
+        params for query, params in graph.calls if "CREATE (ep:Episodic" in query
+    )
+    assert episode_params["provenance_write_state"] == "staging"
+    assert not any(
+        "SET ep.provenance_write_state = $complete" in query
+        for query, _params in graph.calls
+    )
+    # The search contract treats this exact anchor as pre-chain until a governed
+    # reconciliation completes the episode.
+    staged_anchor = graphiti_client.ResolvedEpisodeAnchor(
+        episode_uuid=EPISODE_ID,
+        episode_name=payload["episode_name"],
+        source_description=payload["source_description"],
+        source_type=payload["source_type"],
+        source_id=payload["source_id"],
+        engagement_id=payload["engagement_id"],
+        episode_type=payload["episode_type"],
+        anchor_mode=payload["anchor_mode"],
+        producer_contract_version=payload["producer_contract_version"],
+        valid_at=None,
+        provenance_write_state="staging",
+    )
+    assert search_router._anchor_is_complete(staged_anchor) is False
+
+
+def test_structured_v2_verification_failure_leaves_episode_staging(monkeypatch):
+    class _VerificationFailureGraph(_RecordingGraph):
+        def query(self, query: str, params: dict | None = None):
+            if "RETURN edge.uuid, edge.producer_contract_version" in query:
+                self.calls.append((query, params or {}))
+                return _QueryResult([])
+            return super().query(query, params)
+
+    graph = _VerificationFailureGraph()
+    _install_fake_db(monkeypatch, graph)
+    generated_ids = iter((uuid.UUID(SUBJECT_ID), uuid.UUID(OBJECT_ID)))
+    monkeypatch.setattr(structured_router.uuidlib, "uuid4", lambda: next(generated_ids))
+
+    response = _structured_client().post("/ingest/structured/v2", json=_v2_payload())
+
+    assert response.status_code == 500
+    assert not any(
+        "SET ep.provenance_write_state = $complete" in query
+        for query, _params in graph.calls
+    )
 
 
 @pytest.mark.parametrize(

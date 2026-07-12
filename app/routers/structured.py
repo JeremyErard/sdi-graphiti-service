@@ -20,6 +20,8 @@ from app.config import settings
 from app.models.episode import EpisodeType
 from app.provenance_contract import (
     LEGACY_STRUCTURED_CONTRACT_VERSION,
+    PROVENANCE_WRITE_STATE_COMPLETE,
+    PROVENANCE_WRITE_STATE_STAGING,
     STRUCTURED_PROVENANCE_CONTRACT_VERSION,
 )
 from app.services import graphiti_client
@@ -291,6 +293,8 @@ async def _write_structured(
                     episode_type: $episode_type,
                     anchor_mode: $anchor_mode,
                     producer_contract_version: $producer_contract_version,
+                    provenance_write_state: $provenance_write_state,
+                    expected_fact_count: $expected_fact_count,
                     valid_at: $valid_at,
                     created_at: $created_at,
                     group_id: $group_id
@@ -309,6 +313,8 @@ async def _write_structured(
                     "producer_contract_version": (
                         STRUCTURED_PROVENANCE_CONTRACT_VERSION
                     ),
+                    "provenance_write_state": PROVENANCE_WRITE_STATE_STAGING,
+                    "expected_fact_count": len(req.relationships),
                     "valid_at": reference_time.isoformat(),
                     "created_at": now_iso,
                     "group_id": graph_name,
@@ -511,6 +517,73 @@ async def _write_structured(
             written_fact_ids.append(edge_uuid)
             rels_created += 1
 
+        if anchored and isinstance(req, StructuredIngestV2Request):
+            expected_fact_ids = [str(rel.fact_id) for rel in req.relationships]
+            if rels_skipped or written_fact_ids != expected_fact_ids:
+                raise RuntimeError("structured v2 staged fact set is incomplete")
+            verification_rows = graph.query(
+                """
+                MATCH ()-[edge:RELATES_TO]->()
+                WHERE edge.uuid IN $fact_ids AND edge.group_id = $group_id
+                RETURN edge.uuid, edge.producer_contract_version,
+                       edge.engagement_id, edge.source_id, edge.source_type,
+                       edge.episode_type, edge.anchor_mode, edge.episodes
+                """,
+                params={
+                    "fact_ids": expected_fact_ids,
+                    "group_id": graph_name,
+                },
+            ).result_set
+            verified_ids: list[str] = []
+            for row in verification_rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 8:
+                    raise RuntimeError("structured v2 staged fact verification failed")
+                episodes, episodes_valid = graphiti_client._episode_uuid_list(row[7])
+                if (
+                    row[1] != STRUCTURED_PROVENANCE_CONTRACT_VERSION
+                    or row[2] != req.engagement_id
+                    or row[3] != req.source_id
+                    or row[4] != req.source_type
+                    or row[5] != req.episode_type.value
+                    or row[6] != req.anchor_mode.value
+                    or not episodes_valid
+                    or episodes != (episode_uuid,)
+                ):
+                    raise RuntimeError("structured v2 staged fact verification failed")
+                verified_ids.append(str(row[0]))
+            if (
+                len(verified_ids) != len(expected_fact_ids)
+                or set(verified_ids) != set(expected_fact_ids)
+            ):
+                raise RuntimeError("structured v2 staged fact verification failed")
+
+            finalized = graph.query(
+                """
+                MATCH (ep:Episodic {uuid: $episode_uuid, group_id: $group_id})
+                WHERE ep.provenance_write_state = $staging
+                  AND ep.expected_fact_count = $expected_fact_count
+                SET ep.provenance_write_state = $complete,
+                    ep.provenance_write_completed_at = $completed_at
+                RETURN ep.uuid
+                """,
+                params={
+                    "episode_uuid": episode_uuid,
+                    "group_id": graph_name,
+                    "staging": PROVENANCE_WRITE_STATE_STAGING,
+                    "complete": PROVENANCE_WRITE_STATE_COMPLETE,
+                    "expected_fact_count": len(expected_fact_ids),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            finalized_rows = finalized.result_set
+            if (
+                len(finalized_rows) != 1
+                or not isinstance(finalized_rows[0], (list, tuple))
+                or not finalized_rows[0]
+                or str(finalized_rows[0][0]) != episode_uuid
+            ):
+                raise RuntimeError("structured v2 staged finalization failed")
+
         elapsed_ms = int(
             (datetime.now(timezone.utc) - start).total_seconds() * 1000
         )
@@ -566,6 +639,18 @@ async def ingest_structured_v2(req: StructuredIngestV2Request):
 
     This compatibility surface name-merges graph-local entities. It is barred
     from governed bulk projection, which belongs to ``/ingest/projection/v2``.
+    ``staged`` contains partial writes but is not an idempotent resume protocol;
+    the route therefore remains default-off and requires enforced provenance.
     """
 
+    if settings.graphiti_structured_v2_write_mode != "staged":
+        raise HTTPException(
+            status_code=409,
+            detail="Structured v2 writes are disabled",
+        )
+    if settings.graphiti_provenance_mode != "enforce":
+        raise HTTPException(
+            status_code=409,
+            detail="Structured v2 staged writes require provenance enforcement",
+        )
     return await _write_structured(req, anchored=True)

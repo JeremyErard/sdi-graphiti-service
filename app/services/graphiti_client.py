@@ -29,6 +29,9 @@ _clients: dict[str, Graphiti] = {}
 # index exists this process-lifetime (so we don't re-issue CREATE every search).
 _edge_vindex_ensured: set[str] = set()
 
+_MAX_EPISODE_STORAGE_CHARS = 100_000
+_MAX_EPISODES_PER_FACT = 64
+
 
 @dataclass(frozen=True)
 class ResolvedEpisodeAnchor:
@@ -42,6 +45,7 @@ class ResolvedEpisodeAnchor:
     anchor_mode: str | None
     producer_contract_version: str | None
     valid_at: datetime | None
+    provenance_write_state: str | None = None
     malformed: bool = False
 
 
@@ -98,11 +102,18 @@ def _episode_uuid_list(value: Any) -> tuple[tuple[str, ...], bool]:
     if candidate is None:
         return (), True
     if isinstance(candidate, str):
+        if len(candidate) > _MAX_EPISODE_STORAGE_CHARS:
+            return (), False
         try:
             candidate = ast.literal_eval(candidate)
         except (SyntaxError, ValueError):
             return (), False
     if not isinstance(candidate, (list, tuple)):
+        return (), False
+    # A stricter raw-entry bound avoids walking an adversarial native list and
+    # never truncates authority. Duplicate-heavy historical rows can be repaired
+    # by the governed backfill rather than silently normalized here.
+    if len(candidate) > _MAX_EPISODES_PER_FACT:
         return (), False
     normalized: list[str] = []
     seen: set[str] = set()
@@ -113,6 +124,8 @@ def _episode_uuid_list(value: Any) -> tuple[tuple[str, ...], bool]:
         if episode_uuid not in seen:
             normalized.append(episode_uuid)
             seen.add(episode_uuid)
+            if len(normalized) > _MAX_EPISODES_PER_FACT:
+                return (), False
     return tuple(normalized), True
 
 
@@ -740,7 +753,7 @@ async def resolve_search_provenance(
                    episode.source_type, episode.source_id,
                    episode.engagement_id, episode.episode_type,
                    episode.anchor_mode, episode.producer_contract_version,
-                   episode.valid_at
+                   episode.valid_at, episode.provenance_write_state
             """,
             params={"episode_uuids": episode_ids, "group_id": graph_name},
         ).result_set
@@ -750,7 +763,7 @@ async def resolve_search_provenance(
                 if isinstance(row, (list, tuple)) and row
                 else None
             )
-            if not isinstance(row, (list, tuple)) or len(row) < 10:
+            if not isinstance(row, (list, tuple)) or len(row) < 11:
                 if episode_id in seen_episode_ids:
                     corrupted_episode_ids.add(episode_id)
                 else:
@@ -776,6 +789,7 @@ async def resolve_search_provenance(
                 anchor_mode=_nonempty_string(row[7], 64),
                 producer_contract_version=_nonempty_string(row[8], 64),
                 valid_at=valid_at,
+                provenance_write_state=_nonempty_string(row[10], 32),
             )
 
         for episode_id in corrupted_episode_ids:
@@ -793,6 +807,7 @@ async def resolve_search_provenance(
                     episode_type=None,
                     anchor_mode=None,
                     producer_contract_version=None,
+                    provenance_write_state=None,
                     valid_at=None,
                     malformed=True,
                 )

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.provenance_contract import (
     PROVENANCE_SUMMARY_CONTRACT_VERSION,
+    PROVENANCE_SHADOW_CONTRACT_VERSION,
     SEARCH_CONTEXT_CONTRACT_VERSION,
 )
 
@@ -100,3 +101,39 @@ class SearchContextResponse(BaseModel):
     graph_name: str = ""
     search_time_ms: float = 0.0
     provenance_summary: ProvenanceSummary
+
+
+class LegacyFactResult(BaseModel):
+    """Exact pre-P1 fact wire retained for rolling compatibility."""
+
+    subject: str
+    predicate: str
+    object: str
+    fact: str = ""
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    expired_at: datetime | None = None
+
+
+class LegacySearchContextResponse(BaseModel):
+    """Pre-P1 response: no contract version and therefore no P1 claim."""
+
+    facts: list[LegacyFactResult] = Field(default_factory=list)
+    segment_insights: list[str] = Field(default_factory=list)
+    graph_name: str = ""
+    search_time_ms: float = 0.0
+
+
+class ProvenanceShadow(BaseModel):
+    """Non-enforcing v3 preview nested under the compatibility response."""
+
+    contract_version: Literal[PROVENANCE_SHADOW_CONTRACT_VERSION] = (
+        PROVENANCE_SHADOW_CONTRACT_VERSION
+    )
+    enforcement_applied: Literal[False] = False
+    facts: list[FactResult] = Field(default_factory=list)
+    provenance_summary: ProvenanceSummary
+
+
+class ShadowSearchContextResponse(LegacySearchContextResponse):
+    provenance_shadow: ProvenanceShadow

@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -35,6 +36,17 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "info"
 
+    # P1 provenance rollout is deliberately non-enforcing by default. ``legacy``
+    # preserves the established search response. ``shadow`` adds a separately
+    # versioned preview without changing prompt-visible facts. Only ``enforce``
+    # returns the fail-closed v3 response.
+    graphiti_provenance_mode: Literal["legacy", "shadow", "enforce"] = "legacy"
+
+    # The source-anchored structured-v2 writer remains dormant until an operator
+    # explicitly selects the staged lifecycle. There is intentionally no unsafe
+    # direct-enable mode.
+    graphiti_structured_v2_write_mode: Literal["off", "staged"] = "off"
+
     # Engage -> Graphiti service authentication. ``off`` preserves the current
     # production contract during a coordinated rollout; ``optional`` accepts
     # unsigned legacy traffic but verifies any signed request; ``required``
@@ -44,6 +56,18 @@ class Settings(BaseSettings):
     graphiti_ingest_secret: str = ""
     graphiti_admin_secret: str = ""
     graphiti_auth_max_clock_skew_seconds: int = 300
+
+    @model_validator(mode="after")
+    def validate_provenance_write_pair(self):
+        if (
+            self.graphiti_structured_v2_write_mode == "staged"
+            and self.graphiti_provenance_mode != "enforce"
+        ):
+            raise ValueError(
+                "GRAPHITI_STRUCTURED_V2_WRITE_MODE=staged requires "
+                "GRAPHITI_PROVENANCE_MODE=enforce"
+            )
+        return self
 
     class Config:
         env_file = ".env"
