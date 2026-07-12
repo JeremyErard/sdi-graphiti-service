@@ -35,6 +35,7 @@ def _episode(episode_id, **overrides):
         "episode_type": "document_analysis",
         "anchor_mode": "typed_source",
         "producer_contract_version": "structured_provenance_v2",
+        "valid_at": None,
         "provenance_write_state": "complete",
     }
     values.update(overrides)
@@ -46,9 +47,11 @@ def _edge(edge_id, episodes, **overrides):
         "uuid": edge_id,
         "episodes": episodes,
         "subject_uuid": SUBJECT_ID,
+        "subject_is_entity": True,
         "has_subject_name": True,
         "has_predicate": True,
         "object_uuid": OBJECT_ID,
+        "object_is_entity": True,
         "has_object_name": True,
         "has_fact": True,
         "valid_at": None,
@@ -152,6 +155,52 @@ def test_structured_v2_requires_complete_write_state_but_other_contracts_do_not(
         "pre_chain": 1,
         "malformed": 0,
     }
+
+
+@pytest.mark.parametrize(
+    ("valid_at", "status"),
+    [
+        (None, "chained"),
+        ("2026-07-11T12:00:00Z", "chained"),
+        ("not-a-time", "malformed"),
+        ("x" * 129, "malformed"),
+    ],
+)
+def test_episode_valid_at_matches_search_source_parity(valid_at, status):
+    result = build_provenance_aggregates(
+        [_episode(EPISODE_IDS[0], valid_at=valid_at)],
+        [_edge(EDGE_IDS[0], [EPISODE_IDS[0]])],
+    )
+
+    assert _status_counts(result)[status] == 1
+
+
+def test_invalid_episode_valid_at_overrides_structured_staging_pre_chain():
+    result = build_provenance_aggregates(
+        [
+            _episode(
+                EPISODE_IDS[0],
+                valid_at="not-a-time",
+                provenance_write_state="staging",
+            )
+        ],
+        [_edge(EDGE_IDS[0], [EPISODE_IDS[0]])],
+    )
+
+    assert _status_counts(result)["malformed"] == 1
+
+
+def test_oversized_episode_valid_at_is_rejected_before_datetime_parse(monkeypatch):
+    def forbidden_parse(_value):
+        raise AssertionError("oversized source temporal must not be parsed")
+
+    monkeypatch.setattr(provenance_stats, "_parse_dt", forbidden_parse)
+    result = build_provenance_aggregates(
+        [_episode(EPISODE_IDS[0], valid_at="x" * 1_000_000)],
+        [_edge(EDGE_IDS[0], [EPISODE_IDS[0]])],
+    )
+
+    assert _status_counts(result)["malformed"] == 1
 
 
 def test_duplicate_episode_identity_cannot_win_but_independent_valid_source_can():
@@ -317,6 +366,7 @@ def test_graph_query_projects_only_presence_flags_and_safe_anchor_dimensions():
                             "document_analysis",
                             "typed_source",
                             "structured_provenance_v2",
+                            None,
                             "complete",
                         ]
                     ]
@@ -329,7 +379,9 @@ def test_graph_query_projects_only_presence_flags_and_safe_anchor_dimensions():
                         SUBJECT_ID,
                         True,
                         True,
+                        True,
                         OBJECT_ID,
+                        True,
                         True,
                         True,
                         None,
@@ -356,10 +408,13 @@ def test_graph_query_projects_only_presence_flags_and_safe_anchor_dimensions():
     assert "episode.content" not in episode_query
     assert "size(trim(episode.name)) <= 2000" in episode_query
     assert "size(trim(episode.source_description)) <= 2000" in episode_query
+    assert "size(toString(episode.valid_at))" in episode_query
     assert "$disallowed_control_pattern" in episode_query
     assert "$nonblank_text_pattern" in episode_query
     edge_query = graph.queries[1][0]
-    assert "MATCH (subject:Entity)-[edge:RELATES_TO]->(object:Entity)" in edge_query
+    assert "MATCH (subject)-[edge:RELATES_TO]->(object)" in edge_query
+    assert "'Entity' IN labels(subject) AS subject_is_entity" in edge_query
+    assert "'Entity' IN labels(object) AS object_is_entity" in edge_query
     assert "subject.uuid" in edge_query
     assert "object.uuid" in edge_query
     assert "size(trim(subject.name)) <= 2000" in edge_query
@@ -377,6 +432,8 @@ def test_graph_query_projects_only_presence_flags_and_safe_anchor_dimensions():
         assert params["group_id"] == "client_pokagon"
         assert "disallowed_control_pattern" in params
         assert "nonblank_text_pattern" in params
+        assert params["temporal_storage_limit"] == 128
+        assert "oversized_temporal_sentinel" in params
     edge_params = graph.queries[1][1]
     assert edge_params["temporal_storage_limit"] == 128
     assert "oversized_temporal_sentinel" in edge_params
@@ -473,6 +530,8 @@ def test_episode_text_incompleteness_is_malformed(source_overrides):
     [
         {"subject_uuid": "not-a-uuid"},
         {"object_uuid": "not-a-uuid"},
+        {"subject_is_entity": False},
+        {"object_is_entity": False},
         {"has_subject_name": False},
         {"has_predicate": False},
         {"has_object_name": False},
@@ -485,6 +544,8 @@ def test_episode_text_incompleteness_is_malformed(source_overrides):
     ids=[
         "subject_uuid",
         "object_uuid",
+        "subject_not_entity",
+        "object_not_entity",
         "blank_or_oversize_subject_name",
         "blank_or_control_predicate",
         "oversize_or_control_object_name",
@@ -506,6 +567,7 @@ def test_edge_wire_incompleteness_is_malformed_before_source_status(edge_overrid
         "pre_chain": 0,
         "malformed": 1,
     }
+    assert result["facts_total"] == 1
 
 
 def test_clean_edge_wire_with_valid_temporals_remains_chained():

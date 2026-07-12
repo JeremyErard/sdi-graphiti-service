@@ -62,6 +62,7 @@ class StatsEpisode:
     episode_type: Any
     anchor_mode: Any
     producer_contract_version: Any
+    valid_at: Any = None
     provenance_write_state: Any = None
 
 
@@ -70,9 +71,11 @@ class StatsEdge:
     uuid: Any
     episodes: Any
     subject_uuid: Any = None
+    subject_is_entity: Any = False
     has_subject_name: Any = False
     has_predicate: Any = False
     object_uuid: Any = None
+    object_is_entity: Any = False
     has_object_name: Any = False
     has_fact: Any = False
     valid_at: Any = None
@@ -171,6 +174,8 @@ def _edge_wire_complete(edge: StatsEdge) -> bool:
     return bool(
         canonical_uuid(edge.subject_uuid)
         and canonical_uuid(edge.object_uuid)
+        and _present_flag(edge.subject_is_entity)
+        and _present_flag(edge.object_is_entity)
         and _present_flag(edge.has_subject_name)
         and _present_flag(edge.has_predicate)
         and _present_flag(edge.has_object_name)
@@ -218,6 +223,7 @@ def _source_complete(source: StatsEpisode) -> bool:
             episode_type,
             anchor_mode,
             producer,
+            _temporal_is_valid(source.valid_at),
         )
     ):
         return False
@@ -240,7 +246,7 @@ def _source_complete(source: StatsEpisode) -> bool:
 
 
 def _source_claims_malformed(source: StatsEpisode, *, duplicate: bool) -> bool:
-    if duplicate:
+    if duplicate or not _temporal_is_valid(source.valid_at):
         return True
     producer = _structural_text(source.producer_contract_version, 64)
     anchor_mode = _structural_text(source.anchor_mode, 64)
@@ -270,6 +276,7 @@ def _duplicate_episode_sentinel(episode_id: str) -> StatsEpisode:
         episode_type=None,
         anchor_mode=None,
         producer_contract_version=None,
+        valid_at=None,
         provenance_write_state=None,
     )
 
@@ -404,7 +411,7 @@ def build_provenance_aggregates(
 def _episode_records(rows: Iterable[Any]) -> tuple[StatsEpisode, ...]:
     records: list[StatsEpisode] = []
     for row in rows:
-        if not isinstance(row, (list, tuple)) or len(row) < 10:
+        if not isinstance(row, (list, tuple)) or len(row) < 11:
             records.append(
                 StatsEpisode(
                     None,
@@ -417,20 +424,21 @@ def _episode_records(rows: Iterable[Any]) -> tuple[StatsEpisode, ...]:
                     None,
                     None,
                     None,
+                    None,
                 )
             )
         else:
-            records.append(StatsEpisode(*row[:10]))
+            records.append(StatsEpisode(*row[:11]))
     return tuple(records)
 
 
 def _edge_records(rows: Iterable[Any]) -> tuple[StatsEdge, ...]:
     records: list[StatsEdge] = []
     for row in rows:
-        if not isinstance(row, (list, tuple)) or len(row) < 11:
+        if not isinstance(row, (list, tuple)) or len(row) < 13:
             records.append(StatsEdge(None, None))
         else:
-            records.append(StatsEdge(*row[:11]))
+            records.append(StatsEdge(*row[:13]))
     return tuple(records)
 
 
@@ -455,6 +463,15 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
                episode.source_type, episode.source_id, episode.engagement_id,
                episode.episode_type, episode.anchor_mode,
                episode.producer_contract_version,
+               CASE
+                 WHEN episode.valid_at IS NULL
+                   OR toString(episode.valid_at) = ''
+                   THEN NULL
+                 WHEN size(toString(episode.valid_at))
+                   <= $temporal_storage_limit
+                   THEN toString(episode.valid_at)
+                 ELSE $oversized_temporal_sentinel
+               END AS valid_at,
                episode.provenance_write_state
         LIMIT 100001
         """,
@@ -462,6 +479,8 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
             "group_id": graph_name,
             "disallowed_control_pattern": _DISALLOWED_CONTROL_PATTERN,
             "nonblank_text_pattern": _NONBLANK_TEXT_PATTERN,
+            "temporal_storage_limit": _MAX_TEMPORAL_STORAGE_CHARS,
+            "oversized_temporal_sentinel": _OVERSIZED_TEMPORAL_SENTINEL,
         },
     )
     episode_rows = getattr(episode_result, "result_set", None)
@@ -472,9 +491,10 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
 
     edge_result = graph.ro_query(
         """
-        MATCH (subject:Entity)-[edge:RELATES_TO]->(object:Entity)
+        MATCH (subject)-[edge:RELATES_TO]->(object)
         WHERE edge.group_id = $group_id
         RETURN edge.uuid, edge.episodes, subject.uuid,
+               'Entity' IN labels(subject) AS subject_is_entity,
                (subject.name IS NOT NULL
                  AND subject.name =~ $nonblank_text_pattern
                  AND size(trim(subject.name)) <= 2000
@@ -488,6 +508,7 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
                    =~ $disallowed_control_pattern))
                  AS has_predicate,
                object.uuid,
+               'Entity' IN labels(object) AS object_is_entity,
                (object.name IS NOT NULL
                  AND object.name =~ $nonblank_text_pattern
                  AND size(trim(object.name)) <= 2000

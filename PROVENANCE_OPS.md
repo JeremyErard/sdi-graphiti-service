@@ -72,7 +72,11 @@ is bounded before any plan/aggregate construction.
 Opt-in provenance statistics remain activation-blocked until the deployed
 FalkorDB version has separately proven the `GRAPH.RO_QUERY` syntax used for the
 server-side `CASE`, `toString`, bounded-length, and regular-expression
-predicates. Unit query-shape tests are not that compatibility proof.
+predicates. That proof must also include representative worst-case result-volume
+and memory evidence, or server-side bounded projections for the raw anchor
+dimension fields and `edge.episodes`, because those values cross the driver
+boundary before Python guards run. Unit query-shape tests are not that
+compatibility or resource-bound proof.
 
 ## Read-only pinned probes
 
