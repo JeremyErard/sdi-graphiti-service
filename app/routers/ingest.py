@@ -9,6 +9,7 @@ from app.models.episode import (
     IngestEpisodeRequest,
     IngestEpisodeResponse,
 )
+from app.provenance_contract import LEGACY_EPISODE_CONTRACT_VERSION
 from app.services import graphiti_client
 
 logger = logging.getLogger("graphiti_service")
@@ -24,6 +25,17 @@ async def ingest_episode(req: IngestEpisodeRequest):
     Graphiti extracts entities and relationships from the content using Claude Haiku.
     """
     try:
+        anchor_mode = (
+            req.anchor_mode.value
+            if req.anchor_mode is not None
+            else LEGACY_EPISODE_CONTRACT_VERSION
+        )
+        producer_contract_version = (
+            req.producer_contract_version
+            if req.producer_contract_version is not None
+            else LEGACY_EPISODE_CONTRACT_VERSION
+        )
+
         # Build descriptive episode name
         episode_name = f"{req.episode_type.value}: {req.source_type}/{req.source_id}"
         source_desc = (
@@ -45,6 +57,11 @@ async def ingest_episode(req: IngestEpisodeRequest):
             source_description=source_desc,
             reference_time=req.timestamp,
             metadata=req.metadata,
+            source_id=req.source_id,
+            source_type=req.source_type,
+            episode_type=req.episode_type.value,
+            anchor_mode=anchor_mode,
+            producer_contract_version=producer_contract_version,
         )
 
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
@@ -61,9 +78,12 @@ async def ingest_episode(req: IngestEpisodeRequest):
             graph_name=graph_name,
         )
 
-    except Exception as e:
-        logger.error(f"[graphiti] Ingestion failed for {req.client_slug}: {e}")
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+    except Exception as error:
+        logger.error(
+            "[graphiti] Ingestion failed error_type=%s",
+            type(error).__name__,
+        )
+        raise HTTPException(status_code=500, detail="Ingestion failed")
 
 
 @router.post("/bootstrap")
