@@ -486,6 +486,47 @@ def test_shadow_preview_failure_does_not_change_compatibility_output(monkeypatch
     assert body["provenance_shadow"]["provenance_summary"][
         "malformed_response_events"
     ] == 1
+    assert (
+        body["provenance_shadow"]["provenance_summary"]["retrieval_path"]
+        == "fast"
+    )
+
+
+def test_shadow_resolution_failure_is_attributed_to_the_preview_path(monkeypatch):
+    monkeypatch.setattr(
+        search_router.settings,
+        "graphiti_provenance_mode",
+        "shadow",
+    )
+    calls = 0
+
+    async def fake_search_with_path(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [_legacy_raw(FACT_IDS[0], fact="legacy survives")], "fast"
+        return [_raw(FACT_IDS[0])], "hybrid_fallback"
+
+    async def fail_preview_resolution(**_kwargs):
+        raise RuntimeError("preview resolution unavailable")
+
+    monkeypatch.setattr(graphiti_client, "search_with_path", fake_search_with_path)
+    monkeypatch.setattr(
+        graphiti_client,
+        "resolve_search_provenance",
+        fail_preview_resolution,
+    )
+    monkeypatch.setattr(search_router, "time", SimpleNamespace(time=lambda: 100.0))
+
+    response = _client().post("/search/context", json=_request(max_results=1))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["facts"][0]["fact"] == "legacy survives"
+    assert body["provenance_shadow"]["facts"] == []
+    summary = body["provenance_shadow"]["provenance_summary"]
+    assert summary["malformed_response_events"] == 1
+    assert summary["retrieval_path"] == "hybrid_fallback"
 
 
 def test_enforce_mode_makes_only_the_bounded_overfetch_call(monkeypatch):

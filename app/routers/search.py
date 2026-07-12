@@ -367,6 +367,10 @@ async def search_context(req: SearchContextRequest):
                 max(req.max_results * _OVERFETCH_FACTOR, req.max_results),
                 _MAX_OVERFETCH,
             )
+            # Until the preview search returns, the compatibility path is the
+            # only observed retrieval path. Once it does return, any later
+            # resolution/evaluation failure belongs to that preview path.
+            preview_path = legacy_path
             try:
                 preview_edges, preview_path = await graphiti_client.search_with_path(
                     client_slug=req.client_slug,
@@ -387,7 +391,7 @@ async def search_context(req: SearchContextRequest):
                 preview_facts = []
                 preview_summary = _failed_shadow_summary(
                     req=req,
-                    retrieval_path=legacy_path,
+                    retrieval_path=preview_path,
                     overfetch_limit=overfetch_limit,
                 )
             elapsed_ms = (time.time() - started) * 1000
