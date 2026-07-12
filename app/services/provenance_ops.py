@@ -205,6 +205,8 @@ def normalize_provable_episode_list(
     candidate = value
     representation_is_list = isinstance(candidate, list)
     if isinstance(candidate, str):
+        if len(candidate) > _MAX_EPISODE_STORAGE_BYTES:
+            return None, False
         try:
             storage_bytes = len(candidate.encode("utf-8"))
         except UnicodeError:
@@ -221,11 +223,17 @@ def normalize_provable_episode_list(
         return None, False
 
     normalized: list[str] = []
+    seen: set[str] = set()
     for item in candidate:
         episode_id = canonical_uuid(item)
-        if episode_id is None or episode_id not in known_episode_ids:
+        if (
+            episode_id is None
+            or episode_id not in known_episode_ids
+            or episode_id in seen
+        ):
             return None, False
         normalized.append(episode_id)
+        seen.add(episode_id)
     canonical = tuple(normalized)
     already_normalized = representation_is_list and candidate == list(canonical)
     return canonical, already_normalized

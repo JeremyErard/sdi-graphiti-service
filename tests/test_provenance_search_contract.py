@@ -376,11 +376,20 @@ def test_rollout_configuration_defaults_safe_and_rejects_unknown_modes():
             graphiti_provenance_mode="enforce",
             graphiti_auth_mode="optional",
         )
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            graphiti_acceptance_probe_mode=True,
+            graphiti_provenance_mode="enforce",
+            graphiti_auth_mode="required",
+            voyage_api_key="   ",
+        )
     probe = Settings(
         _env_file=None,
         graphiti_acceptance_probe_mode=True,
         graphiti_provenance_mode="enforce",
         graphiti_auth_mode="required",
+        voyage_api_key="probe-voyage-key",
     )
     assert probe.graphiti_acceptance_probe_mode is True
 
@@ -1496,3 +1505,17 @@ def test_episode_reference_parser_rejects_oversized_storage_without_truncation()
     parsed, valid = graphiti_client._episode_uuid_list(allowed)
     assert valid is True
     assert parsed == tuple(allowed)
+    assert graphiti_client._episode_uuid_list([allowed[0], allowed[0]]) == (
+        (),
+        False,
+    )
+
+
+def test_episode_reference_character_limit_precedes_utf8_encoding():
+    class _HugeString(str):
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("oversized string must not be encoded")
+
+    assert graphiti_client._episode_uuid_list(
+        _HugeString("x" * 100_001)
+    ) == ((), False)

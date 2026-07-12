@@ -150,6 +150,10 @@ def test_only_provable_existing_episode_lists_are_normalized():
         known_episode_ids=known,
     ) == (None, False)
     assert normalize_provable_episode_list(
+        [EPISODE_ID, EPISODE_ID],
+        known_episode_ids=known,
+    ) == (None, False)
+    assert normalize_provable_episode_list(
         " " * 100_001,
         known_episode_ids=known,
     ) == (None, False)
@@ -170,6 +174,19 @@ def test_episode_storage_limit_is_utf8_bytes_and_precedes_parsing(monkeypatch):
         known_episode_ids=frozenset({EPISODE_ID}),
     ) == (None, False)
     assert called is False
+
+
+def test_character_limit_precedes_utf8_encoding():
+    class _HugeString(str):
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("oversized string must not be encoded")
+
+    value = _HugeString("x" * 100_001)
+
+    assert normalize_provable_episode_list(
+        value,
+        known_episode_ids=frozenset({EPISODE_ID}),
+    ) == (None, False)
 
 
 def test_plan_repairs_derivable_endpoints_and_converges_idempotently():

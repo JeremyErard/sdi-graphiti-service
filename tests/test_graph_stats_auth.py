@@ -42,10 +42,15 @@ class FakeGraph:
         if "MATCH ()-[r]->()" in query:
             return FakeQueryResult([[22]])
         if "MATCH (episode:Episodic)" in query:
-            assert params == {"group_id": self.name}
+            assert params["group_id"] == self.name
+            assert "disallowed_control_pattern" in params
+            assert "nonblank_text_pattern" in params
             return FakeQueryResult([])
-        if "MATCH ()-[edge:RELATES_TO]" in query:
-            assert params == {"group_id": self.name}
+        if "edge:RELATES_TO" in query:
+            assert params["group_id"] == self.name
+            assert "disallowed_control_pattern" in params
+            assert "nonblank_text_pattern" in params
+            assert params["temporal_storage_limit"] == 128
             return FakeQueryResult([])
         raise AssertionError(f"unexpected graph-stats query: {query}")
 

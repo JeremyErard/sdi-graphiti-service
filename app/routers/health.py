@@ -112,7 +112,8 @@ async def _probe_embedder() -> dict:
     when VOYAGE_API_KEY is set (the post-cutover path), else the OpenAI default.
     This keeps /ready truthful about the embedder retrieval really depends on —
     otherwise it would keep pinging exhausted OpenAI and report degraded even
-    when Voyage is healthy.
+    when Voyage is healthy. Dedicated acceptance-probe processes bypass this
+    provider-selection probe and exercise ``_probe_fast_path_embedder`` instead.
     """
     if settings.voyage_api_key:
         import voyageai
@@ -128,6 +129,24 @@ async def _probe_embedder() -> dict:
     client = AsyncOpenAI(api_key=settings.openai_api_key or None, timeout=8, max_retries=0)
     await client.embeddings.create(model="text-embedding-3-small", input="readiness probe")
     return {"ok": True, "provider": "openai", "model": "text-embedding-3-small"}
+
+
+async def _probe_fast_path_embedder() -> dict:
+    """Exercise the exact explicit embedder required by indexed fast search."""
+
+    from app.services.graphiti_client import _create_embedder
+
+    embedder = _create_embedder()
+    if embedder is None:
+        raise RuntimeError("explicit fast-path embedder is not configured")
+    vector = await embedder.create(input_data=["readiness probe"])
+    if not isinstance(vector, list) or len(vector) != settings.embedding_dim:
+        raise RuntimeError("fast-path embedder dimension mismatch")
+    return {
+        "ok": True,
+        "provider": "voyage",
+        "model": settings.embedding_model,
+    }
 
 
 async def _probe_llm() -> dict:
@@ -157,8 +176,9 @@ async def readiness_check():
     Hardened against the probe becoming a liability: the result is cached for
     ~60s so it cannot be amplified into unbounded paid calls (keep Render's
     healthCheckPath on the free /health); each dependency is probed exactly once
-    (max_retries=0) and all three run concurrently under one overall deadline, so
-    /ready cannot hang or self-amplify during the very outage it exists to detect.
+    (max_retries=0) and normal-mode dependencies run concurrently under one
+    overall deadline. Probe mode checks only FalkorDB plus the exact fast-path
+    embedder and never calls the generative provider.
     """
     from fastapi.responses import JSONResponse
 
@@ -176,7 +196,7 @@ async def readiness_check():
             fdb, emb = await asyncio.wait_for(
                 asyncio.gather(
                     _probe_falkordb(),
-                    _probe_embedder(),
+                    _probe_fast_path_embedder(),
                     return_exceptions=True,
                 ),
                 timeout=12,
@@ -211,7 +231,11 @@ async def readiness_check():
             return out
         return x  # type: ignore[return-value]
 
-    emb_provider = "voyage" if settings.voyage_api_key else "openai"
+    emb_provider = (
+        "voyage"
+        if settings.graphiti_acceptance_probe_mode or settings.voyage_api_key
+        else "openai"
+    )
     checks = {
         "falkordb": _coerce(fdb, None),
         "embedder": _coerce(emb, emb_provider),

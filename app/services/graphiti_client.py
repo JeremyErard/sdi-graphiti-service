@@ -128,6 +128,8 @@ def _episode_uuid_list(value: Any) -> tuple[tuple[str, ...], bool]:
     if candidate is None:
         return (), True
     if isinstance(candidate, str):
+        if len(candidate) > _MAX_EPISODE_STORAGE_BYTES:
+            return (), False
         try:
             storage_bytes = len(candidate.encode("utf-8"))
         except UnicodeError:
@@ -151,11 +153,10 @@ def _episode_uuid_list(value: Any) -> tuple[tuple[str, ...], bool]:
         episode_uuid = _uuid_string(item)
         if not episode_uuid:
             return (), False
-        if episode_uuid not in seen:
-            normalized.append(episode_uuid)
-            seen.add(episode_uuid)
-            if len(normalized) > _MAX_EPISODES_PER_FACT:
-                return (), False
+        if episode_uuid in seen:
+            return (), False
+        normalized.append(episode_uuid)
+        seen.add(episode_uuid)
     return tuple(normalized), True
 
 

@@ -69,6 +69,11 @@ provide a shared snapshot, so concurrent graph changes could otherwise cause
 page skips/duplicates and break source-aggregate parity. The one-command result
 is bounded before any plan/aggregate construction.
 
+Opt-in provenance statistics remain activation-blocked until the deployed
+FalkorDB version has separately proven the `GRAPH.RO_QUERY` syntax used for the
+server-side `CASE`, `toString`, bounded-length, and regular-expression
+predicates. Unit query-shape tests are not that compatibility proof.
+
 ## Read-only pinned probes
 
 The harness requires all three inputs and follows no redirects:
@@ -80,12 +85,13 @@ python scripts/provenance_probe.py \
   --auth-secret-env GRAPHITI_SEARCH_SECRET
 ```
 
-A dedicated service process must set all three of:
+A dedicated service process must set all four of:
 
 ```text
 GRAPHITI_ACCEPTANCE_PROBE_MODE=true
 GRAPHITI_PROVENANCE_MODE=enforce
 GRAPHITI_AUTH_MODE=required
+VOYAGE_API_KEY=<configured-fast-path-key>
 ```
 
 The harness requires a valid local `GRAPHITI_SEARCH_SECRET` to sign the request.
@@ -107,7 +113,10 @@ signed body. A probe-mode process rejects a request without that fence, while a
 normal process rejects a request with it. In probe mode the service proves exact
 graph membership, skips lazy index creation, uses `GRAPH.RO_QUERY` for indexed
 retrieval and provenance resolution, and fails closed rather than initializing a
-Graphiti client or falling back.
+Graphiti client or falling back. Probe configuration and `/ready` also require
+and exercise the exact explicit Voyage embedder object used by fast search,
+including its configured output dimension; readiness never substitutes the
+implicit OpenAI fallback.
 
 “Read-only probe” is scoped precisely: HMAC replay protection writes the nonce as
 security state, and fast retrieval makes a query-embedding provider call. The

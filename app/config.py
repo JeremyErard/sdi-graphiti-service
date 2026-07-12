@@ -82,6 +82,11 @@ class Settings(BaseSettings):
                 "GRAPHITI_PROVENANCE_MODE=enforce and "
                 "GRAPHITI_AUTH_MODE=required"
             )
+        if self.graphiti_acceptance_probe_mode and not self.voyage_api_key.strip():
+            raise ValueError(
+                "GRAPHITI_ACCEPTANCE_PROBE_MODE=true requires VOYAGE_API_KEY "
+                "for the exact fast-path embedder"
+            )
         return self
 
     class Config:
