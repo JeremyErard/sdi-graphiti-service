@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import re
 import time
 
 from fastapi import APIRouter
@@ -12,6 +14,14 @@ logger = logging.getLogger("graphiti_service")
 
 router = APIRouter()
 
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$", re.IGNORECASE)
+
+
+def _deploy_commit() -> str:
+    """Return a bounded deploy identity without reflecting arbitrary env text."""
+    candidate = os.environ.get("RENDER_GIT_COMMIT", "").strip()
+    return candidate.lower() if _GIT_COMMIT_RE.fullmatch(candidate) else "unknown"
+
 
 @router.get("/health")
 async def health_check():
@@ -21,6 +31,7 @@ async def health_check():
     status = {
         "status": "ok",
         "service": "sdi-graphiti-service",
+        "commit": _deploy_commit(),
         "falkordb": {"connected": False},
     }
 
@@ -202,6 +213,7 @@ async def readiness_check():
     body = {
         "status": "ready" if critical_ok else "degraded",
         "service": "sdi-graphiti-service",
+        "commit": _deploy_commit(),
         "checks": public_checks,
     }
     status_code = 200 if critical_ok else 503
