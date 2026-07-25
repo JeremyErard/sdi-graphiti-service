@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     graphiti_admin_secret: str = ""
     graphiti_auth_max_clock_skew_seconds: int = 300
 
+    # Governed exact-ID projection (/ingest/projection/v2). The envelope carries
+    # both origins so the direct import path and the later Outcome projector emit
+    # one shape, but only the direct import lane is authorized in this phase.
+    # Default false keeps the Outcome projector lane refused until it is ratified.
+    projection_v2_allow_outcome_event: bool = False
+
     class Config:
         env_file = ".env"
         case_sensitive = False
