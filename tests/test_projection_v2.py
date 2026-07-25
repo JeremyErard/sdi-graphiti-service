@@ -1903,8 +1903,28 @@ def test_the_projection_module_opens_no_path_back_to_a_system_of_record():
     }, module_imports
 
 
+def _walk_routes(node):
+    """Yield every route, flattening whatever container shape the installed
+    Starlette uses. Newer versions wrap an included router in a `_IncludedRouter`
+    that carries no `.path` of its own, so walking `app.routes` one level deep is
+    version-dependent and silently finds nothing."""
+    for route in getattr(node, "routes", []) or []:
+        yield route
+        if getattr(route, "routes", None):
+            yield from _walk_routes(route)
+
+
+def _mounted_paths():
+    """Prefer the OpenAPI document, which is public and stable across versions,
+    and fall back to walking the route tree."""
+    documented = set(app.openapi().get("paths", {}))
+    return documented | {
+        path for route in _walk_routes(app) if (path := getattr(route, "path", None))
+    }
+
+
 def test_adding_the_route_did_not_change_any_existing_route(client):
-    paths = {route.path for route in app.routes}
+    paths = _mounted_paths()
     assert PATH in paths
     assert RECEIPTS_PATH in paths
     assert "/ingest/structured/v2" not in paths
@@ -1915,14 +1935,17 @@ def test_adding_the_route_did_not_change_any_existing_route(client):
 def test_the_route_is_mounted_under_the_ingest_scope_with_one_shared_dependency():
     from app import main
 
-    mounted = [route for route in app.routes if getattr(route, "path", "") == PATH]
-    assert mounted
+    mounted = [r for r in _walk_routes(app) if getattr(r, "path", None) == PATH]
+    assert mounted, f"{PATH} is not mounted; known paths: {sorted(_mounted_paths())}"
     calls = [d.call for d in mounted[0].dependant.dependencies]
     # The mount-level guard and the handler's principal are the same object, so
     # verify_request runs once and the request nonce is consumed once.
     assert calls
     assert set(calls) == {projection.INGEST_PRINCIPAL}
     assert main.projection.INGEST_PRINCIPAL is projection.INGEST_PRINCIPAL
+    # The behavioural counterpart of this property, that one shared principal means
+    # verify_request runs once and the nonce is consumed once, is already proven by
+    # test_a_signed_request_passes_the_perimeter_exactly_once.
 
 
 def test_no_client_identity_or_planning_snapshot_is_hardcoded():
