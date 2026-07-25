@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.graph_names import graph_name_for_client
+from app.models.projection import PROJECTION_NODE_LABEL, PROJECTION_RECEIPT_LABEL
 
 logger = logging.getLogger("graphiti_service")
 
@@ -57,9 +58,17 @@ async def get_graph_data(req: GraphDataRequest):
         )
         graph = db.select_graph(graph_name)
 
-        # Query entity and community nodes (skip episodes — too heavy for viz)
+        # Query entity and community nodes (skip episodes — too heavy for viz).
+        # The exact-ID projection label space is excluded as well. This query is
+        # label-agnostic, so without the exclusion a projected row in any
+        # lifecycle state, including REJECTED and MERGED, would become a map node
+        # the moment the projection lane is used, and the ledger nodes would be
+        # rendered alongside them. Only declared retained states may feed
+        # retrieval, and no retrieval surface consumes projection rows yet.
         node_result = graph.query(
-            f"MATCH (n) WHERE NOT n:Episodic RETURN n LIMIT {req.max_nodes}"
+            f"MATCH (n) WHERE NOT n:Episodic "
+            f"AND NOT n:{PROJECTION_NODE_LABEL} AND NOT n:{PROJECTION_RECEIPT_LABEL} "
+            f"RETURN n LIMIT {req.max_nodes}"
         )
 
         nodes: list[GraphNode] = []
@@ -262,6 +271,7 @@ async def get_graph_data(req: GraphDataRequest):
         edge_result = graph.query(
             "MATCH (a)-[r]->(b) "
             "WHERE NOT a:Episodic AND NOT b:Episodic "
+            f"AND NOT a:{PROJECTION_NODE_LABEL} AND NOT b:{PROJECTION_NODE_LABEL} "
             f"RETURN a.uuid, a.id, id(a), r, b.uuid, b.id, id(b) LIMIT {req.max_nodes * 2}"
         )
 
