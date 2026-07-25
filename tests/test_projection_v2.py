@@ -1927,9 +1927,23 @@ def test_adding_the_route_did_not_change_any_existing_route(client):
     paths = _mounted_paths()
     assert PATH in paths
     assert RECEIPTS_PATH in paths
-    assert "/ingest/structured/v2" not in paths
     for existing in ["/ingest/episode", "/search/context", "/graph/nodes-and-edges", "/health"]:
         assert existing in paths
+
+
+def test_p2_prime_is_a_separate_lane_from_the_source_anchored_compatibility_endpoint():
+    """A8 names this endpoint `/ingest/projection/v2` precisely so that
+    `/ingest/structured/v2`, a P1 artifact, can never be mistaken for
+    authoritative exact-ID projection, and bars structured/v2 from P2-prime.
+
+    An earlier version of this test asserted that `/ingest/structured/v2` did not
+    exist at all. That was the wrong property and it broke the moment the P1 lane
+    landed: structured/v2 is a legitimate sibling. What must hold is that the two
+    are distinct paths and that this module registers only its own."""
+    own_paths = {getattr(route, "path", None) for route in projection.router.routes}
+    assert own_paths == {"/projection/v2", "/projection/v2/receipts"}
+    assert "/structured/v2" not in own_paths
+    assert PATH != "/ingest/structured/v2"
 
 
 def test_the_route_is_mounted_under_the_ingest_scope_with_one_shared_dependency():
