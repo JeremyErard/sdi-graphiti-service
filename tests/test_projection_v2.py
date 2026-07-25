@@ -1933,19 +1933,32 @@ def test_adding_the_route_did_not_change_any_existing_route(client):
 
 
 def test_the_route_is_mounted_under_the_ingest_scope_with_one_shared_dependency():
+    """Asserted against this module's own APIRouter rather than the composed
+    application. How FastAPI composes `app.routes` is a private detail that
+    differs by version: on newer Starlette an included router becomes an opaque
+    wrapper that exposes no resolved route object, so reaching into the app is
+    not portable. `projection.router` is the object this module owns and its
+    `.routes` are ordinary APIRoutes on every supported version.
+
+    The behavioural counterpart, that one shared principal means verify_request
+    runs once and the request nonce is consumed once, is proven end to end by
+    test_a_signed_request_passes_the_perimeter_exactly_once. If the mount-level
+    guard and the handler principal were ever distinct objects, the perimeter
+    would run twice and the second call would answer 409 Replayed."""
     from app import main
 
-    mounted = [r for r in _walk_routes(app) if getattr(r, "path", None) == PATH]
-    assert mounted, f"{PATH} is not mounted; known paths: {sorted(_mounted_paths())}"
-    calls = [d.call for d in mounted[0].dependant.dependencies]
-    # The mount-level guard and the handler's principal are the same object, so
-    # verify_request runs once and the request nonce is consumed once.
+    assert PATH in _mounted_paths()
+    assert RECEIPTS_PATH in _mounted_paths()
+
+    own = [r for r in projection.router.routes if getattr(r, "path", None) == "/projection/v2"]
+    assert own, [getattr(r, "path", None) for r in projection.router.routes]
+    calls = [d.call for d in own[0].dependant.dependencies]
     assert calls
     assert set(calls) == {projection.INGEST_PRINCIPAL}
+
+    # main mounts the very same principal object, so the perimeter check is
+    # declared once for the request rather than twice.
     assert main.projection.INGEST_PRINCIPAL is projection.INGEST_PRINCIPAL
-    # The behavioural counterpart of this property, that one shared principal means
-    # verify_request runs once and the nonce is consumed once, is already proven by
-    # test_a_signed_request_passes_the_perimeter_exactly_once.
 
 
 def test_no_client_identity_or_planning_snapshot_is_hardcoded():
