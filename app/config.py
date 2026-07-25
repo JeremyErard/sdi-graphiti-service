@@ -47,22 +47,16 @@ class Settings(BaseSettings):
     # direct-enable mode.
     graphiti_structured_v2_write_mode: Literal["off", "staged"] = "off"
 
-    # Engage -> Graphiti service authentication. ``off`` preserves the current
-    # production contract during a coordinated rollout; ``optional`` accepts
-    # unsigned legacy traffic but verifies any signed request; ``required``
-    # rejects every non-health request that is not scope- and tenant-bound.
-    graphiti_auth_mode: Literal["off", "optional", "required"] = "off"
-    graphiti_search_secret: str = ""
-    graphiti_ingest_secret: str = ""
-    graphiti_admin_secret: str = ""
-    graphiti_auth_max_clock_skew_seconds: int = 300
-
     # Dedicated acceptance-probe processes expose only the signed, enforced
     # search contract and use FalkorDB's read-only query command. The default is
     # deliberately false so ordinary service processes retain their established
     # retrieval/fallback behavior.
     graphiti_acceptance_probe_mode: bool = False
 
+    # Declared with the flags it governs rather than at the end of the class so
+    # this block does not sit on the same insertion point every other settings
+    # change uses. Field order is irrelevant to pydantic; the validator runs
+    # after every field below is populated, including the auth mode.
     @model_validator(mode="after")
     def validate_mode_combinations(self):
         if (
@@ -88,6 +82,16 @@ class Settings(BaseSettings):
                 "for the exact fast-path embedder"
             )
         return self
+
+    # Engage -> Graphiti service authentication. ``off`` preserves the current
+    # production contract during a coordinated rollout; ``optional`` accepts
+    # unsigned legacy traffic but verifies any signed request; ``required``
+    # rejects every non-health request that is not scope- and tenant-bound.
+    graphiti_auth_mode: Literal["off", "optional", "required"] = "off"
+    graphiti_search_secret: str = ""
+    graphiti_ingest_secret: str = ""
+    graphiti_admin_secret: str = ""
+    graphiti_auth_max_clock_skew_seconds: int = 300
 
     class Config:
         env_file = ".env"

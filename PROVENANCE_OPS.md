@@ -47,7 +47,15 @@ fail above 100,000 without constructing a partial plan.
 
 ## Graph statistics
 
-The existing signed `POST /admin/graph-stats` behavior is unchanged by default.
+The default signed `POST /admin/graph-stats` path still issues its original two
+`GRAPH.QUERY` COUNT reads. That command was deliberately left alone: the default
+path runs on every call in every mode, and `GRAPH.RO_QUERY` has not been proven
+against the deployed FalkorDB. One default-path behavior does change: an exact
+`client_slug` whose mapped graph is absent from `GRAPH.LIST` now returns a fixed
+`GRAPH_STATS_GRAPH_NOT_FOUND` 404 without selecting the graph, instead of
+selecting a name that does not exist. `GRAPH.LIST` is the same command the
+all-graphs default path already used in production.
+
 Provenance queries and additive aggregates require this signed-body opt-in:
 
 ```json

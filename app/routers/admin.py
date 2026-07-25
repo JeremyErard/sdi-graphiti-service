@@ -788,8 +788,15 @@ async def graph_stats(req: GraphStatsRequest):
         stats: list[GraphStat] = []
         for name in names:
             graph = db.select_graph(name)
-            nodes = graph.ro_query("MATCH (n) RETURN count(n)").result_set[0][0]
-            edges = graph.ro_query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
+            # The two default COUNT reads stay on GRAPH.QUERY, the command this
+            # endpoint has always shipped. GRAPH.RO_QUERY has not been exercised
+            # against the deployed FalkorDB, and this path runs on every call in
+            # every mode; it is not the place to introduce an unproven command.
+            # The opt-in provenance aggregates below do use ro_query, and that
+            # path is separately activation-blocked pending the live proof
+            # recorded in docs/PROVENANCE_OPS.md.
+            nodes = graph.query("MATCH (n) RETURN count(n)").result_set[0][0]
+            edges = graph.query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
             provenance = (
                 ProvenanceGraphStats.model_validate(
                     provenance_stats_for_graph(graph, name)

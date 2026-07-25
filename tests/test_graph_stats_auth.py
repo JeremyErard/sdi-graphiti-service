@@ -33,14 +33,20 @@ class FakeGraph:
         self.name = name
 
     def query(self, query: str, params: dict | None = None):
-        raise AssertionError("graph-stats reads must use ro_query")
-
-    def ro_query(self, query: str, params: dict | None = None):
+        # The default node/edge totals stay on the shipped GRAPH.QUERY command.
         FakeFalkorDB.queries.append((self.name, query, params or {}))
         if "MATCH (n)" in query:
             return FakeQueryResult([[11]])
         if "MATCH ()-[r]->()" in query:
             return FakeQueryResult([[22]])
+        raise AssertionError("graph-stats provenance reads must use ro_query")
+
+    def ro_query(self, query: str, params: dict | None = None):
+        FakeFalkorDB.queries.append((self.name, query, params or {}))
+        if "MATCH (n) RETURN count(n)" in query or "MATCH ()-[r]->()" in query:
+            raise AssertionError(
+                "default graph-stats totals must stay on the shipped query command"
+            )
         if "MATCH (episode:Episodic)" in query:
             assert params["group_id"] == self.name
             assert "disallowed_control_pattern" in params
