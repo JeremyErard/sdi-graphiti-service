@@ -1,10 +1,15 @@
 """Public liveness must not disclose tenants or infrastructure details."""
 
+import asyncio
+
+import pytest
 import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.routers import health
+from app.services import graphiti_client
 
 DEPLOY_COMMIT = "273e49df13ad42854c68d11670a20514ba1bb7c2"
 
@@ -106,3 +111,88 @@ def test_deploy_commit_is_exact_or_bounded(monkeypatch):
 
     monkeypatch.setenv("RENDER_GIT_COMMIT", "B" * 40)
     assert health._deploy_commit() == "b" * 40
+
+
+def test_probe_process_readiness_never_calls_generative_provider(monkeypatch):
+    async def falkordb_probe():
+        return {"ok": True, "low_headroom": False}
+
+    async def fast_path_embedder_probe():
+        return {"ok": True, "provider": "embedding", "model": "query-model"}
+
+    async def forbidden_default_embedder_probe():
+        raise AssertionError("probe readiness must use the exact fast-path embedder")
+
+    async def forbidden_llm_probe():
+        raise AssertionError("probe process must not make a generative call")
+
+    monkeypatch.setattr(settings, "graphiti_acceptance_probe_mode", True)
+    monkeypatch.setattr(health, "_probe_falkordb", falkordb_probe)
+    monkeypatch.setattr(
+        health,
+        "_probe_fast_path_embedder",
+        fast_path_embedder_probe,
+    )
+    monkeypatch.setattr(health, "_probe_embedder", forbidden_default_embedder_probe)
+    monkeypatch.setattr(health, "_probe_llm", forbidden_llm_probe)
+    monkeypatch.setattr(health, "_ready_cache", None)
+
+    response = client().get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["checks"] == {
+        "data_store": {"ready": True},
+        "retrieval": {"ready": True},
+        "generation": {"ready": False},
+    }
+
+
+def test_probe_readiness_fails_without_the_exact_fast_path_embedder(monkeypatch):
+    async def falkordb_probe():
+        return {"ok": True, "low_headroom": False}
+
+    async def forbidden_llm_probe():
+        raise AssertionError("probe process must not make a generative call")
+
+    monkeypatch.setattr(settings, "graphiti_acceptance_probe_mode", True)
+    monkeypatch.setattr(health, "_probe_falkordb", falkordb_probe)
+    monkeypatch.setattr(graphiti_client, "_create_embedder", lambda: None)
+    monkeypatch.setattr(health, "_probe_llm", forbidden_llm_probe)
+    monkeypatch.setattr(health, "_ready_cache", None)
+
+    response = client().get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"] == {
+        "data_store": {"ready": True},
+        "retrieval": {"ready": False},
+        "generation": {"ready": False},
+    }
+
+
+def test_probe_readiness_uses_search_embedder_factory_and_dimension(monkeypatch):
+    observed = []
+
+    class _Embedder:
+        async def create(self, *, input_data):
+            observed.append(input_data)
+            return [0.1] * settings.embedding_dim
+
+    monkeypatch.setattr(graphiti_client, "_create_embedder", lambda: _Embedder())
+
+    result = asyncio.run(health._probe_fast_path_embedder())
+
+    assert result["ok"] is True
+    assert result["provider"] == "voyage"
+    assert observed == [["readiness probe"]]
+
+
+def test_probe_readiness_rejects_fast_path_dimension_mismatch(monkeypatch):
+    class _Embedder:
+        async def create(self, *, input_data):
+            return [0.1] * (settings.embedding_dim - 1)
+
+    monkeypatch.setattr(graphiti_client, "_create_embedder", lambda: _Embedder())
+
+    with pytest.raises(RuntimeError, match="dimension mismatch"):
+        asyncio.run(health._probe_fast_path_embedder())

@@ -2,9 +2,11 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.provenance_contract import EPISODE_PROVENANCE_CONTRACT_VERSION
 
 
 class EpisodeType(str, Enum):
@@ -32,15 +34,61 @@ class EpisodeType(str, Enum):
     INSIGHT_RECONCILIATION = "insight_reconciliation"
 
 
+class EpisodeAnchorMode(str, Enum):
+    TYPED_SOURCE = "typed_source"
+    ENGAGEMENT = "engagement"
+
+
 class IngestEpisodeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     client_slug: str = Field(..., description="Client identifier for graph isolation")
     engagement_id: str = Field(..., description="Engagement identifier for group filtering")
     episode_type: EpisodeType
     content: str = Field(..., description="Text content to ingest")
     source_id: str = Field(..., description="ID of the source entity (interview, document, etc.)")
     source_type: str = Field(..., description="Type of source: interview, document, process, etc.")
+    anchor_mode: EpisodeAnchorMode | None = Field(
+        default=None,
+        description="Explicit source granularity for v2 producers",
+    )
+    producer_contract_version: (
+        Literal[EPISODE_PROVENANCE_CONTRACT_VERSION] | None
+    ) = Field(
+        default=None,
+        description="Versioned producer signature; required with anchor_mode",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict, description="Additional context")
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+    @model_validator(mode="after")
+    def validate_anchor_pair(self):
+        if (self.anchor_mode is None) != (self.producer_contract_version is None):
+            raise ValueError(
+                "anchor_mode and producer_contract_version must be supplied together"
+            )
+        if (
+            self.producer_contract_version
+            == EPISODE_PROVENANCE_CONTRACT_VERSION
+            and self.anchor_mode == EpisodeAnchorMode.ENGAGEMENT
+            and self.source_id != self.engagement_id
+        ):
+            raise ValueError(
+                "engagement anchors require source_id to equal engagement_id"
+            )
+        if (
+            self.producer_contract_version
+            == EPISODE_PROVENANCE_CONTRACT_VERSION
+            and self.source_type == "engagement"
+            and (
+                self.anchor_mode != EpisodeAnchorMode.ENGAGEMENT
+                or self.source_id != self.engagement_id
+            )
+        ):
+            raise ValueError(
+                "engagement sources require an exact engagement anchor"
+            )
+        return self
 
 
 class IngestEpisodeResponse(BaseModel):

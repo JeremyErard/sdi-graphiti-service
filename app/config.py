@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -34,6 +35,53 @@ class Settings(BaseSettings):
     # Service settings
     port: int = 8000
     log_level: str = "info"
+
+    # P1 provenance rollout is deliberately non-enforcing by default. ``legacy``
+    # preserves the established search response. ``shadow`` adds a separately
+    # versioned preview without changing prompt-visible facts. Only ``enforce``
+    # returns the fail-closed v3 response.
+    graphiti_provenance_mode: Literal["legacy", "shadow", "enforce"] = "legacy"
+
+    # The source-anchored structured-v2 writer remains dormant until an operator
+    # explicitly selects the staged lifecycle. There is intentionally no unsafe
+    # direct-enable mode.
+    graphiti_structured_v2_write_mode: Literal["off", "staged"] = "off"
+
+    # Dedicated acceptance-probe processes expose only the signed, enforced
+    # search contract and use FalkorDB's read-only query command. The default is
+    # deliberately false so ordinary service processes retain their established
+    # retrieval/fallback behavior.
+    graphiti_acceptance_probe_mode: bool = False
+
+    # Declared with the flags it governs rather than at the end of the class so
+    # this block does not sit on the same insertion point every other settings
+    # change uses. Field order is irrelevant to pydantic; the validator runs
+    # after every field below is populated, including the auth mode.
+    @model_validator(mode="after")
+    def validate_mode_combinations(self):
+        if (
+            self.graphiti_structured_v2_write_mode == "staged"
+            and self.graphiti_provenance_mode != "enforce"
+        ):
+            raise ValueError(
+                "GRAPHITI_STRUCTURED_V2_WRITE_MODE=staged requires "
+                "GRAPHITI_PROVENANCE_MODE=enforce"
+            )
+        if self.graphiti_acceptance_probe_mode and (
+            self.graphiti_provenance_mode != "enforce"
+            or self.graphiti_auth_mode != "required"
+        ):
+            raise ValueError(
+                "GRAPHITI_ACCEPTANCE_PROBE_MODE=true requires "
+                "GRAPHITI_PROVENANCE_MODE=enforce and "
+                "GRAPHITI_AUTH_MODE=required"
+            )
+        if self.graphiti_acceptance_probe_mode and not self.voyage_api_key.strip():
+            raise ValueError(
+                "GRAPHITI_ACCEPTANCE_PROBE_MODE=true requires VOYAGE_API_KEY "
+                "for the exact fast-path embedder"
+            )
+        return self
 
     # Engage -> Graphiti service authentication. ``off`` preserves the current
     # production contract during a coordinated rollout; ``optional`` accepts

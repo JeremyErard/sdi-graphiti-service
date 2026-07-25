@@ -1,0 +1,66 @@
+{
+  "facts": [
+    {
+      "expired_at": null,
+      "fact": "The Finance Team owns the Monthly Close process.",
+      "object": "50000000-0000-4000-8000-000000000002",
+      "predicate": "owns",
+      "subject": "50000000-0000-4000-8000-000000000001",
+      "valid_from": null,
+      "valid_to": null
+    }
+  ],
+  "graph_name": "client_pokagon",
+  "provenance_shadow": {
+    "contract_version": "graphiti_provenance_shadow_v1",
+    "enforcement_applied": false,
+    "facts": [
+      {
+        "chain_status": "chained",
+        "episodes": [
+          "60000000-0000-4000-8000-000000000001"
+        ],
+        "expired_at": null,
+        "fact": "The Finance Team owns the Monthly Close process.",
+        "fact_id": "40000000-0000-4000-8000-000000000001",
+        "object": "50000000-0000-4000-8000-000000000002",
+        "object_name": "Monthly Close",
+        "predicate": "owns",
+        "sources": [
+          {
+            "anchor_mode": "typed_source",
+            "engagement_id": "engagement-123",
+            "episode_name": "document_analysis: document/doc-456",
+            "episode_type": "document_analysis",
+            "episode_uuid": "60000000-0000-4000-8000-000000000001",
+            "producer_contract_version": "structured_provenance_v2",
+            "source_description": "Operating-model source document",
+            "source_id": "doc-456",
+            "source_type": "document",
+            "valid_at": null
+          }
+        ],
+        "subject": "50000000-0000-4000-8000-000000000001",
+        "subject_name": "Finance Team",
+        "valid_from": null,
+        "valid_to": null
+      }
+    ],
+    "provenance_summary": {
+      "candidates": 1,
+      "contract_version": "graphiti_provenance_summary_v1",
+      "cross_engagement_suppressed": 0,
+      "expired_suppressed": 0,
+      "malformed_item_suppressed": 0,
+      "malformed_response_events": 0,
+      "overfetch_limit": 3,
+      "pre_chain_suppressed": 0,
+      "requested_results": 1,
+      "retrieval_path": "fast",
+      "service_forwarded": 1,
+      "starved_at_service": false
+    }
+  },
+  "search_time_ms": 0.0,
+  "segment_insights": []
+}

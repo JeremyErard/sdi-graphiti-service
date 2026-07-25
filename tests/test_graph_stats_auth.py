@@ -13,6 +13,10 @@ from app import auth
 from app.auth import build_signature, require_scope
 from app.config import settings
 from app.routers import admin, graph, ingest, search, structured
+from app.services.provenance_stats import (
+    PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE,
+    ProvenanceStatsReadError,
+)
 from scripts.graphiti_http import signed_headers as operator_signed_headers
 
 
@@ -20,24 +24,46 @@ ADMIN_SECRET = "admin-secret-that-is-at-least-32-characters"
 
 
 class FakeQueryResult:
-    def __init__(self, count: int):
-        self.result_set = [[count]]
+    def __init__(self, rows):
+        self.result_set = rows
 
 
 class FakeGraph:
     def __init__(self, name: str):
         self.name = name
 
-    def query(self, query: str):
+    def query(self, query: str, params: dict | None = None):
+        # The default node/edge totals stay on the shipped GRAPH.QUERY command.
+        FakeFalkorDB.queries.append((self.name, query, params or {}))
         if "MATCH (n)" in query:
-            return FakeQueryResult(11)
+            return FakeQueryResult([[11]])
         if "MATCH ()-[r]->()" in query:
-            return FakeQueryResult(22)
+            return FakeQueryResult([[22]])
+        raise AssertionError("graph-stats provenance reads must use ro_query")
+
+    def ro_query(self, query: str, params: dict | None = None):
+        FakeFalkorDB.queries.append((self.name, query, params or {}))
+        if "MATCH (n) RETURN count(n)" in query or "MATCH ()-[r]->()" in query:
+            raise AssertionError(
+                "default graph-stats totals must stay on the shipped query command"
+            )
+        if "MATCH (episode:Episodic)" in query:
+            assert params["group_id"] == self.name
+            assert "disallowed_control_pattern" in params
+            assert "nonblank_text_pattern" in params
+            return FakeQueryResult([])
+        if "edge:RELATES_TO" in query:
+            assert params["group_id"] == self.name
+            assert "disallowed_control_pattern" in params
+            assert "nonblank_text_pattern" in params
+            assert params["temporal_storage_limit"] == 128
+            return FakeQueryResult([])
         raise AssertionError(f"unexpected graph-stats query: {query}")
 
 
 class FakeFalkorDB:
     selected: list[str] = []
+    queries: list[tuple[str, str, dict]] = []
 
     def __init__(self, **_kwargs):
         pass
@@ -85,6 +111,7 @@ def required_auth(monkeypatch):
     monkeypatch.setattr(settings, "graphiti_auth_max_clock_skew_seconds", 300)
     monkeypatch.setattr(falkordb, "FalkorDB", FakeFalkorDB)
     FakeFalkorDB.selected = []
+    FakeFalkorDB.queries = []
     seen: set[tuple[str, str]] = set()
 
     async def consume(scope: str, nonce: str) -> bool:
@@ -150,6 +177,96 @@ def test_platform_signed_body_counts_all_graphs_without_mutation():
         "graph_count": 2,
     }
     assert FakeFalkorDB.selected == ["client_pokagon", "segment_tribal_gaming"]
+    assert not any(
+        "Episodic" in query or "edge:RELATES_TO" in query
+        for _name, query, _params in FakeFalkorDB.queries
+    )
+
+
+def test_provenance_aggregates_are_explicitly_opt_in_and_content_free():
+    body = encoded({"client_slug": "pokagon", "include_provenance": True})
+
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="pokagon"),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "graphs": [
+            {
+                "graph_name": "client_pokagon",
+                "nodes": 11,
+                "edges": 22,
+                "provenance": {
+                    "facts_total": 0,
+                    "malformed_response_events": 0,
+                    "by_structural_status": [
+                        {"structural_status": "chained", "count": 0},
+                        {"structural_status": "pre_chain", "count": 0},
+                        {"structural_status": "malformed", "count": 0},
+                    ],
+                    "by_episode_type": [],
+                    "by_engagement": [],
+                },
+            }
+        ],
+        "graph_count": 1,
+    }
+    provenance_queries = [
+        query
+        for _name, query, _params in FakeFalkorDB.queries
+        if "Episodic" in query or "edge:RELATES_TO" in query
+    ]
+    assert len(provenance_queries) == 2
+    serialized = response.text.lower()
+    for forbidden in ("fact", "source_description", "episode_name", "content"):
+        # Structural field names such as facts_total are allowed; graph values are not.
+        if forbidden == "fact":
+            continue
+        assert forbidden not in serialized
+
+
+def test_provenance_opt_in_requires_one_exact_client_before_graph_access():
+    body = encoded({"include_provenance": True})
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="*"),
+    )
+
+    assert response.status_code == 422
+    assert FakeFalkorDB.selected == []
+
+
+def test_missing_exact_graph_fails_with_fixed_code_without_selection():
+    body = encoded({"client_slug": "missing"})
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="missing"),
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "GRAPH_STATS_GRAPH_NOT_FOUND"}
+    assert FakeFalkorDB.selected == []
+
+
+def test_provenance_bound_failure_returns_only_fixed_safe_code(monkeypatch):
+    def fail_stats(*_args, **_kwargs):
+        raise ProvenanceStatsReadError(PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE)
+
+    monkeypatch.setattr(admin, "provenance_stats_for_graph", fail_stats)
+    body = encoded({"client_slug": "pokagon", "include_provenance": True})
+    response = client().post(
+        "/admin/graph-stats",
+        content=body,
+        headers=admin_headers(body=body, client_slug="pokagon"),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": PROVENANCE_STATS_EDGE_ROW_LIMIT_CODE}
 
 
 def test_supported_operator_helper_signs_graph_stats_post(monkeypatch):
