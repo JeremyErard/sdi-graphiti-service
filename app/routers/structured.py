@@ -245,13 +245,8 @@ async def _write_structured(
 
     try:
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
-        from falkordb import FalkorDB
 
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
 
         now_iso = start.isoformat()

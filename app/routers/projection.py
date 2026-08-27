@@ -672,15 +672,45 @@ def _spot_probe(envelope: ProjectionEnvelopeV2, group_id: str) -> dict[str, Any]
     }
 
 
-def _open_graph(graph_name: str) -> Any:
-    from falkordb import FalkorDB
+# Module-local FalkorDB handle, DELIBERATELY not shared with the rest of the
+# service.
+#
+# Constructing FalkorDB() opens a connection pool and _open_graph ran per
+# request, leaking one every time; on 2026-08-27 the accumulated leaks across
+# this service exhausted FalkorDB's client limit and it refused every query
+# with "Too many connections".
+#
+# The obvious fix — importing the shared accessor the other modules now use —
+# is not available here and should not be made available. This module is pinned
+# by test_the_projection_module_opens_no_path_back_to_a_system_of_record to
+# import nothing that could become a reverse-write path, and that module is
+# named on its forbidden list. So the pooling fix is duplicated rather than
+# shared: a few lines of duplication is the cheaper price than a hole in that
+# boundary.
+_falkor_db: Any = None
 
-    db = FalkorDB(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-    )
-    return db.select_graph(graph_name)
+
+def _get_falkor_db() -> Any:
+    global _falkor_db
+    if _falkor_db is None:
+        from falkordb import FalkorDB
+
+        _falkor_db = FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+    return _falkor_db
+
+
+def _reset_falkor_db() -> None:
+    """Drop the handle so the next call reconnects (tests inject their own)."""
+    global _falkor_db
+    _falkor_db = None
+
+
+def _open_graph(graph_name: str) -> Any:
+    return _get_falkor_db().select_graph(graph_name)
 
 
 def _derive_graph_name(client_slug: str) -> str:
