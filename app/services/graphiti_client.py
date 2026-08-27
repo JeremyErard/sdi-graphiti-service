@@ -238,6 +238,51 @@ def _create_embedder():
     )
 
 
+# Process-wide FalkorDB handle.
+#
+# Constructing FalkorDB() opens a connection pool. Twelve call sites built a
+# fresh one per request and none of them closed it. `_search_fast` runs on EVERY
+# search — which includes every kg-health probe and every entity-resolution step
+# inside ingestion — and /graph/nodes-and-edges, /structured, /projection and
+# five admin routes did the same. Each request leaked a pool until FalkorDB hit
+# its client limit and began refusing every query with "Too many connections".
+#
+# Observed 2026-08-27: FalkorDB Live and unrestarted since June 15 with a
+# healthy disk, yet every search timed out at the caller's 8s ceiling and all
+# five kg-ingest jobs failed after exhausting three 300s retries, each recorded
+# only as "Graphiti ingestion returned null".
+#
+# falkordb-py wraps redis-py, whose client is thread-safe and pools internally,
+# so a single handle per process is both correct and what the library expects.
+_falkor_db: Any = None
+
+
+def get_falkor_db() -> Any:
+    """Return the shared FalkorDB handle, creating it on first use."""
+    global _falkor_db
+    if _falkor_db is None:
+        from falkordb import FalkorDB as _FalkorDB
+
+        _falkor_db = _FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+    return _falkor_db
+
+
+def reset_falkor_db() -> None:
+    """Drop the shared handle so the next call reconnects.
+
+    The handle is process-wide by design — one pool per process is the point.
+    That makes its lifetime explicit state, so anything that must not reuse an
+    existing connection has to say so: tests that inject their own fake
+    FalkorDB, and any caller that has just invalidated the connection.
+    """
+    global _falkor_db
+    _falkor_db = None
+
+
 def _create_driver(graph_name: str) -> FalkorDriver:
     """Create a FalkorDB driver targeting a specific named graph."""
     return FalkorDriver(
@@ -290,13 +335,8 @@ async def init_graph(client_slug: str) -> str:
     # get incremental HNSW indexing from the first edge onward — avoiding the
     # one-time bulk build that older graphs paid on their first search. Best-effort.
     try:
-        from falkordb import FalkorDB
 
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = get_falkor_db()
         _ensure_edge_vector_index(db.select_graph(graph_name), graph_name)
     except Exception as e:
         logger.warning(f"[graphiti] vector index init skipped for {graph_name}: {e}")
@@ -418,13 +458,8 @@ async def add_episode(
         canonical_episode_id = _uuid_string(episode_id)
         if not canonical_episode_id:
             raise RuntimeError("anchored episode ingestion returned no valid episode UUID")
-        from falkordb import FalkorDB
 
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = get_falkor_db()
         graph = db.select_graph(graph_name)
         updated = graph.query(
             """
@@ -538,13 +573,8 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     vector-only within this function (still fast and relevant).
     """
     graph_name = _graph_name_for_client(client_slug)
-    from falkordb import FalkorDB
 
-    db = FalkorDB(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-    )
+    db = get_falkor_db()
     graph = (
         _select_existing_probe_graph(db, graph_name)
         if settings.graphiti_acceptance_probe_mode
@@ -723,14 +753,9 @@ async def resolve_search_provenance(
     if not ordered_edge_ids:
         return {}, malformed_response_events
 
-    from falkordb import FalkorDB
 
     graph_name = _graph_name_for_client(client_slug)
-    db = FalkorDB(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-    )
+    db = get_falkor_db()
     graph = (
         _select_existing_probe_graph(db, graph_name)
         if settings.graphiti_acceptance_probe_mode
