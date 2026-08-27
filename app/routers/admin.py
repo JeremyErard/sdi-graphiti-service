@@ -107,7 +107,6 @@ async def delete_graph(req: DeleteGraphRequest):
         )
     try:
         from app.services import graphiti_client as gc
-        from falkordb import FalkorDB
 
         graph_name = gc._graph_name_for_client(req.client_slug)
         # Evict cached Graphiti client so a new one won't reference a stale graph.
@@ -123,11 +122,7 @@ async def delete_graph(req: DeleteGraphRequest):
         # so reaching through driver.client.execute_command silently fails for
         # graph-key cleanup. The native FalkorDB().select_graph(name).delete()
         # API issues GRAPH.DELETE properly and removes the graph from GRAPH.LIST.
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
         try:
             graph.delete()
@@ -242,13 +237,8 @@ async def reembed_graph(req: ReembedGraphRequest):
             )
 
     try:
-        from falkordb import FalkorDB
 
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
 
         NODE_FILTER = "n.name IS NOT NULL AND n.name <> ''"
@@ -429,14 +419,9 @@ async def export_graph(req: ExportGraphRequest):
     verbatim via re-embed from the same text + embedder). A safety-net backup
     that can fully reconstruct the searchable substrate if needed. Read-only.
     """
-    from falkordb import FalkorDB
 
     graph_name = req.graph_name or graphiti_client._graph_name_for_client(req.client_slug)
-    db = FalkorDB(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-    )
+    db = graphiti_client.get_falkor_db()
     graph = db.select_graph(graph_name)
     off, lim = int(req.offset), int(req.limit)
 
@@ -548,14 +533,9 @@ async def import_graph(req: ImportGraphRequest):
 
     from collections import defaultdict
 
-    from falkordb import FalkorDB
 
     graph_name = req.graph_name or graphiti_client._graph_name_for_client(req.client_slug)
-    db = FalkorDB(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-    )
+    db = graphiti_client.get_falkor_db()
     graph = db.select_graph(graph_name)
     imported = 0
     skipped = 0

@@ -103,6 +103,39 @@ def _create_embedder():
     )
 
 
+# Process-wide FalkorDB handle.
+#
+# Constructing FalkorDB() opens a connection pool. Nine call sites built a fresh
+# one per request and none of them closed it — `_search_fast` runs on EVERY
+# search (including every kg-health probe and every entity-resolution step
+# inside ingestion), and /graph/nodes-and-edges and /structured did the same.
+# Each request therefore leaked a pool until FalkorDB hit maxclients and began
+# refusing every query with "Too many connections".
+#
+# Observed 2026-08-27: FalkorDB live and healthy, disk fine, no restarts — yet
+# every search timed out at the caller's 8s ceiling and all five kg-ingest jobs
+# failed after exhausting three 300s retries, each recorded only as "Graphiti
+# ingestion returned null".
+#
+# falkordb-py wraps redis-py, whose client is thread-safe and pools internally,
+# so a single handle per process is both correct and what the library expects.
+_falkor_db: Any = None
+
+
+def get_falkor_db() -> Any:
+    """Return the shared FalkorDB handle, creating it on first use."""
+    global _falkor_db
+    if _falkor_db is None:
+        from falkordb import FalkorDB
+
+        _falkor_db = FalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+        )
+    return _falkor_db
+
+
 def _create_driver(graph_name: str) -> FalkorDriver:
     """Create a FalkorDB driver targeting a specific named graph."""
     return FalkorDriver(
@@ -157,11 +190,7 @@ async def init_graph(client_slug: str) -> str:
     try:
         from falkordb import FalkorDB
 
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = get_falkor_db()
         _ensure_edge_vector_index(db.select_graph(graph_name), graph_name)
     except Exception as e:
         logger.warning(f"[graphiti] vector index init skipped for {graph_name}: {e}")
@@ -344,11 +373,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     graph_name = _graph_name_for_client(client_slug)
     from falkordb import FalkorDB
 
-    db = FalkorDB(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-    )
+    db = get_falkor_db()
     graph = db.select_graph(graph_name)
     _ensure_edge_vector_index(graph, graph_name)
 

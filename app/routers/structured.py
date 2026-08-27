@@ -78,13 +78,8 @@ async def ingest_structured(req: StructuredIngestRequest):
     reference_time = req.reference_time or start
 
     try:
-        from falkordb import FalkorDB
 
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
 
         now_iso = start.isoformat()

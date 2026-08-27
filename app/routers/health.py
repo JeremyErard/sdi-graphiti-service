@@ -24,6 +24,7 @@ async def health_check():
         "falkordb": {"host": settings.falkordb_host, "port": settings.falkordb_port},
     }
 
+    r = None
     try:
         r = redis.Redis(
             host=settings.falkordb_host,
@@ -77,12 +78,22 @@ async def health_check():
         except Exception:
             pass
 
-        await r.aclose()
     except Exception as e:
         status["status"] = "degraded"
         status["falkordb"]["connected"] = False
         status["falkordb"]["error"] = str(e)
         logger.error(f"[graphiti] Health check — FalkorDB connection failed: {e}")
+    finally:
+        # MUST be finally. This close used to sit at the end of the try, so it
+        # was skipped on exactly the path where it matters: once FalkorDB starts
+        # refusing connections, r.info() raises and the connection leaks. Render
+        # polls this endpoint continuously, so a saturated FalkorDB made every
+        # health check leak another connection — the failure fed itself.
+        if r is not None:
+            try:
+                await r.aclose()
+            except Exception:
+                pass
 
     return status
 

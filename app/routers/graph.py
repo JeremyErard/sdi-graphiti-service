@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
+from app.services import graphiti_client
 
 logger = logging.getLogger("graphiti_service")
 
@@ -53,12 +54,7 @@ async def get_graph_data(req: GraphDataRequest):
     graph_name = _graph_name_for_client(req.client_slug)
 
     try:
-        from falkordb import FalkorDB
-        db = FalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-        )
+        db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
 
         # Query entity and community nodes (skip episodes — too heavy for viz)
