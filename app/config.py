@@ -22,6 +22,18 @@ class Settings(BaseSettings):
     # answering, so a queued job is reported as queued instead of looking dead.
     max_concurrent_ingests: int = 1
 
+    # Socket timeout for the SYNCHRONOUS FalkorDB handle, in seconds.
+    #
+    # Load-bearing. That handle is used from inside async request paths, so a
+    # call with no timeout blocks the whole event loop for as long as FalkorDB
+    # takes — which, if FalkorDB is wedged, is forever. On 2026-08-28 this
+    # service stopped answering even /health (a 3s redis ping) while an
+    # extraction held the loop; nothing else could be scheduled at all.
+    #
+    # Generous rather than tight, because admin export/import legitimately run
+    # long. The point is that it is FINITE.
+    falkordb_socket_timeout_seconds: int = 120
+
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
     falkordb_password: str = ""
