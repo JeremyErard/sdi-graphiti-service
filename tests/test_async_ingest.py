@@ -150,3 +150,44 @@ def test_sync_endpoint_still_hides_the_cause(monkeypatch):
     r = client().post("/ingest/episode", json=EPISODE)
     assert r.status_code == 500
     assert r.json() == {"detail": "Ingestion failed"}
+
+
+def test_a_cancelled_task_does_not_leave_its_job_running(monkeypatch):
+    """CancelledError is a BaseException, so `except Exception` missed it.
+
+    A cancelled task used to leave its job pinned at "running" forever: the
+    poller asked every 5s, got "running" every time, and spent its entire
+    budget on work that had already stopped.
+    """
+    async def cancelled(req):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(ingest, "_perform_ingest", cancelled)
+    c = client()
+    job_id = c.post("/ingest/episode/async", json=EPISODE).json()["job_id"]
+    body = c.post("/ingest/jobs/status", json={"job_id": job_id, "client_slug": "pokagon"}).json()
+
+    assert body["status"] == "failed"
+    assert body["status"] != "running"
+
+
+def test_a_running_job_that_never_reports_is_eventually_abandoned(monkeypatch):
+    """Only FINISHED jobs are pruned, so a task that dies without recording an
+    outcome would otherwise answer "still working" forever."""
+    job = ingest_jobs.create("pokagon")
+    assert ingest_jobs.get(job.job_id, "pokagon").status == "running"
+
+    monkeypatch.setattr(ingest_jobs, "RUNNING_MAX_AGE_SECONDS", -1)
+    abandoned = ingest_jobs.get(job.job_id, "pokagon")
+
+    # Abandoned, NOT deleted: a poller gets a verdict rather than a 404 it
+    # would have to interpret.
+    assert abandoned is not None
+    assert abandoned.status == "failed"
+    assert abandoned.error_type == "IngestJobAbandoned"
+
+
+def test_an_abandoned_job_is_still_tenant_scoped(monkeypatch):
+    job = ingest_jobs.create("pokagon")
+    monkeypatch.setattr(ingest_jobs, "RUNNING_MAX_AGE_SECONDS", -1)
+    assert ingest_jobs.get(job.job_id, "someone-else") is None

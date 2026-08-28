@@ -118,6 +118,16 @@ async def ingest_episode_async(req: IngestEpisodeRequest):
     async def _run() -> None:
         try:
             ingest_jobs.mark_succeeded(job.job_id, await _perform_ingest(req))
+        except asyncio.CancelledError as error:
+            # CancelledError is a BaseException (3.8+), so `except Exception`
+            # did NOT catch it. A cancelled task therefore left its job pinned
+            # at "running" forever: the poller kept asking, got "running" every
+            # time, and spun until its whole budget was spent — for work that
+            # had already stopped. Record it, then re-raise so cancellation
+            # still behaves like cancellation.
+            logger.error("[graphiti] Async ingestion cancelled job=%s", job.job_id)
+            ingest_jobs.mark_failed(job.job_id, error, content)
+            raise
         except Exception as error:  # noqa: BLE001 - recorded on the job
             logger.error(
                 "[graphiti] Async ingestion failed job=%s error_type=%s",
