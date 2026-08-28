@@ -12,6 +12,7 @@ from app.models.episode import (
     IngestEpisodeResponse,
 )
 from app.provenance_contract import LEGACY_EPISODE_CONTRACT_VERSION
+from app.config import settings
 from app.services import graphiti_client, ingest_jobs
 
 logger = logging.getLogger("graphiti_service")
@@ -103,6 +104,26 @@ async def ingest_episode(req: IngestEpisodeRequest):
 # owner and a task can be garbage-collected mid-extraction.
 _running: set[asyncio.Task] = set()
 
+# Extraction is CPU-bound work on a single-CPU service. Running two at once
+# starved the event loop so badly that the HTTP server stopped answering —
+# observed 2026-08-28, with both /ingest/episode/async and /ingest/jobs/status
+# timing out at the caller while this service was alive and had not restarted.
+#
+# The semaphore is acquired INSIDE the background task, never in the request
+# handler, so a busy service still accepts the job and returns its handle
+# immediately. A queued episode then reports "running" to the poller, which is
+# accurate: it has been accepted and is waiting its turn.
+#
+# Created lazily because a Semaphore binds to the running loop.
+_ingest_slots: asyncio.Semaphore | None = None
+
+
+def _slots() -> asyncio.Semaphore:
+    global _ingest_slots
+    if _ingest_slots is None:
+        _ingest_slots = asyncio.Semaphore(max(1, settings.max_concurrent_ingests))
+    return _ingest_slots
+
 
 @router.post("/episode/async", status_code=202)
 async def ingest_episode_async(req: IngestEpisodeRequest):
@@ -117,7 +138,8 @@ async def ingest_episode_async(req: IngestEpisodeRequest):
 
     async def _run() -> None:
         try:
-            ingest_jobs.mark_succeeded(job.job_id, await _perform_ingest(req))
+            async with _slots():
+                ingest_jobs.mark_succeeded(job.job_id, await _perform_ingest(req))
         except asyncio.CancelledError as error:
             # CancelledError is a BaseException (3.8+), so `except Exception`
             # did NOT catch it. A cancelled task therefore left its job pinned
