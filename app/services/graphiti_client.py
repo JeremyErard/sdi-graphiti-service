@@ -1,6 +1,7 @@
 """Graphiti core wrapper — graph connections, ingestion, and provenance search."""
 
 import ast
+import asyncio
 import logging
 import time
 import uuid as uuidlib
@@ -267,6 +268,13 @@ def get_falkor_db() -> Any:
             host=settings.falkordb_host,
             port=settings.falkordb_port,
             password=settings.falkordb_password or None,
+            # MUST be finite. This handle is SYNCHRONOUS and is used from inside
+            # async paths, so an untimed call blocks the entire event loop for
+            # as long as FalkorDB takes to answer — unbounded, if FalkorDB is
+            # wedged. On 2026-08-28 this service could not serve even /health (a
+            # 3s redis ping) while one extraction held the loop.
+            socket_connect_timeout=settings.falkordb_socket_timeout_seconds,
+            socket_timeout=settings.falkordb_socket_timeout_seconds,
         )
     return _falkor_db
 
@@ -459,30 +467,37 @@ async def add_episode(
         if not canonical_episode_id:
             raise RuntimeError("anchored episode ingestion returned no valid episode UUID")
 
-        db = get_falkor_db()
-        graph = db.select_graph(graph_name)
-        updated = graph.query(
-            """
-            MATCH (ep:Episodic {uuid: $episode_uuid, group_id: $group_id})
-            SET ep.source_id = $source_id,
-                ep.source_type = $source_type,
-                ep.engagement_id = $engagement_id,
-                ep.episode_type = $episode_type,
-                ep.anchor_mode = $anchor_mode,
-                ep.producer_contract_version = $producer_contract_version
-            RETURN ep.uuid
-            """,
-            params={
-                "episode_uuid": canonical_episode_id,
-                "group_id": graph_name,
-                "source_id": source_id,
-                "source_type": source_type,
-                "engagement_id": engagement_id,
-                "episode_type": episode_type,
-                "anchor_mode": anchor_mode,
-                "producer_contract_version": producer_contract_version,
-            },
-        )
+        # Run OFF the event loop. This is a synchronous driver call on the
+        # per-episode ingest path; inline it blocks every other request for its
+        # duration, which is how a single extraction was able to stop this
+        # service answering anything at all. The socket timeout bounds how long
+        # it can take; this keeps that time from being charged to the loop.
+        def _anchor_provenance():
+            graph = get_falkor_db().select_graph(graph_name)
+            return graph.query(
+                """
+                MATCH (ep:Episodic {uuid: $episode_uuid, group_id: $group_id})
+                SET ep.source_id = $source_id,
+                    ep.source_type = $source_type,
+                    ep.engagement_id = $engagement_id,
+                    ep.episode_type = $episode_type,
+                    ep.anchor_mode = $anchor_mode,
+                    ep.producer_contract_version = $producer_contract_version
+                RETURN ep.uuid
+                """,
+                params={
+                    "episode_uuid": canonical_episode_id,
+                    "group_id": graph_name,
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "engagement_id": engagement_id,
+                    "episode_type": episode_type,
+                    "anchor_mode": anchor_mode,
+                    "producer_contract_version": producer_contract_version,
+                },
+            )
+
+        updated = await asyncio.to_thread(_anchor_provenance)
         if not updated.result_set:
             raise RuntimeError("anchored episode provenance update matched no episode")
 
