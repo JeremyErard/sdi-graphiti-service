@@ -191,3 +191,56 @@ def test_an_abandoned_job_is_still_tenant_scoped(monkeypatch):
     job = ingest_jobs.create("pokagon")
     monkeypatch.setattr(ingest_jobs, "RUNNING_MAX_AGE_SECONDS", -1)
     assert ingest_jobs.get(job.job_id, "someone-else") is None
+
+
+def test_a_busy_service_still_accepts_and_hands_back_a_handle(monkeypatch):
+    """Serialising must not make the service look down.
+
+    The semaphore is acquired inside the background task, never in the request
+    handler, so a caller always gets its handle immediately and a queued
+    episode reports "running" — accurate, since it has been accepted.
+    """
+    async def slow(req):
+        await asyncio.sleep(30)
+        return {"episode_id": "never"}
+
+    monkeypatch.setattr(ingest, "_perform_ingest", slow)
+    ingest._ingest_slots = None
+    c = client()
+
+    first = c.post("/ingest/episode/async", json=EPISODE)
+    second = c.post("/ingest/episode/async", json=EPISODE)
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["job_id"] != first.json()["job_id"]
+    assert second.json()["status"] == "running"
+
+
+def test_extraction_is_serialised_to_one_at_a_time(monkeypatch):
+    """Two concurrent extractions starved the event loop on a 1-CPU service
+    until the HTTP server stopped answering (2026-08-28)."""
+    concurrent = 0
+    peak = 0
+
+    async def tracked(req):
+        nonlocal concurrent, peak
+        concurrent += 1
+        peak = max(peak, concurrent)
+        await asyncio.sleep(0)
+        concurrent -= 1
+        return {"episode_id": "ep", "entities_extracted": 0, "facts_created": 0, "graph_name": "g"}
+
+    monkeypatch.setattr(ingest, "_perform_ingest", tracked)
+    ingest._ingest_slots = None
+    c = client()
+    for _ in range(4):
+        assert c.post("/ingest/episode/async", json=EPISODE).status_code == 202
+
+    assert peak == 1, f"expected extractions serialised, saw {peak} at once"
+
+
+def test_the_limit_comes_from_config_so_it_can_be_raised_with_the_cpu(monkeypatch):
+    monkeypatch.setattr(ingest.settings, "max_concurrent_ingests", 3)
+    ingest._ingest_slots = None
+    assert ingest._slots()._value == 3

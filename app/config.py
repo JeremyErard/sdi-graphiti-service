@@ -8,6 +8,20 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # FalkorDB connection
+    # How many episode extractions may run at once.
+    #
+    # One, because this service runs on a SINGLE CPU and extraction is a long
+    # chain of model calls with real CPU work between them (embedding handling,
+    # JSON parsing, rank fusion). Two concurrent extractions starved the asyncio
+    # event loop badly enough that the HTTP server stopped answering: on
+    # 2026-08-28 both POST /ingest/episode/async and POST /ingest/jobs/status
+    # timed out at the caller while the service was alive and had not restarted.
+    #
+    # Serialising is not a throughput loss worth minding — the work is
+    # CPU-bound on one core either way. What it buys is a service that keeps
+    # answering, so a queued job is reported as queued instead of looking dead.
+    max_concurrent_ingests: int = 1
+
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
     falkordb_password: str = ""
