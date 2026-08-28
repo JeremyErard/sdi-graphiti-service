@@ -40,6 +40,13 @@ JobStatus = Literal["running", "succeeded", "failed"]
 # read the outcome, then pruned so the registry cannot grow without bound.
 FINISHED_TTL_SECONDS = 30 * 60
 
+# A running job older than this is abandoned. Nothing should take this long —
+# the caller's own poll budget is 2400s — and without a ceiling a job whose task
+# died without recording an outcome would stay "running" forever: never pruned
+# (only FINISHED jobs are), and answering every poll with "still working" for
+# work that had already stopped.
+RUNNING_MAX_AGE_SECONDS = 60 * 60
+
 # Hard ceiling on retained jobs. Reached only if something floods the endpoint;
 # the oldest finished jobs are dropped first so a live job is never evicted.
 MAX_JOBS = 500
@@ -166,7 +173,19 @@ def mark_failed(job_id: str, error: BaseException, content: str) -> None:
 def _prune() -> None:
     now = time.time()
     for job_id, job in list(_jobs.items()):
-        if job.finished_at is not None and now - job.finished_at > FINISHED_TTL_SECONDS:
+        if job.finished_at is None:
+            # Abandon rather than delete, so a poller gets a definitive answer
+            # instead of a 404 it would have to guess about.
+            if now - job.created_at > RUNNING_MAX_AGE_SECONDS:
+                job.status = "failed"
+                job.error_type = "IngestJobAbandoned"
+                job.error_message = (
+                    f"no outcome recorded within {RUNNING_MAX_AGE_SECONDS}s; "
+                    "the task died without reporting"
+                )
+                job.finished_at = now
+            continue
+        if now - job.finished_at > FINISHED_TTL_SECONDS:
             _jobs.pop(job_id, None)
     if len(_jobs) <= MAX_JOBS:
         return
