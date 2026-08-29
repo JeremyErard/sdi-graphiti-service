@@ -9,6 +9,7 @@ ceiling, so the request had to stop waiting for the work.
 """
 
 import asyncio
+import time
 
 import pytest
 from fastapi import Depends, FastAPI
@@ -244,3 +245,36 @@ def test_the_limit_comes_from_config_so_it_can_be_raised_with_the_cpu(monkeypatc
     monkeypatch.setattr(ingest.settings, "max_concurrent_ingests", 3)
     ingest._ingest_slots = None
     assert ingest._slots()._value == 3
+
+
+def test_a_running_job_reports_how_long_it_has_been_silent(monkeypatch):
+    """A poller must be able to tell a slow job from a stopped one.
+
+    Extraction spends most of its twenty-odd minutes inside Anthropic calls,
+    which log nothing. Without a liveness signal, a healthy run and a wedged one
+    look identical from outside — polls answered, silence otherwise. On
+    2026-08-28/29 that ambiguity turned every "keep waiting or intervene?"
+    decision into a guess, with real money riding on it.
+    """
+    monkeypatch.setattr(ingest_jobs, "RUNNING_MAX_AGE_SECONDS", 3600)
+    job = ingest_jobs.create("pokagon")
+    body = job.to_dict()
+
+    assert body["status"] == "running"
+    assert "silent_for_seconds" in body
+    assert body["silent_for_seconds"] < 5
+
+
+def test_a_heartbeat_resets_the_silence(monkeypatch):
+    job = ingest_jobs.create("pokagon")
+    job.heartbeat_at = time.time() - 600          # pretend ten minutes of silence
+    assert job.to_dict()["silent_for_seconds"] >= 590
+
+    ingest_jobs.heartbeat(job.job_id)
+    assert job.to_dict()["silent_for_seconds"] < 5
+
+
+def test_the_heartbeat_is_tenant_scoped_like_everything_else():
+    job = ingest_jobs.create("pokagon")
+    ingest_jobs.heartbeat(job.job_id)
+    assert ingest_jobs.get(job.job_id, "someone-else") is None

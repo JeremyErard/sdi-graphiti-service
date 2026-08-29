@@ -60,6 +60,12 @@ CONTENT_ECHO_WINDOW = 32
 @dataclass
 class IngestJob:
     job_id: str
+    # Last time the job was seen alive. Extraction spends most of its twenty-odd
+    # minutes inside Anthropic calls, which log nothing, so from outside the
+    # service a healthy run and a wedged one look identical: polls answered,
+    # silence otherwise. That ambiguity cost hours on 2026-08-28/29 — every
+    # judgement about whether to wait or intervene was a guess.
+    heartbeat_at: float = field(default_factory=time.time)
     # The tenant this job belongs to. A poll must present a matching slug, so
     # one ingest-scoped caller cannot read another tenant's job by guessing a
     # handle. Graphs are per-client and job outcomes name entity/fact counts,
@@ -76,11 +82,17 @@ class IngestJob:
         end = self.finished_at if self.finished_at is not None else time.time()
         return (end - self.created_at) * 1000.0
 
+    def silent_for_seconds(self) -> float:
+        return max(0.0, time.time() - self.heartbeat_at)
+
     def to_dict(self) -> dict[str, Any]:
         body: dict[str, Any] = {
             "job_id": self.job_id,
             "status": self.status,
             "elapsed_ms": round(self.elapsed_ms()),
+            # How long since this job last proved it was alive. A poller can now
+            # tell a slow run from a stopped one instead of guessing.
+            "silent_for_seconds": round(self.silent_for_seconds()),
         }
         if self.result is not None:
             body["result"] = self.result
@@ -150,6 +162,14 @@ def get(job_id: str, client_slug: str) -> IngestJob | None:
     if job is None or job.client_slug != client_slug:
         return None
     return job
+
+
+def heartbeat(job_id: str) -> None:
+    """Record that the job is still working. Cheap, and the only liveness signal
+    that exists during the long silent extraction phase."""
+    job = _jobs.get(job_id)
+    if job is not None:
+        job.heartbeat_at = time.time()
 
 
 def mark_succeeded(job_id: str, result: dict[str, Any]) -> None:
