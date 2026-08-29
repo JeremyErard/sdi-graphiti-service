@@ -32,7 +32,22 @@ class Settings(BaseSettings):
     #
     # Generous rather than tight, because admin export/import legitimately run
     # long. The point is that it is FINITE.
-    falkordb_socket_timeout_seconds: int = 120
+    # 120 was BELOW what a real episode needs, so it was the binding constraint
+    # rather than a safety net: every ingest died at ~121s, and when the value
+    # moved the failure time moved with it.
+    #
+    # graphiti-core dedups extracted entities by computing cosine distance
+    # INLINE in Cypher, with no vector index on the entity embeddings -- an O(N)
+    # scan per entity, ~25-50 entities per episode, against every embedded node
+    # in the graph. That is genuinely slow, and it gets slower as the graph
+    # grows. (Our own RELATES_TO.fact_embedding HNSW index accelerates SEARCH;
+    # it does not touch graphiti's ingest-side dedup.)
+    #
+    # Still bounded, and deliberately well under INGEST_POLL_BUDGET_MS (3600s)
+    # so the poller reports a real outcome rather than the socket giving up
+    # first. The bound's job is to stop "slow" becoming "hangs forever"; it is
+    # not a performance target.
+    falkordb_socket_timeout_seconds: int = 900
 
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
