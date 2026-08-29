@@ -18,6 +18,7 @@ from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.config import LLMConfig
 
 from app.config import settings
+from app.services.indexed_falkor import IndexedFalkorDriver, ensure_node_vector_index
 from app.graph_names import graph_name_for_client, segment_graph_name
 from app.provenance_contract import STRUCTURALLY_ANCHORED_MODES
 
@@ -366,8 +367,13 @@ def reset_async_falkor_db() -> None:
 
 
 def _create_driver(graph_name: str) -> FalkorDriver:
-    """Create a FalkorDB driver targeting a specific named graph."""
-    return FalkorDriver(falkor_db=new_async_falkor_db(), database=graph_name)
+    """Create a FalkorDB driver targeting a specific named graph.
+
+    IndexedFalkorDriver, not FalkorDriver: graphiti's own entity dedup is a full
+    Entity scan with an inline 1024-dim cosine, run once per extracted entity.
+    See app/services/indexed_falkor.py.
+    """
+    return IndexedFalkorDriver(falkor_db=new_async_falkor_db(), database=graph_name)
 
 
 async def evict_client(client_slug: str) -> None:
@@ -433,6 +439,9 @@ async def init_graph(client_slug: str) -> str:
 
         db = get_falkor_db()
         _ensure_edge_vector_index(db.select_graph(graph_name), graph_name)
+        ensure_node_vector_index(
+            db.select_graph(graph_name), graph_name, int(settings.embedding_dim)
+        )
     except Exception as e:
         logger.warning(f"[graphiti] vector index init skipped for {graph_name}: {e}")
 
