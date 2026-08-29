@@ -115,6 +115,10 @@ _running: set[asyncio.Task] = set()
 # accurate: it has been accepted and is waiting its turn.
 #
 # Created lazily because a Semaphore binds to the running loop.
+# How often a running ingest proves it is still alive. Frequent enough that a
+# stalled job is obvious within a minute, rare enough to be free.
+HEARTBEAT_INTERVAL_SECONDS = 30
+
 _ingest_slots: asyncio.Semaphore | None = None
 
 
@@ -137,6 +141,30 @@ async def ingest_episode_async(req: IngestEpisodeRequest):
     content = req.content
 
     async def _run() -> None:
+        # Prove the job is alive while extraction runs.
+        #
+        # add_episode spends most of its twenty-odd minutes inside Anthropic
+        # calls, which log nothing. From outside, a healthy run and a wedged one
+        # are indistinguishable — polls answered, silence otherwise. Every
+        # decision about whether to keep waiting was therefore a guess, and on
+        # 2026-08-28/29 that guess had to be made repeatedly with real money and
+        # real time riding on it.
+        #
+        # A ticking heartbeat is not progress (we cannot see inside the library),
+        # but it separates the two cases that actually matter: still scheduled,
+        # versus the task is gone.
+        async def _beat() -> None:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                ingest_jobs.heartbeat(job.job_id)
+                logger.info(
+                    "[graphiti] ingest alive job=%s elapsed=%ds",
+                    job.job_id,
+                    round(ingest_jobs.get(job.job_id, req.client_slug).elapsed_ms() / 1000)
+                    if ingest_jobs.get(job.job_id, req.client_slug) else -1,
+                )
+
+        beat = asyncio.create_task(_beat())
         try:
             async with _slots():
                 ingest_jobs.mark_succeeded(job.job_id, await _perform_ingest(req))
@@ -157,6 +185,8 @@ async def ingest_episode_async(req: IngestEpisodeRequest):
                 type(error).__name__,
             )
             ingest_jobs.mark_failed(job.job_id, error, content)
+        finally:
+            beat.cancel()
 
     task = asyncio.create_task(_run())
     _running.add(task)
