@@ -206,3 +206,47 @@ def test_the_graph_visualisation_endpoint_does_not_freeze_the_loop(monkeypatch):
 
     ticks = asyncio.run(scenario())
     assert ticks >= 5, f"event loop was starved by the graph endpoint (ticks={ticks})"
+
+
+def test_init_graph_does_not_freeze_the_loop(monkeypatch):
+    """Rebuilding indices must not stop the service answering.
+
+    #25 moved /graph and /structured off the loop and deliberately LEFT the
+    admin callers, reasoning they were manual and rare. On 2026-08-29 I then
+    called one — the new maintenance route, which runs init_graph — against an
+    unresponsive FalkorDB, and it froze the service so completely that /health
+    stopped answering.
+
+    "Rare" is not "never". The one time one was called, it took everything down.
+    """
+    from app.services import graphiti_client as gc
+
+    class _Client:
+        async def build_indices_and_constraints(self):
+            return None
+
+    async def _get_client(_slug):
+        return _Client()
+
+    monkeypatch.setattr(gc, "get_client", _get_client)
+    monkeypatch.setattr(gc, "get_falkor_db", lambda: _SlowDb(0.4))
+    monkeypatch.setattr(gc, "_ensure_edge_vector_index", lambda *a, **k: _SlowDb(0.4).graph.query("x"))
+
+    async def scenario() -> int:
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            await gc.init_graph("pokagon")
+        finally:
+            beat.cancel()
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    assert ticks >= 5, f"event loop was starved by init_graph (ticks={ticks})"

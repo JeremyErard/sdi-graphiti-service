@@ -511,12 +511,30 @@ async def init_graph(client_slug: str) -> str:
     # get incremental HNSW indexing from the first edge onward — avoiding the
     # one-time bulk build that older graphs paid on their first search. Best-effort.
     try:
+        # OFF the event loop. This is a synchronous driver call, and running it
+        # inline blocks every other request for its full duration — up to the
+        # 120s socket timeout, repeatedly, if FalkorDB is not answering.
+        #
+        # Demonstrated 2026-08-29: calling the new maintenance route against an
+        # unresponsive FalkorDB froze this service so completely that /health
+        # stopped answering. #25 moved /graph and /structured off the loop and
+        # deliberately left the admin callers, reasoning they were manual and
+        # rare. "Rare" is not "never", and the one time one was called it took
+        # the whole service down.
+        # BOTH indexes, off the loop. main added the Entity index here after this
+        # branch was written, and it is the more expensive of the two — the
+        # slowlog measured a comparable CREATE INDEX on this graph at 102s.
+        # Building it inline would freeze the service exactly as the edge index
+        # did, so the resolution runs the pair in the worker thread rather than
+        # keeping one off the loop and putting a heavier one back on it.
+        def _init_vector_index():
+            db = get_falkor_db()
+            _ensure_edge_vector_index(db.select_graph(graph_name), graph_name)
+            ensure_node_vector_index(
+                db.select_graph(graph_name), graph_name, int(settings.embedding_dim)
+            )
 
-        db = get_falkor_db()
-        _ensure_edge_vector_index(db.select_graph(graph_name), graph_name)
-        ensure_node_vector_index(
-            db.select_graph(graph_name), graph_name, int(settings.embedding_dim)
-        )
+        await asyncio.to_thread(_init_vector_index)
     except Exception as e:
         logger.warning(f"[graphiti] vector index init skipped for {graph_name}: {e}")
 
