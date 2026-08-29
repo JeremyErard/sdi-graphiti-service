@@ -82,7 +82,10 @@ async def ensure_node_vector_index_via(executor: Any, group_key: str, dim: int) 
         )
         logger.info(f"[graphiti] created Entity.name_embedding vector index ({group_key})")
     except Exception as e:  # noqa: BLE001 - "already exists" is the common case
-        logger.debug(f"[graphiti] node vector index ensure ({group_key}): {e}")
+        # INFO, not DEBUG. At DEBUG this was invisible in production, so
+        # "did the index get built?" could not be answered from the logs --
+        # and that question was load-bearing while diagnosing the outage.
+        logger.info(f"[graphiti] node vector index not created ({group_key}): {e}")
 
 
 class IndexedFalkorSearchOperations(FalkorSearchOperations):
