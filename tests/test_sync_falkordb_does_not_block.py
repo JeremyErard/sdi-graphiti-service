@@ -163,3 +163,46 @@ def test_the_search_path_does_not_freeze_the_event_loop(monkeypatch):
 
     ticks = asyncio.run(scenario())
     assert ticks >= 5, f"event loop was starved during the search read (ticks={ticks})"
+
+
+def test_the_graph_visualisation_endpoint_does_not_freeze_the_loop(monkeypatch):
+    """/graph/nodes-and-edges must not stop the world either.
+
+    Not hypothetical. On 2026-08-29 a single operator call to this endpoint —
+    made to check whether the graph contained anything — froze the service and
+    destroyed a 28-minute ingestion in progress. It was reading through the
+    synchronous handle inline.
+
+    "Bounded by the 120s socket timeout, so not urgent" was the wrong call: 120
+    seconds of frozen loop is long enough to kill a long-running extraction, and
+    any client or operator request can trigger it.
+
+    The handler is awaited DIRECTLY on the test's own loop. Driving it through
+    TestClient would prove nothing — TestClient runs the app on a loop of its
+    own, so a blocking handler would not starve this one.
+    """
+    from app.routers import graph as graph_router
+
+    monkeypatch.setattr(graph_router.graphiti_client, "get_falkor_db", lambda: _SlowDb(0.4))
+
+    async def scenario() -> int:
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            req = graph_router.GraphDataRequest(client_slug="pokagon", max_nodes=10)
+            await graph_router.get_graph_data(req)
+        except Exception:
+            pass  # the fake graph returns no usable rows; only scheduling matters here
+        finally:
+            beat.cancel()
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    assert ticks >= 5, f"event loop was starved by the graph endpoint (ticks={ticks})"

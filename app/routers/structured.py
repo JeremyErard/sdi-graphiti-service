@@ -6,6 +6,7 @@ source anchor Graphiti can truthfully preserve. Graphiti records those anchors;
 it never claims that the referenced row exists in a tenant database.
 """
 
+import asyncio
 import logging
 import re
 import uuid as uuidlib
@@ -246,19 +247,26 @@ async def _write_structured(
     try:
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
 
+        # Every read/write below goes through the SYNCHRONOUS FalkorDB handle.
+        # Run inline they stop the event loop for their whole duration, so this
+        # write path could freeze the entire service — /health included.
+        # Demonstrated 2026-08-29 via /graph/nodes-and-edges: one such call froze
+        # the service and destroyed a 28-minute ingestion in progress.
+        # asyncio.to_thread keeps the ORDER (each is awaited in turn) while
+        # taking the wait off the loop.
         db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
 
         now_iso = start.isoformat()
         if anchored and isinstance(req, StructuredIngestV2Request):
-            episode_collision = graph.query(
+            episode_collision = await asyncio.to_thread(graph.query, 
                 """
                 MATCH (ep:Episodic {uuid: $episode_uuid, group_id: $group_id})
                 RETURN ep.uuid LIMIT 1
                 """,
                 params={"episode_uuid": episode_uuid, "group_id": graph_name},
             )
-            fact_collision = graph.query(
+            fact_collision = await asyncio.to_thread(graph.query, 
                 """
                 MATCH ()-[edge:RELATES_TO]->()
                 WHERE edge.uuid IN $fact_ids AND edge.group_id = $group_id
@@ -274,7 +282,7 @@ async def _write_structured(
                     status_code=409,
                     detail="Structured ingest identity conflict",
                 )
-            graph.query(
+            await asyncio.to_thread(graph.query, 
                 """
                 CREATE (ep:Episodic {
                     uuid: $uuid,
@@ -316,7 +324,7 @@ async def _write_structured(
                 },
             )
         else:
-            graph.query(
+            await asyncio.to_thread(graph.query, 
                 """
                 CREATE (ep:Episodic {
                     uuid: $uuid,
@@ -352,7 +360,7 @@ async def _write_structured(
             if not name_norm:
                 continue
 
-            match = graph.query(
+            match = await asyncio.to_thread(graph.query, 
                 """
                 MATCH (e:Entity {group_id: $group_id})
                 WHERE toLower(e.name) = $name_lower
@@ -371,7 +379,7 @@ async def _write_structured(
                 new_uuid = str(uuidlib.uuid4())
                 summary = (ent.description or "").strip()
                 label_value = ent.type.strip() if ent.type else "Entity"
-                graph.query(
+                await asyncio.to_thread(graph.query, 
                     """
                     CREATE (e:Entity {
                         uuid: $uuid,
@@ -394,7 +402,7 @@ async def _write_structured(
                 name_to_uuid[name_norm] = new_uuid
                 entities_created += 1
 
-            graph.query(
+            await asyncio.to_thread(graph.query, 
                 """
                 MATCH (ep:Episodic {uuid: $ep_uuid}), (e:Entity {uuid: $e_uuid})
                 CREATE (ep)-[:MENTIONS {created_at: $created_at}]->(e)
@@ -416,14 +424,14 @@ async def _write_structured(
             tgt_uuid = name_to_uuid.get(tgt_norm)
 
             if not src_uuid:
-                match = graph.query(
+                match = await asyncio.to_thread(graph.query, 
                     "MATCH (e:Entity {group_id: $g}) WHERE toLower(e.name) = $n RETURN e.uuid LIMIT 1",
                     params={"g": graph_name, "n": src_norm},
                 )
                 if match.result_set:
                     src_uuid = str(match.result_set[0][0])
             if not tgt_uuid:
-                match = graph.query(
+                match = await asyncio.to_thread(graph.query, 
                     "MATCH (e:Entity {group_id: $g}) WHERE toLower(e.name) = $n RETURN e.uuid LIMIT 1",
                     params={"g": graph_name, "n": tgt_norm},
                 )
@@ -441,7 +449,7 @@ async def _write_structured(
             )
             fact = rel.fact or rel.relation or ""
             if anchored and isinstance(req, StructuredIngestV2Request):
-                graph.query(
+                await asyncio.to_thread(graph.query, 
                     """
                     MATCH (s:Entity {uuid: $src}), (t:Entity {uuid: $tgt})
                     CREATE (s)-[r:RELATES_TO {
@@ -481,7 +489,7 @@ async def _write_structured(
                     },
                 )
             else:
-                graph.query(
+                await asyncio.to_thread(graph.query, 
                     """
                     MATCH (s:Entity {uuid: $src}), (t:Entity {uuid: $tgt})
                     CREATE (s)-[r:RELATES_TO {
@@ -516,7 +524,9 @@ async def _write_structured(
             expected_fact_ids = [str(rel.fact_id) for rel in req.relationships]
             if rels_skipped or written_fact_ids != expected_fact_ids:
                 raise RuntimeError("structured v2 staged fact set is incomplete")
-            verification_rows = graph.query(
+            # Parenthesised deliberately: `await f(...).attr` parses as
+            # `await (f(...).attr)`, which reads the attribute off the coroutine.
+            verification_rows = (await asyncio.to_thread(graph.query, 
                 """
                 MATCH ()-[edge:RELATES_TO]->()
                 WHERE edge.uuid IN $fact_ids AND edge.group_id = $group_id
@@ -528,7 +538,7 @@ async def _write_structured(
                     "fact_ids": expected_fact_ids,
                     "group_id": graph_name,
                 },
-            ).result_set
+            )).result_set
             verified_ids: list[str] = []
             for row in verification_rows:
                 if not isinstance(row, (list, tuple)) or len(row) < 8:
@@ -552,7 +562,7 @@ async def _write_structured(
             ):
                 raise RuntimeError("structured v2 staged fact verification failed")
 
-            finalized = graph.query(
+            finalized = await asyncio.to_thread(graph.query, 
                 """
                 MATCH (ep:Episodic {uuid: $episode_uuid, group_id: $group_id})
                 WHERE ep.provenance_write_state = $staging
