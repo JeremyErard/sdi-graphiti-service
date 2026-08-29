@@ -325,6 +325,9 @@ def reset_falkor_db() -> None:
 # FalkorDriver accepts an existing instance via falkor_db=, so we inject a
 # bounded one. The instance is shared across graphs on purpose — the driver
 # selects its own database per call.
+# Diagnostics must fail fast. See _log_slow_queries.
+SLOWLOG_TIMEOUT_SECONDS = 10
+
 _async_falkor_db: Any = None
 
 
@@ -384,33 +387,58 @@ async def _log_slow_queries(graph_name: str, top: int = 5) -> None:
     circumstantial evidence, and indexing it did not change the outcome.
     FalkorDB keeps a per-graph slow log; ask it instead of guessing.
 
-    Best-effort in every direction: this runs on an already-failing path and
-    must never replace the real error with one of its own.
+    Its OWN short-lived client with a SHORT timeout, deliberately. The first
+    version of this reused the shared handle, which carries a 900s socket
+    timeout -- so a diagnostic running on an already-failed FalkorDB call sat
+    waiting fifteen minutes on the very dependency that had just died, and the
+    task was torn down before it logged anything at all. A diagnostic that can
+    outlive the failure it is describing is not a diagnostic.
     """
     try:
-        def _read():
-            graph = get_falkor_db().select_graph(graph_name)
-            return graph.slowlog()
-
-        entries = await asyncio.to_thread(_read)
-    except Exception as exc:  # noqa: BLE001 - diagnostics must not mask the fault
-        logger.warning(f"[graphiti] slowlog unavailable for {graph_name}: {type(exc).__name__}")
+        raw = await asyncio.wait_for(
+            asyncio.to_thread(_read_slowlog, graph_name), timeout=SLOWLOG_TIMEOUT_SECONDS + 5
+        )
+    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        logger.warning(
+            f"[graphiti] slowlog unavailable for {graph_name}: {type(exc).__name__} "
+            f"(it must never wait as long as the call that failed)"
+        )
         return
 
-    if not entries:
+    if not raw:
         logger.warning(
             f"[graphiti] slowlog for {graph_name} is EMPTY -- the slow work is not a "
             f"single logged query (a server-side abort, or time spent outside Cypher)"
         )
         return
 
-    # Newest last in FalkorDB's slowlog; report the slowest few.
     try:
-        ranked = sorted(entries, key=lambda e: float(e[3]), reverse=True)[:top]
+        ranked = sorted(raw, key=lambda e: float(e[3]), reverse=True)[:top]
     except Exception:  # noqa: BLE001 - shape varies by version
-        ranked = list(entries)[-top:]
+        ranked = list(raw)[-top:]
     for e in ranked:
         logger.warning(f"[graphiti] SLOW {graph_name}: {str(e)[:400]}")
+
+
+def _read_slowlog(graph_name: str) -> list:
+    """One short-lived, short-timeout connection. Never the shared handle."""
+    import redis as _redis
+
+    r = _redis.Redis(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+        socket_connect_timeout=SLOWLOG_TIMEOUT_SECONDS,
+        socket_timeout=SLOWLOG_TIMEOUT_SECONDS,
+        decode_responses=True,
+    )
+    try:
+        return list(r.execute_command("GRAPH.SLOWLOG", graph_name) or [])
+    finally:
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def evict_client(client_slug: str) -> None:

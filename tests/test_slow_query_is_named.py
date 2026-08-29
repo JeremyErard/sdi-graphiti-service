@@ -8,6 +8,7 @@ what a guess looks like when it is wrong. FalkorDB keeps a per-graph slow log.
 
 import asyncio
 
+from app.config import settings
 from app.services import graphiti_client
 
 
@@ -31,7 +32,10 @@ class _DB:
 
 
 def _run(monkeypatch, graph):
-    monkeypatch.setattr(graphiti_client, "get_falkor_db", lambda: _DB(graph))
+    def _read(graph_name):
+        return graph.slowlog()
+
+    monkeypatch.setattr(graphiti_client, "_read_slowlog", _read)
     asyncio.run(graphiti_client._log_slow_queries("client_pokagon"))
 
 
@@ -66,4 +70,28 @@ def test_diagnostics_never_replace_the_real_error(monkeypatch, caplog):
     """This runs on an already-failing path. It must not raise."""
     with caplog.at_level("WARNING"):
         _run(monkeypatch, _Graph(raises=True))  # must not raise
+    assert any("slowlog unavailable" in r.message for r in caplog.records)
+
+
+def test_the_slowlog_read_never_waits_as_long_as_the_call_that_failed():
+    """It reads through its OWN short-timeout client, not the shared 900s one.
+
+    The first version reused the shared handle. On an already-failed FalkorDB
+    call that meant waiting another fifteen minutes on the dependency that had
+    just died, and the task was torn down before logging anything -- so the
+    diagnostic produced exactly nothing in the one case it existed for.
+    """
+    assert graphiti_client.SLOWLOG_TIMEOUT_SECONDS <= 30
+    assert graphiti_client.SLOWLOG_TIMEOUT_SECONDS < settings.falkordb_socket_timeout_seconds
+
+
+def test_a_hanging_slowlog_still_reports_rather_than_hanging(monkeypatch, caplog):
+    """If the slowlog read itself blocks, say so; never inherit the hang."""
+
+    def _hang(graph_name):
+        raise TimeoutError("Timeout reading from falkordb")
+
+    monkeypatch.setattr(graphiti_client, "_read_slowlog", _hang)
+    with caplog.at_level("WARNING"):
+        asyncio.run(graphiti_client._log_slow_queries("client_pokagon"))
     assert any("slowlog unavailable" in r.message for r in caplog.records)
