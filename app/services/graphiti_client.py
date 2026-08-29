@@ -327,20 +327,36 @@ def reset_falkor_db() -> None:
 _async_falkor_db: Any = None
 
 
-def get_async_falkor_db() -> Any:
-    """Return the shared ASYNC FalkorDB client, with finite timeouts."""
-    global _async_falkor_db
-    if _async_falkor_db is None:
-        from falkordb.asyncio import FalkorDB as _AsyncFalkorDB
+def new_async_falkor_db() -> Any:
+    """Build a NEW async FalkorDB client with finite timeouts.
 
-        _async_falkor_db = _AsyncFalkorDB(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-            socket_timeout=settings.falkordb_socket_timeout_seconds,
-            socket_connect_timeout=settings.falkordb_socket_timeout_seconds,
-        )
-    return _async_falkor_db
+    Deliberately not shared. The bounded timeout above is what turns "hangs
+    forever" into a raised TimeoutError, and it must stay — but a timeout is a
+    CANCELLED read, and redis-py asyncio leaves the un-read reply sitting in
+    that connection's buffer. The next borrower of that pooled connection reads
+    the previous command's reply, desyncs, and times out in turn. One timeout
+    therefore poisoned every subsequent query through the shared pool, which is
+    why a bare `MATCH (n) RETURN count(n)` could not complete against a server
+    that was idle, ~100 keys, 53MB, and logging no slow query at all — while
+    _probe_falkordb, which builds a FRESH client per call, answered in 1.5s.
+
+    A client per graph keeps the blast radius at one graph, and evict_client()
+    below discards even that one rather than inheriting it.
+    """
+    from falkordb.asyncio import FalkorDB as _AsyncFalkorDB
+
+    return _AsyncFalkorDB(
+        host=settings.falkordb_host,
+        port=settings.falkordb_port,
+        password=settings.falkordb_password or None,
+        socket_timeout=settings.falkordb_socket_timeout_seconds,
+        socket_connect_timeout=settings.falkordb_socket_timeout_seconds,
+    )
+
+
+def get_async_falkor_db() -> Any:
+    """Back-compat alias; each call returns a NEW bounded client."""
+    return new_async_falkor_db()
 
 
 def reset_async_falkor_db() -> None:
@@ -351,7 +367,25 @@ def reset_async_falkor_db() -> None:
 
 def _create_driver(graph_name: str) -> FalkorDriver:
     """Create a FalkorDB driver targeting a specific named graph."""
-    return FalkorDriver(falkor_db=get_async_falkor_db(), database=graph_name)
+    return FalkorDriver(falkor_db=new_async_falkor_db(), database=graph_name)
+
+
+async def evict_client(client_slug: str) -> None:
+    """Discard the cached Graphiti client (and its pool) for one graph.
+
+    Called when a query through it failed. Without this the cached client keeps
+    handing out the same desynced connections and every later episode fails the
+    same way, recoverable only by restarting the process — which is exactly the
+    shape the outage took.
+    """
+    graph_name = _graph_name_for_client(client_slug)
+    client = _clients.pop(graph_name, None)
+    if client is None:
+        return
+    try:
+        await client.close()
+    except Exception as exc:  # noqa: BLE001 - closing a broken pool may itself fail
+        logger.debug(f"[graphiti] evict_client close failed for {graph_name}: {exc}")
 
 
 async def get_client(client_slug: str) -> Graphiti:
@@ -493,14 +527,22 @@ async def add_episode(
 
     start = time.time()
 
-    result = await client.add_episode(
-        name=name,
-        episode_body=content,
-        source_description=source_description,
-        reference_time=reference_time,
-        source=GraphitiEpisodeType.text,
-        group_id=graph_name,
-    )
+    try:
+        result = await client.add_episode(
+            name=name,
+            episode_body=content,
+            source_description=source_description,
+            reference_time=reference_time,
+            source=GraphitiEpisodeType.text,
+            group_id=graph_name,
+        )
+    except BaseException:
+        # BaseException, not Exception: asyncio.CancelledError has been a
+        # BaseException since 3.8, and a cancelled read is the exact case that
+        # leaves the connection desynced. Catching only Exception would let the
+        # most important one through uncleaned.
+        await evict_client(client_slug)
+        raise
 
     elapsed_ms = (time.time() - start) * 1000
     logger.info(
