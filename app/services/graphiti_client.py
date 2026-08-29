@@ -376,6 +376,43 @@ def _create_driver(graph_name: str) -> FalkorDriver:
     return IndexedFalkorDriver(falkor_db=new_async_falkor_db(), database=graph_name)
 
 
+async def _log_slow_queries(graph_name: str, top: int = 5) -> None:
+    """Report WHICH query was slow, rather than inferring it from timings.
+
+    Two days were spent reasoning about which Cypher statement was responsible
+    from failure DURATIONS alone -- entity dedup was the leading candidate, on
+    circumstantial evidence, and indexing it did not change the outcome.
+    FalkorDB keeps a per-graph slow log; ask it instead of guessing.
+
+    Best-effort in every direction: this runs on an already-failing path and
+    must never replace the real error with one of its own.
+    """
+    try:
+        def _read():
+            graph = get_falkor_db().select_graph(graph_name)
+            return graph.slowlog()
+
+        entries = await asyncio.to_thread(_read)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not mask the fault
+        logger.warning(f"[graphiti] slowlog unavailable for {graph_name}: {type(exc).__name__}")
+        return
+
+    if not entries:
+        logger.warning(
+            f"[graphiti] slowlog for {graph_name} is EMPTY -- the slow work is not a "
+            f"single logged query (a server-side abort, or time spent outside Cypher)"
+        )
+        return
+
+    # Newest last in FalkorDB's slowlog; report the slowest few.
+    try:
+        ranked = sorted(entries, key=lambda e: float(e[3]), reverse=True)[:top]
+    except Exception:  # noqa: BLE001 - shape varies by version
+        ranked = list(entries)[-top:]
+    for e in ranked:
+        logger.warning(f"[graphiti] SLOW {graph_name}: {str(e)[:400]}")
+
+
 async def evict_client(client_slug: str) -> None:
     """Discard the cached Graphiti client (and its pool) for one graph.
 
@@ -550,6 +587,7 @@ async def add_episode(
         # BaseException since 3.8, and a cancelled read is the exact case that
         # leaves the connection desynced. Catching only Exception would let the
         # most important one through uncleaned.
+        await _log_slow_queries(graph_name)
         await evict_client(client_slug)
         raise
 
