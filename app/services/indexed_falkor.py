@@ -30,6 +30,7 @@ from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.falkordb.operations.search_ops import FalkorSearchOperations
+from graphiti_core.driver.search_interface.search_interface import SearchInterface
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.driver.record_parsers import entity_edge_from_record, entity_node_from_record
 from graphiti_core.models.nodes.node_db_queries import get_entity_node_return_query
@@ -242,5 +243,85 @@ class IndexedFalkorDriver(FalkorDriver):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._search_ops = IndexedFalkorSearchOperations()
+        # Without this line every override in this module is dead code.
+        self.search_interface = SearchOpsInterface()
 
 
+
+
+# ---------------------------------------------------------------------------
+# Wiring. This is the part that was missing.
+#
+# graphiti's search_utils functions dispatch like this:
+#
+#     if driver.search_interface:
+#         return await driver.search_interface.edge_fulltext_search(...)
+#     ...inline query...
+#
+# They NEVER consult driver.search_ops -- `search_ops` appears zero times in
+# search_utils.py. Overriding search_ops (which is what the node index and the
+# bounded fulltext query above originally did) therefore changed nothing at all:
+# both were correct implementations wired to a seam nothing calls, and the
+# slowlog kept reporting the same unbounded 588s query after they shipped.
+#
+# Patching the module functions instead does not work either: callers do
+# `from ...search_utils import node_similarity_search` and call it bare, so a
+# module-attribute patch never reaches their already-bound reference.
+#
+# search_interface is the seam that is actually consulted, so the shim lives
+# here and delegates straight back to search_ops -- which keeps the real
+# implementations, and their tests, in one place.
+# ---------------------------------------------------------------------------
+
+# Every SearchInterface method takes `driver` first; every search_ops method
+# takes an `executor` first, and the driver IS one (it has execute_query). So
+# delegation is positional pass-through.
+_DELEGATED_WITH_DRIVER = (
+    "community_fulltext_search",
+    "community_similarity_search",
+    "edge_bfs_search",
+    "edge_fulltext_search",
+    "edge_similarity_search",
+    "episode_fulltext_search",
+    "episode_mentions_reranker",
+    "node_bfs_search",
+    "node_distance_reranker",
+    "node_fulltext_search",
+    "node_similarity_search",
+)
+_DELEGATED_PLAIN = ("build_edge_search_filters", "build_node_search_filters")
+
+
+class SearchOpsInterface(SearchInterface):
+    """Routes graphiti's search calls to this driver's search_ops.
+
+    get_embeddings_for_communities is deliberately NOT implemented: graphiti
+    calls it inside `try/except NotImplementedError` and falls back to its own
+    query, so inheriting the base's raise is the correct behaviour. The other
+    thirteen have no such guard and must all be present, or search breaks
+    wholesale the moment search_interface is set.
+    """
+
+    model_config = {"arbitrary_types_allowed": True}
+
+
+def _delegate_with_driver(name: str):
+    async def _method(self, driver: Any, *args: Any, **kwargs: Any):
+        return await getattr(driver.search_ops, name)(driver, *args, **kwargs)
+
+    _method.__name__ = name
+    return _method
+
+
+def _delegate_plain(name: str):
+    def _method(self, *args: Any, **kwargs: Any):
+        raise NotImplementedError(name)
+
+    _method.__name__ = name
+    return _method
+
+
+for _n in _DELEGATED_WITH_DRIVER:
+    setattr(SearchOpsInterface, _n, _delegate_with_driver(_n))
+for _n in _DELEGATED_PLAIN:
+    setattr(SearchOpsInterface, _n, _delegate_plain(_n))
