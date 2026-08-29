@@ -123,3 +123,43 @@ def test_the_provenance_write_does_not_freeze_the_event_loop(monkeypatch):
     assert ticks >= 5, f"event loop was starved during the sync write (ticks={ticks})"
 
 
+
+
+def test_the_search_path_does_not_freeze_the_event_loop(monkeypatch):
+    """Search, not just ingest, must stay off the loop.
+
+    The second freeze on 2026-08-28 happened with NO ingestion running at all.
+    The kg-health cron calls /search/context periodically, which goes through
+    _search_fast and the same synchronous handle. One slow read there stops the
+    whole service, including the health check that would have reported it.
+    """
+    slow = _SlowDb(0.4)
+    monkeypatch.setattr(graphiti_client, "get_falkor_db", lambda: slow)
+    monkeypatch.setattr(graphiti_client, "_ensure_edge_vector_index", lambda *_a, **_k: None)
+    monkeypatch.setattr(graphiti_client, "_row_to_edge", lambda row: row)
+    monkeypatch.setattr(graphiti_client, "_lucene_sanitize", lambda q: "")
+
+    class _Embedder:
+        async def create(self, input_data):
+            return [0.0] * 8
+
+    monkeypatch.setattr(graphiti_client, "_create_embedder", lambda: _Embedder())
+
+    async def scenario() -> int:
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            await graphiti_client._search_fast("pokagon", "monthly close", 5)
+        finally:
+            beat.cancel()
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    assert ticks >= 5, f"event loop was starved during the search read (ticks={ticks})"

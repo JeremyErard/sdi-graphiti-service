@@ -96,6 +96,21 @@ def _graph_read(graph: Any, query: str, params: dict[str, Any] | None = None) ->
     return graph.query(query, params)
 
 
+async def _graph_read_async(graph: Any, query: str, params: dict[str, Any] | None = None) -> Any:
+    """Run a synchronous graph read WITHOUT charging its duration to the loop.
+
+    The FalkorDB handle is synchronous, so calling it inline on an async path
+    stops every other request for as long as the query takes. On 2026-08-28 that
+    left this service unable to answer its own /health for over twenty minutes —
+    and the second time it happened there was no ingestion running at all, only
+    the periodic health probe going through the search path.
+
+    The socket timeout bounds how long one call can take; this keeps that time
+    from being taken out of everyone else's.
+    """
+    return await asyncio.to_thread(_graph_read, graph, query, params)
+
+
 def _parse_dt(v: Any) -> datetime | None:
     """Best-effort parse of a stored temporal value to datetime, else None.
 
@@ -596,7 +611,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         else db.select_graph(graph_name)
     )
     if not settings.graphiti_acceptance_probe_mode:
-        _ensure_edge_vector_index(graph, graph_name)
+        await asyncio.to_thread(_ensure_edge_vector_index, graph, graph_name)
 
     embedder = _create_embedder()
     if embedder is None:
@@ -621,7 +636,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         return order
 
     # Cosine via HNSW (k inlined int; vector passed as the proven vecf32($param)).
-    vres = _graph_read(
+    vres = await _graph_read_async(
         graph,
         f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
         f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
@@ -635,7 +650,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     safe_q = _lucene_sanitize(query)
     if safe_q:
         try:
-            bres = _graph_read(
+            bres = await _graph_read_async(
                 graph,
                 f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
                 f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN} LIMIT {pool}",
