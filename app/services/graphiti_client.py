@@ -306,14 +306,52 @@ def reset_falkor_db() -> None:
     _falkor_db = None
 
 
+# The ASYNC FalkorDB client graphiti-core writes through.
+#
+# graphiti-core builds its own as FalkorDB(host, port, username, password) — and
+# falkordb.asyncio.FalkorDB defaults socket_timeout and socket_connect_timeout
+# to None. No timeout at all. A query that never comes back therefore hangs the
+# coroutine FOREVER: no exception, no completion, no cancellation.
+#
+# That is why ingestion never finished. Every episode attempted on 2026-08-28/29
+# ended as "no outcome recorded within 3600s; the task died without reporting" —
+# not slow, not failing, simply never returning. Each ceiling raised during the
+# day only changed when the hang was noticed, never prevented it.
+#
+# The synchronous handle was given a timeout in #23, but that is a DIFFERENT
+# client; the driver performing the actual ingest writes still had none.
+#
+# FalkorDriver accepts an existing instance via falkor_db=, so we inject a
+# bounded one. The instance is shared across graphs on purpose — the driver
+# selects its own database per call.
+_async_falkor_db: Any = None
+
+
+def get_async_falkor_db() -> Any:
+    """Return the shared ASYNC FalkorDB client, with finite timeouts."""
+    global _async_falkor_db
+    if _async_falkor_db is None:
+        from falkordb.asyncio import FalkorDB as _AsyncFalkorDB
+
+        _async_falkor_db = _AsyncFalkorDB(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+            socket_timeout=settings.falkordb_socket_timeout_seconds,
+            socket_connect_timeout=settings.falkordb_socket_timeout_seconds,
+        )
+    return _async_falkor_db
+
+
+def reset_async_falkor_db() -> None:
+    """Drop the shared async client so the next call reconnects (tests)."""
+    global _async_falkor_db
+    _async_falkor_db = None
+
+
 def _create_driver(graph_name: str) -> FalkorDriver:
     """Create a FalkorDB driver targeting a specific named graph."""
-    return FalkorDriver(
-        host=settings.falkordb_host,
-        port=settings.falkordb_port,
-        password=settings.falkordb_password or None,
-        database=graph_name,
-    )
+    return FalkorDriver(falkor_db=get_async_falkor_db(), database=graph_name)
 
 
 async def get_client(client_slug: str) -> Graphiti:
