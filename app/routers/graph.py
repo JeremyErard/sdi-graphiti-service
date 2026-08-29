@@ -1,5 +1,6 @@
 """Graph traversal endpoints for Knowledge Map visualization."""
 
+import asyncio
 import logging
 from typing import Any
 
@@ -53,6 +54,12 @@ async def get_graph_data(req: GraphDataRequest):
     try:
         db = graphiti_client.get_falkor_db()
         graph = db.select_graph(graph_name)
+        # These reads go through the SYNCHRONOUS FalkorDB handle, so running them
+        # inline stops the event loop for their whole duration — the service
+        # answers nothing, including /health. Demonstrated on 2026-08-29: a
+        # single call to this endpoint froze the service and destroyed a
+        # 28-minute ingestion that was in progress.
+        read = lambda q: asyncio.to_thread(graph.query, q)
 
         # Query entity and community nodes (skip episodes — too heavy for viz).
         # The exact-ID projection label space is excluded as well. This query is
@@ -61,7 +68,7 @@ async def get_graph_data(req: GraphDataRequest):
         # the moment the projection lane is used, and the ledger nodes would be
         # rendered alongside them. Only declared retained states may feed
         # retrieval, and no retrieval surface consumes projection rows yet.
-        node_result = graph.query(
+        node_result = await read(
             f"MATCH (n) WHERE NOT n:Episodic "
             f"AND NOT n:{PROJECTION_NODE_LABEL} AND NOT n:{PROJECTION_RECEIPT_LABEL} "
             f"RETURN n LIMIT {req.max_nodes}"
@@ -264,7 +271,7 @@ async def get_graph_data(req: GraphDataRequest):
                 ))
 
         # Query edges — only between non-episode nodes, return minimal data
-        edge_result = graph.query(
+        edge_result = await read(
             "MATCH (a)-[r]->(b) "
             "WHERE NOT a:Episodic AND NOT b:Episodic "
             f"AND NOT a:{PROJECTION_NODE_LABEL} AND NOT b:{PROJECTION_NODE_LABEL} "
