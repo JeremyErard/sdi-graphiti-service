@@ -39,7 +39,13 @@ def test_the_async_driver_client_has_finite_timeouts(monkeypatch):
 
 
 def test_the_driver_is_built_with_that_client_not_its_own(monkeypatch):
-    """FalkorDriver creates an UNBOUNDED client unless one is injected."""
+    """The driver creates an UNBOUNDED client unless one is injected.
+
+    Patches IndexedFalkorDriver, which is what _create_driver builds now — see
+    app/services/indexed_falkor.py. The invariant is unchanged: the bounded
+    client must be injected and host/port must NOT be passed, or the driver
+    builds its own untimed one.
+    """
     sentinel = object()
     seen: dict = {}
 
@@ -47,7 +53,7 @@ def test_the_driver_is_built_with_that_client_not_its_own(monkeypatch):
         def __init__(self, **kwargs):
             seen.update(kwargs)
 
-    monkeypatch.setattr(graphiti_client, "FalkorDriver", _CapturingDriver)
+    monkeypatch.setattr(graphiti_client, "IndexedFalkorDriver", _CapturingDriver)
     monkeypatch.setattr(graphiti_client, "new_async_falkor_db", lambda: sentinel)
 
     graphiti_client._create_driver("client_pokagon")
