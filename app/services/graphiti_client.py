@@ -417,7 +417,17 @@ async def _log_slow_queries(graph_name: str, top: int = 5) -> None:
     except Exception:  # noqa: BLE001 - shape varies by version
         ranked = list(raw)[-top:]
     for e in ranked:
-        logger.warning(f"[graphiti] SLOW {graph_name}: {str(e)[:400]}")
+        # Duration FIRST. Logging the raw entry put the query text ahead of the
+        # duration and then truncated -- so the SLOWEST entry, the one with the
+        # longest query, was the one whose timing got cut off. The field that
+        # ranks the list must survive truncation.
+        try:
+            ms = float(e[3])
+            query = " ".join(str(e[2]).split())
+        except Exception:  # noqa: BLE001 - shape varies by version
+            logger.warning(f"[graphiti] SLOW {graph_name}: {str(e)[:400]}")
+            continue
+        logger.warning(f"[graphiti] SLOW {graph_name}: {ms / 1000:.1f}s :: {query[:300]}")
 
 
 def _read_slowlog(graph_name: str) -> list:

@@ -95,3 +95,18 @@ def test_a_hanging_slowlog_still_reports_rather_than_hanging(monkeypatch, caplog
     with caplog.at_level("WARNING"):
         asyncio.run(graphiti_client._log_slow_queries("client_pokagon"))
     assert any("slowlog unavailable" in r.message for r in caplog.records)
+
+
+def test_the_duration_survives_truncation(monkeypatch, caplog):
+    """The slowest entry has the longest query, so logging the raw tuple
+    truncated away the very timing that ranked it."""
+    long_q = "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) " + ("X" * 900)
+
+    def _read(graph_name):
+        return [["1", "GRAPH.QUERY", long_q, "412000.0"]]
+
+    monkeypatch.setattr(graphiti_client, "_read_slowlog", _read)
+    with caplog.at_level("WARNING"):
+        asyncio.run(graphiti_client._log_slow_queries("client_pokagon"))
+    line = [r.message for r in caplog.records if "SLOW" in r.message][0]
+    assert "412.0s" in line, "the duration must appear before the query text"
