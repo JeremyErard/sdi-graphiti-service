@@ -31,8 +31,10 @@ from typing import Any
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.falkordb.operations.search_ops import FalkorSearchOperations
 from graphiti_core.driver.falkordb_driver import FalkorDriver
-from graphiti_core.driver.record_parsers import entity_node_from_record
+from graphiti_core.driver.record_parsers import entity_edge_from_record, entity_node_from_record
 from graphiti_core.models.nodes.node_db_queries import get_entity_node_return_query
+from graphiti_core.edges import EntityEdge
+from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.nodes import EntityNode
 
 logger = logging.getLogger("graphiti_service")
@@ -88,7 +90,91 @@ async def ensure_node_vector_index_via(executor: Any, group_key: str, dim: int) 
         logger.info(f"[graphiti] node vector index not created ({group_key}): {e}")
 
 
-class IndexedFalkorSearchOperations(FalkorSearchOperations):
+# How many extra fulltext hits to pull before filtering. The bound is applied
+# before the join, but group_id / uuid filters are applied after it, so a bare
+# top-`limit` could come back short. Over-fetching preserves recall while still
+# keeping the join bounded.
+FULLTEXT_OVERFETCH = 10
+
+
+class _BoundedFulltextMixin:
+    async def edge_fulltext_search(
+        self,
+        executor: Any,
+        query: str,
+        search_filter: Any,
+        group_ids: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[EntityEdge]:
+        """Bound the fulltext procedure BEFORE the join, as every other provider does.
+
+        Measured on client_pokagon: this query took 576.3s while
+        db.idx.vector.queryRelationships on the SAME relationship type took
+        0.4s. Same graph, same data, 1400x apart -- and the only structural
+        difference is where the bound is applied.
+
+        graphiti's get_relationships_query() accepts a `limit` and then drops it
+        on FalkorDB alone:
+
+            FALKORDB: CALL db.idx.fulltext.queryRelationships('{label}', $query)
+            KUZU:     CALL QUERY_FTS_INDEX(..., TOP := $limit)
+            NEO4J:    CALL db.index.fulltext.queryRelationships(..., {limit: $limit})
+
+        So on FalkorDB the procedure yields EVERY matching relationship, and the
+        generated Cypher then runs
+        `MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)` per hit,
+        applying LIMIT only at the very end -- after the expensive part.
+
+        FalkorDB's procedure takes no limit argument, so the bound goes in the
+        Cypher immediately after YIELD instead. Semantics match the other
+        providers: take the top scores, then join.
+        """
+        from graphiti_core.driver.driver import GraphProvider  # noqa: PLC0415
+        from graphiti_core.driver.falkordb.operations.search_ops import (  # noqa: PLC0415
+            _build_falkor_fulltext_query,
+        )
+        from graphiti_core.search.search_filters import (  # noqa: PLC0415
+            edge_search_filter_query_constructor,
+        )
+
+        fuzzy_query = _build_falkor_fulltext_query(query, group_ids)
+        if fuzzy_query == "":
+            return []
+
+        filter_queries, filter_params = edge_search_filter_query_constructor(
+            search_filter, GraphProvider.FALKORDB
+        )
+        if group_ids is not None:
+            filter_queries.append("e.group_id IN $group_ids")
+            filter_params["group_ids"] = group_ids
+        filter_query = (" WHERE " + " AND ".join(filter_queries)) if filter_queries else ""
+
+        prefilter = max(int(limit) * FULLTEXT_OVERFETCH, int(limit))
+        cypher = (
+            "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
+            "YIELD relationship AS rel, score "
+            f"WITH rel, score ORDER BY score DESC LIMIT {prefilter} "
+            "MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)"
+            + filter_query
+            + " WITH e, score, n, m RETURN "
+            + get_entity_edge_return_query(GraphProvider.FALKORDB)
+            + " ORDER BY score DESC LIMIT $limit"
+        )
+
+        try:
+            records, _, _ = await executor.execute_query(
+                cypher, query=fuzzy_query, limit=limit, **filter_params
+            )
+        except Exception as e:  # noqa: BLE001 - never lose a search to this
+            logger.info(f"[graphiti] bounded fulltext edge search unavailable: {e}")
+            return await super().edge_fulltext_search(
+                executor, query, search_filter, group_ids, limit
+            )
+
+        return [entity_edge_from_record(r) for r in records]
+
+
+class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperations):
     """FalkorSearchOperations, but entity dedup goes through the vector index."""
 
     async def node_similarity_search(
@@ -156,3 +242,5 @@ class IndexedFalkorDriver(FalkorDriver):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._search_ops = IndexedFalkorSearchOperations()
+
+
