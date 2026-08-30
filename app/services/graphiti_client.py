@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 import yaml
+from pydantic import BaseModel
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType as GraphitiEpisodeType
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -213,6 +214,55 @@ def _load_entity_types() -> list[dict[str, str]]:
     except Exception as e:
         logger.warning(f"Failed to load entity types from config.yaml: {e}")
         return []
+
+
+# Built once. The YAML is read from disk and turned into model classes, and
+# doing that per episode would re-read and re-build 16 classes on every ingest.
+_entity_type_models: dict[str, type[BaseModel]] | None = None
+
+
+def entity_type_models() -> dict[str, type[BaseModel]]:
+    """The domain taxonomy, as the model classes graphiti's extractor wants.
+
+    config.yaml has said "These define what Graphiti extracts from episodes"
+    since it was written, and they did not: `_load_entity_types` had ZERO
+    callers and `add_episode` was never given an `entity_types` argument, so
+    all 16 types were inert and extraction ran untyped.
+
+    graphiti-core takes `dict[str, type[BaseModel]]` and uses each class's
+    docstring as the description shown to the extraction model, so the YAML
+    description becomes the docstring rather than a field.
+
+    Fail-soft: a malformed or missing taxonomy returns {} and extraction falls
+    back to untyped, which is exactly today's behaviour. A broken config file
+    must not stop ingestion.
+    """
+    global _entity_type_models
+    if _entity_type_models is not None:
+        return _entity_type_models
+
+    models: dict[str, type[BaseModel]] = {}
+    for entry in _load_entity_types():
+        name = (entry or {}).get("name")
+        if not name or not isinstance(name, str):
+            continue
+        description = (entry or {}).get("description") or name
+        # type() rather than a literal class per entry: the taxonomy is data,
+        # and hand-writing 16 near-identical classes would put it in two places.
+        models[name] = type(name, (BaseModel,), {"__doc__": description})
+
+    _entity_type_models = models
+    if models:
+        logger.info(f"[graphiti] entity taxonomy active: {len(models)} types")
+    else:
+        logger.warning("[graphiti] entity taxonomy EMPTY — extraction will be untyped")
+    return models
+
+
+def reset_entity_type_models() -> None:
+    """Drop the cached taxonomy so the next call re-reads config.yaml (tests)."""
+    global _entity_type_models
+    _entity_type_models = None
 
 
 def _create_llm_client() -> AnthropicClient:
@@ -720,6 +770,9 @@ async def add_episode(
             reference_time=reference_time,
             source=GraphitiEpisodeType.text,
             group_id=graph_name,
+            # The taxonomy config.yaml always claimed to define. Without this
+            # argument all 16 types were decoration.
+            entity_types=entity_type_models() or None,
         )
     except BaseException:
         # BaseException, not Exception: asyncio.CancelledError has been a
