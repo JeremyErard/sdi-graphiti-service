@@ -1,6 +1,7 @@
 """SDI Graphiti Service — Temporal Knowledge Graph API for Engage Platform."""
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -36,6 +37,9 @@ async def lifespan(app: FastAPI):
         f"[graphiti] Starting service — FalkorDB at "
         f"{settings.falkordb_host}:{settings.falkordb_port}"
     )
+    # Fire-and-forget: the census is observability, not a startup dependency.
+    asyncio.create_task(graphiti_client.log_graph_census())
+
     yield
     logger.info("[graphiti] Shutting down — closing graph connections")
     await graphiti_client.close_all()
