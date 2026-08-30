@@ -110,3 +110,24 @@ def test_the_duration_survives_truncation(monkeypatch, caplog):
         asyncio.run(graphiti_client._log_slow_queries("client_pokagon"))
     line = [r.message for r in caplog.records if "SLOW" in r.message][0]
     assert "412.0s" in line, "the duration must appear before the query text"
+
+
+def test_a_SUCCESSFUL_ingest_reports_its_slow_queries_too(monkeypatch, caplog):
+    """Reporting only on failure left the fix unproven while it looked proven.
+
+    The bounded fulltext query went live in the same minutes a wedged FalkorDB
+    was restarted. The two episodes that then succeeded took 758s and 1555s --
+    long enough to still contain the 588s unbounded query. With no measurement
+    on the success path there was nothing to separate "the bound works" from
+    "the restart cleared a stuck server".
+    """
+    import inspect
+
+    from app.services import graphiti_client as gc
+
+    src = inspect.getsource(gc.add_episode)
+    after_success = src.split("Episode added to")[1]
+    assert "_log_slow_queries" in after_success, (
+        "a successful ingest must report its timings; failure-only reporting "
+        "cannot tell a working fix from a lucky restart"
+    )
