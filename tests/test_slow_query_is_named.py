@@ -131,3 +131,23 @@ def test_a_SUCCESSFUL_ingest_reports_its_slow_queries_too(monkeypatch, caplog):
         "a successful ingest must report its timings; failure-only reporting "
         "cannot tell a working fix from a lucky restart"
     )
+
+
+def test_the_memory_probe_fails_fast_like_the_slowlog(monkeypatch, caplog):
+    """Sizing decisions need the real number, and the probe must never hang.
+
+    FalkorDB was scaled from 1c-2g to 2c-8g on 2026-08-29 on an inferred memory
+    hypothesis that turned out to be wrong -- the cost was algorithmic, not
+    resource. Nothing reported actual usage: /health says only "connected" and
+    /ready collapses the probe to a boolean. This closes that gap.
+    """
+    from app.services import graphiti_client as gc
+
+    def _boom():
+        raise TimeoutError("Timeout reading from falkordb")
+
+    monkeypatch.setattr(gc, "_log_memory_usage", gc._log_memory_usage)
+    monkeypatch.setattr(gc.asyncio, "to_thread", lambda fn: (_ for _ in ()).throw(TimeoutError("x")))
+    with caplog.at_level("WARNING"):
+        asyncio.run(gc._log_memory_usage())
+    assert any("memory probe unavailable" in r.message for r in caplog.records)
