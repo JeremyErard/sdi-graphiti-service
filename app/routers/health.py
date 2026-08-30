@@ -96,6 +96,20 @@ async def _probe_falkordb() -> dict:
         # healthy — surface None rather than a green low_headroom=False (B5).
         headroom_pct = None
         low = None
+    # Logged, not returned. The readiness RESPONSE stays a boolean per check --
+    # widening it would leak capacity detail to an unauthenticated caller. But
+    # the numbers are already computed here and were being discarded, which is
+    # why "is this instance bigger than it needs to be?" could only be answered
+    # by inference. It was inferred once, wrongly, and the wrong answer is
+    # still being paid for monthly.
+    logger.info(
+        "[graphiti] falkordb memory used=%s peak=%s rss=%s maxmemory=%s frag=%s",
+        info.get("used_memory_human"),
+        info.get("used_memory_peak_human"),
+        info.get("used_memory_rss_human"),
+        info.get("maxmemory_human"),
+        info.get("mem_fragmentation_ratio"),
+    )
     return {
         "ok": True,
         "used_memory_human": info.get("used_memory_human", "unknown"),
