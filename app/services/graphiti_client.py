@@ -379,6 +379,46 @@ def _create_driver(graph_name: str) -> FalkorDriver:
     return IndexedFalkorDriver(falkor_db=new_async_falkor_db(), database=graph_name)
 
 
+async def log_graph_census() -> None:
+    """Enumerate every graph with its node/edge counts, once, at startup.
+
+    G9 ("knowledge census") is ratified but has never been run, and the last
+    count anyone recorded was 2026-06-15 (8 graphs pruned to 3). Nothing since
+    reports what graphs EXIST, so orphans -- which have appeared twice from
+    naming drift, `client_test` and a phantom `client_tribal_gaming` built from
+    an industry string used as a slug -- are invisible until someone looks.
+
+    Read-only and best-effort: a census must never keep the service from
+    starting. Runs once per boot rather than per request, because counts scan.
+    """
+    try:
+        def _census() -> list[tuple[str, int, int]]:
+            db = get_falkor_db()
+            rows: list[tuple[str, int, int]] = []
+            for name in sorted(db.list_graphs() or []):
+                g = db.select_graph(name)
+                nodes = g.query("MATCH (n) RETURN count(n)").result_set[0][0]
+                edges = g.query("MATCH ()-[r]->() RETURN count(r)").result_set[0][0]
+                rows.append((name, int(nodes), int(edges)))
+            return rows
+
+        rows = await asyncio.wait_for(asyncio.to_thread(_census), timeout=120)
+    except Exception as exc:  # noqa: BLE001 - never block startup on a census
+        logger.warning(f"[graphiti] CENSUS unavailable: {type(exc).__name__}")
+        return
+
+    if not rows:
+        logger.warning("[graphiti] CENSUS: no graphs found")
+        return
+    for name, nodes, edges in rows:
+        # "empty" is the interesting state: a graph that exists but holds
+        # nothing is either freshly provisioned or an orphan, and the two are
+        # indistinguishable without this line.
+        state = "EMPTY" if nodes == 0 and edges == 0 else "populated"
+        logger.warning(f"[graphiti] CENSUS {name}: nodes={nodes} edges={edges} {state}")
+    logger.warning(f"[graphiti] CENSUS total_graphs={len(rows)}")
+
+
 async def _log_memory_usage() -> None:
     """Report what FalkorDB is actually using, versus what it is allowed.
 
