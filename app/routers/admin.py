@@ -758,6 +758,13 @@ async def graph_stats(req: GraphStatsRequest):
             await graphiti_client._log_slow_queries(
                 graphiti_client._graph_name_for_client(req.client_slug)
             )
+            # Actual memory in use, which no surface reports today. /health says
+            # only "connected" and /ready collapses the probe to a boolean, so
+            # the sizing question -- is this instance bigger than it needs to
+            # be? -- could only be answered by guessing from an RDB file size.
+            # It was guessed once already, and the guess cost a plan upgrade
+            # that fixed nothing.
+            await graphiti_client._log_memory_usage()
 
         db = graphiti_client.get_falkor_db()
         listed_graphs = db.list_graphs()

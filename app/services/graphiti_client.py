@@ -379,6 +379,49 @@ def _create_driver(graph_name: str) -> FalkorDriver:
     return IndexedFalkorDriver(falkor_db=new_async_falkor_db(), database=graph_name)
 
 
+async def _log_memory_usage() -> None:
+    """Report what FalkorDB is actually using, versus what it is allowed.
+
+    Its own short-timeout client, for the same reason the slow log has one: a
+    diagnostic must never wait as long as the thing it is describing.
+    """
+    def _read() -> dict:
+        import redis as _redis
+
+        r = _redis.Redis(
+            host=settings.falkordb_host,
+            port=settings.falkordb_port,
+            password=settings.falkordb_password or None,
+            socket_connect_timeout=SLOWLOG_TIMEOUT_SECONDS,
+            socket_timeout=SLOWLOG_TIMEOUT_SECONDS,
+            decode_responses=True,
+        )
+        try:
+            return dict(r.info("memory"))
+        finally:
+            try:
+                r.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_read), timeout=SLOWLOG_TIMEOUT_SECONDS + 5
+        )
+    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        logger.warning(f"[graphiti] memory probe unavailable: {type(exc).__name__}")
+        return
+
+    logger.warning(
+        "[graphiti] MEMORY used=%s peak=%s rss=%s maxmemory=%s frag=%s",
+        info.get("used_memory_human"),
+        info.get("used_memory_peak_human"),
+        info.get("used_memory_rss_human"),
+        info.get("maxmemory_human"),
+        info.get("mem_fragmentation_ratio"),
+    )
+
+
 async def _log_slow_queries(graph_name: str, top: int = 5) -> None:
     """Report WHICH query was slow, rather than inferring it from timings.
 
