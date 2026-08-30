@@ -653,6 +653,19 @@ async def add_episode(
         f"in {elapsed_ms:.0f}ms: {name}"
     )
 
+    # Report the slow log on SUCCESS too, not only on failure.
+    #
+    # Reporting only on failure left the most important question unanswerable.
+    # The bounded fulltext query (#35/#36) went live in the same minutes that a
+    # wedged FalkorDB was restarted, and the two episodes that then succeeded
+    # took 758s and 1555s -- long enough to still contain the 588s unbounded
+    # query. With no slow log on the success path there was no measurement to
+    # separate "the bound works" from "the restart cleared a stuck server", and
+    # the fix stayed unproven while looking proven.
+    #
+    # An ingest that SUCCEEDS is exactly when the timings are worth having.
+    await _log_slow_queries(graph_name)
+
     # AddEpisodeResults has .episode, .nodes, .edges attributes
     entities_extracted = len(result.nodes) if hasattr(result, "nodes") else 0
     facts_created = len(result.edges) if hasattr(result, "edges") else 0
