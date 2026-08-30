@@ -743,6 +743,21 @@ async def graph_stats(req: GraphStatsRequest):
     returns no fact text, names, descriptions, or source content.
     """
     try:
+        # Report the per-graph slow log alongside the counts.
+        #
+        # The slow log is cumulative, so it already holds the timings of runs
+        # that have since finished — but nothing READ it except the failure
+        # path, and after the fulltext bound shipped nothing failed. That left
+        # the most consequential question unanswerable from a healthy system:
+        # the bounded query and a FalkorDB restart went live in the same
+        # minutes, and both predict the successes that followed. This route is
+        # already read-only, already authenticated, and already about graph
+        # observability, so the timings belong here rather than behind a
+        # deliberate failure.
+        if req.client_slug:
+            await graphiti_client._log_slow_queries(
+                graphiti_client._graph_name_for_client(req.client_slug)
+            )
 
         db = graphiti_client.get_falkor_db()
         listed_graphs = db.list_graphs()
