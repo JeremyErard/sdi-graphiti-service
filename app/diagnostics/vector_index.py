@@ -22,7 +22,14 @@ one bounded probe query whose failure is caught and reported. Nothing is
 created, altered or deleted.
 
     render jobs create <graphiti-serviceId> --confirm \
-      --start-command "python scripts/check_vector_indexes.py"
+      --start-command "python -m app.diagnostics.vector_index"
+
+It lives under app/ and NOT under scripts/ for one reason: the Dockerfile copies
+`config.yaml` and `app/` only. Everything in scripts/ is written to run on a
+laptop against the HTTP API (see kg_export.py's usage line) and is not present
+in the image, so a diagnostic that must run INSIDE the service cannot live
+there. The first version of this did, and the job failed with
+"can't open file '/app/scripts/check_vector_indexes.py'".
 """
 from __future__ import annotations
 

@@ -19,7 +19,7 @@ signature was valid. These tests pin the reasoning about a real server's reply,
 not a substitute for asking it.
 """
 
-from scripts.check_vector_indexes import classify_probe, summarize_indexes
+from app.diagnostics.vector_index import classify_probe, summarize_indexes
 
 
 class TestClassifyProbe:
