@@ -39,6 +39,10 @@ _DISALLOWED_CONTROL_PATTERN = (
     r"[\s\S]*[\x00-\x08\x0B\x0C\x0E-\x1F\x7F][\s\S]*"
 )
 _NONBLANK_TEXT_PATTERN = r"[\s\S]*\S[\s\S]*"
+# Applied through string.matchRegEx(text, pattern), never the =~ operator: the
+# first live include_provenance=true call (2026-09-10) failed with
+# "FalkorDB does not currently support =~". matchRegEx searches rather than
+# anchors, which these wrapped patterns tolerate.
 _OVERSIZED_TEMPORAL_SENTINEL = "invalid:oversized-temporal"
 _KIND_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,239}")
@@ -449,16 +453,14 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
         WHERE episode.group_id = $group_id
         RETURN episode.uuid,
                (episode.name IS NOT NULL
-                 AND episode.name =~ $nonblank_text_pattern
+                 size(string.matchRegEx(AND episode.name, $nonblank_text_pattern)) > 0
                  AND size(trim(episode.name)) <= 2000
-                 AND NOT (trim(episode.name)
-                   =~ $disallowed_control_pattern))
+                 size(string.matchRegEx(AND NOT (trim(episode.name), $disallowed_control_pattern)) > 0))
                  AS has_name,
                (episode.source_description IS NOT NULL
-                 AND episode.source_description =~ $nonblank_text_pattern
+                 size(string.matchRegEx(AND episode.source_description, $nonblank_text_pattern)) > 0
                  AND size(trim(episode.source_description)) <= 2000
-                 AND NOT (trim(episode.source_description)
-                   =~ $disallowed_control_pattern))
+                 size(string.matchRegEx(AND NOT (trim(episode.source_description), $disallowed_control_pattern)) > 0))
                  AS has_source_description,
                episode.source_type, episode.source_id, episode.engagement_id,
                episode.episode_type, episode.anchor_mode,
@@ -496,30 +498,26 @@ def provenance_stats_for_graph(graph: Any, graph_name: str) -> dict[str, Any]:
         RETURN edge.uuid, edge.episodes, subject.uuid,
                'Entity' IN labels(subject) AS subject_is_entity,
                (subject.name IS NOT NULL
-                 AND subject.name =~ $nonblank_text_pattern
+                 size(string.matchRegEx(AND subject.name, $nonblank_text_pattern)) > 0
                  AND size(trim(subject.name)) <= 2000
-                 AND NOT (trim(subject.name)
-                   =~ $disallowed_control_pattern))
+                 size(string.matchRegEx(AND NOT (trim(subject.name), $disallowed_control_pattern)) > 0))
                  AS has_subject_name,
                (edge.name IS NOT NULL
-                 AND edge.name =~ $nonblank_text_pattern
+                 size(string.matchRegEx(AND edge.name, $nonblank_text_pattern)) > 0
                  AND size(trim(edge.name)) <= 160
-                 AND NOT (trim(edge.name)
-                   =~ $disallowed_control_pattern))
+                 size(string.matchRegEx(AND NOT (trim(edge.name), $disallowed_control_pattern)) > 0))
                  AS has_predicate,
                object.uuid,
                'Entity' IN labels(object) AS object_is_entity,
                (object.name IS NOT NULL
-                 AND object.name =~ $nonblank_text_pattern
+                 size(string.matchRegEx(AND object.name, $nonblank_text_pattern)) > 0
                  AND size(trim(object.name)) <= 2000
-                 AND NOT (trim(object.name)
-                   =~ $disallowed_control_pattern))
+                 size(string.matchRegEx(AND NOT (trim(object.name), $disallowed_control_pattern)) > 0))
                  AS has_object_name,
                (edge.fact IS NOT NULL
-                 AND edge.fact =~ $nonblank_text_pattern
+                 size(string.matchRegEx(AND edge.fact, $nonblank_text_pattern)) > 0
                  AND size(trim(edge.fact)) <= 16000
-                 AND NOT (trim(edge.fact)
-                   =~ $disallowed_control_pattern))
+                 size(string.matchRegEx(AND NOT (trim(edge.fact), $disallowed_control_pattern)) > 0))
                  AS has_fact,
                CASE
                  WHEN edge.valid_at IS NULL OR toString(edge.valid_at) = ''
