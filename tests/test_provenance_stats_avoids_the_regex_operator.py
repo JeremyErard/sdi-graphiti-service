@@ -37,5 +37,8 @@ def test_the_stats_queries_use_matchRegEx_and_never_the_operator():
         assert params["nonblank_text_pattern"] == provenance_stats._NONBLANK_TEXT_PATTERN
         assert params["disallowed_control_pattern"] == provenance_stats._DISALLOWED_CONTROL_PATTERN
     episode_query = graph.queries[0][0]
-    assert "size(string.matchRegEx(episode.name, $nonblank_text_pattern)) > 0" in episode_query
+    assert "size(string.matchRegEx(trim(episode.name), $nonblank_text_pattern)) > 0" in episode_query
+    # The raw column is never projected: the guard the existing suite keeps.
+    for field in ("episode.name,", "episode.source_description,"):
+        assert field not in episode_query
     assert "size(string.matchRegEx(trim(episode.name), $disallowed_control_pattern)) > 0" in episode_query
