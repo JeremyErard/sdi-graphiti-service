@@ -814,6 +814,16 @@ async def graph_stats(req: GraphStatsRequest):
         raise HTTPException(status_code=409, detail=exc.code) from None
     except HTTPException:
         raise
-    except Exception as exc:  # pragma: no cover - connection-level failures
-        logger.error("graph-stats failed error_type=%s", type(exc).__name__)
+    except Exception as exc:
+        # The database's own message names the failing clause (a type mismatch,
+        # an unsupported function, a rejected pattern). It carries no fact text,
+        # so it belongs in the log; without it the only surface that can audit
+        # ingestion completeness reported "failed" and nothing else, and the
+        # cause could not be found from a healthy deployment. The wire detail
+        # stays generic.
+        logger.error(
+            "graph-stats failed error_type=%s detail=%s",
+            type(exc).__name__,
+            str(exc)[:500],
+        )
         raise HTTPException(status_code=502, detail="graph-stats failed")
