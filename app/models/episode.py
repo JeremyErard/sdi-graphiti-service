@@ -32,6 +32,12 @@ class EpisodeType(str, Enum):
     INSIGHT_GEMINI_PERSPECTIVE = "insight_gemini_perspective"
     INSIGHT_GPT_PERSPECTIVE = "insight_gpt_perspective"
     INSIGHT_RECONCILIATION = "insight_reconciliation"
+    # Phase 2 RACI 2026-09-10 — a RACI chart the client has fully approved, ingested
+    # together with the review thread (reviewer remarks, change requests, approvals)
+    # that shaped it. Until this type existed the graph had no path to learn what a
+    # department actually decided about who does what, so it kept returning the
+    # uncorrected SOP-era fact after the client had corrected it in review.
+    RACI_APPROVED = "raci_approved"
 
 
 class EpisodeAnchorMode(str, Enum):
