@@ -51,6 +51,14 @@ class SearchContextRequest(BaseModel):
             "probe deployment. Ordinary service processes reject true."
         ),
     )
+    # An offline measurement hook: a signed caller can ask for the shadow
+    # evaluation on this one request while the service stays in legacy mode
+    # for everyone else. It costs this request the overfetch search; it changes
+    # nothing for any other request and nothing at all in shadow or enforce.
+    provenance_preview: StrictBool = Field(
+        default=False,
+        description="Evaluate provenance for this request even when the service mode is legacy",
+    )
 
     @field_validator("readable_engagement_ids")
     @classmethod

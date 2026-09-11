@@ -32,6 +32,12 @@ class EpisodeType(str, Enum):
     INSIGHT_GEMINI_PERSPECTIVE = "insight_gemini_perspective"
     INSIGHT_GPT_PERSPECTIVE = "insight_gpt_perspective"
     INSIGHT_RECONCILIATION = "insight_reconciliation"
+    # The client record's own history, produced by the backend per workflow:
+    # who approved each map and SOP version and when (approval_history), and
+    # what reviewers wrote and how SDI disposed of it (review_commentary).
+    # Two types so client-facing generators can exclude commentary.
+    APPROVAL_HISTORY = "approval_history"
+    REVIEW_COMMENTARY = "review_commentary"
     # Phase 2 RACI 2026-09-10 — a RACI chart the client has fully approved, ingested
     # together with the review thread (reviewer remarks, change requests, approvals)
     # that shaped it. Until this type existed the graph had no path to learn what a
