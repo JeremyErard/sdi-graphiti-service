@@ -235,12 +235,18 @@ def _source_complete(source: StatsEpisode) -> bool:
         return False
     if anchor_mode == "engagement" and source_id != engagement_id:
         return False
+    if producer == LEGACY_EPISODE_CONTRACT_VERSION:
+        # The backend's contract for a legacy source: legacy anchor mode, and
+        # an engagement-typed source must name its own engagement. It does not
+        # ask a legacy episode for the v2 engagement anchor mode; requiring it
+        # here left 827 Pokagon facts unchainable by any repair.
+        if source_type == "engagement" and source_id != engagement_id:
+            return False
+        return anchor_mode == LEGACY_EPISODE_CONTRACT_VERSION
     if source_type == "engagement" and (
         anchor_mode != "engagement" or source_id != engagement_id
     ):
         return False
-    if producer == LEGACY_EPISODE_CONTRACT_VERSION:
-        return anchor_mode == LEGACY_EPISODE_CONTRACT_VERSION
     if (
         producer == STRUCTURED_PROVENANCE_CONTRACT_VERSION
         and write_state != "complete"

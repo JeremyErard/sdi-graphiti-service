@@ -686,3 +686,32 @@ def test_stats_row_sentinel_hard_fails_without_partial_aggregates(
 
     assert failure.value.code == code
     assert all("LIMIT 100001" in query for query, _ in graph.queries)
+
+
+def test_a_legacy_engagement_sourced_episode_is_complete_when_it_names_its_own_engagement():
+    """Mirrors the backend contract: a legacy source keeps the legacy anchor
+    mode; an engagement-typed one must name its own engagement. Requiring the
+    v2 engagement anchor mode of a legacy episode left 827 Pokagon facts
+    unchainable by any repair (2026-09-11)."""
+    legacy_engagement = provenance_stats.StatsEpisode(
+        uuid="70000000-0000-4000-8000-000000000099",
+        has_name=True,
+        has_source_description=True,
+        source_type="engagement",
+        source_id="engagement-123",
+        engagement_id="engagement-123",
+        episode_type="insight_opus_perspective",
+        anchor_mode="legacy_episode_v0",
+        producer_contract_version="legacy_episode_v0",
+        valid_at="2026-08-01T00:00:00+00:00",
+        provenance_write_state=None,
+    )
+    assert provenance_stats._source_complete(legacy_engagement) is True
+
+    foreign = provenance_stats.StatsEpisode(**{**legacy_engagement.__dict__, "source_id": "someone-else"})
+    assert provenance_stats._source_complete(foreign) is False
+
+    v2_engagement_still_needs_the_v2_anchor = provenance_stats.StatsEpisode(
+        **{**legacy_engagement.__dict__, "anchor_mode": "typed_source", "producer_contract_version": "engage_episode_v2"}
+    )
+    assert provenance_stats._source_complete(v2_engagement_still_needs_the_v2_anchor) is False

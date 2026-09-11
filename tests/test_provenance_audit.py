@@ -382,29 +382,21 @@ def test_cli_apply_exits_nonzero_when_ambiguity_remains(monkeypatch):
     assert provenance_audit.main(["pokagon", "--apply"]) == 2
 
 
-def test_real_apply_entrypoint_is_blocked_before_database_access(capsys):
-    called = False
-
-    def forbidden_db(**_kwargs):
-        nonlocal called
-        called = True
-
-    with pytest.raises(ApplyBlockedError) as failure:
-        run_provenance_audit(
-            "pokagon",
-            apply=True,
-            db_factory=forbidden_db,
-        )
-    assert str(failure.value) == APPLY_BLOCKED_CODE
-    assert called is False
-
-    assert provenance_audit.main(["pokagon", "--apply"]) == 2
+def test_real_apply_entrypoint_now_applies_and_the_cli_reports_it(monkeypatch, capsys):
+    graph = _Graph()
+    db = _DB(graph)
+    monkeypatch.setattr(
+        provenance_audit,
+        "run_provenance_audit",
+        lambda slug, *, apply=False: run_provenance_audit(slug, apply=apply, db_factory=lambda **_k: db),
+    )
+    assert provenance_audit.main(["pokagon", "--apply"]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output == {
-        "mode": "apply",
-        "counts": {},
-        "codes": {APPLY_BLOCKED_CODE: 1},
-    }
+    assert output["mode"] == "apply"
+    assert output["counts"]["apply_attempted"] == 2
+    assert output["counts"]["apply_succeeded"] == 2
+    assert output["counts"]["apply_conflicts"] == 0
+    assert any(" SET " in f" {query} " for query, _p in graph.calls)
 
 
 def test_cli_read_failure_emits_only_fixed_code(monkeypatch, capsys):

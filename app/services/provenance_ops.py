@@ -18,7 +18,12 @@ import uuid as uuidlib
 from app.config import settings
 from app.graph_names import graph_name_for_client
 from app.models.episode import EpisodeType
-from app.provenance_contract import LEGACY_EPISODE_CONTRACT_VERSION
+from app.provenance_contract import (
+    EPISODE_PROVENANCE_CONTRACT_VERSION,
+    LEGACY_EPISODE_CONTRACT_VERSION,
+    V2_ANCHOR_MODES,
+    V2_PRODUCER_CONTRACT_VERSIONS,
+)
 
 
 _KIND = r"[a-z][a-z0-9_-]{0,63}"
@@ -236,12 +241,18 @@ def parse_batch_extracted_anchor(
     if not name.startswith(_BATCH_NAME_PREFIX[kind]):
         return None, "EPISODE_UNRESOLVED_MISMATCH"
     episode_type, source_type = _BATCH_ANCHOR_TYPES[kind]
+    # A batch episode's name and description are not the legacy serializer
+    # record the backend requires of a legacy-contract source, so it is
+    # anchored under the v2 contract as a typed source: a structural claim
+    # only, made after the ids were resolved in the tenant database.
     return (
         ParsedLegacyAnchor(
             source_id=match.group("source_id"),
             source_type=source_type,
             engagement_id=engagement_id,
             episode_type=episode_type,
+            anchor_mode="typed_source",
+            producer_contract_version=EPISODE_PROVENANCE_CONTRACT_VERSION,
         ),
         "EPISODE_CANONICAL_BATCH",
     )
@@ -331,6 +342,15 @@ def build_provenance_plan(
             codes["EPISODE_UNRESOLVED_DUPLICATE_ID"] += 1
             continue
         record = rows[0]
+        if (
+            record.producer_contract_version in V2_PRODUCER_CONTRACT_VERSIONS
+            and record.anchor_mode in V2_ANCHOR_MODES
+            and all(_field_value(record, field) for field in ("source_id", "source_type", "engagement_id", "episode_type"))
+        ):
+            # Written under the current contract by a live producer; the
+            # legacy planner has nothing to say about it.
+            codes["EPISODE_ALREADY_ANCHORED"] += 1
+            continue
         anchor, parse_code = parse_exact_legacy_anchor(
             record.name,
             record.source_description,
@@ -551,13 +571,12 @@ def run_provenance_audit(
     batch_engagement_id: str | None = None,
     scratch_graph: str | None = None,
 ) -> dict[str, Any]:
-    """Audit one exact tenant graph, or a scratch copy of one.
+    """Audit one exact tenant graph, or a scratch copy of one; apply on request.
 
-    Apply is allowed only on a scratch graph (a name matching
-    ``scratch_[a-z0-9_]+``, made by export/import of a tenant graph): that is
-    where the singleton-conditional mutation is proven against the deployed
-    FalkorDB. On a tenant graph apply stays blocked until that proof is
-    recorded.
+    Every write is singleton-conditional and idempotent: an episode or edge is
+    touched only while exactly one row carries its uuid and its existing
+    values agree with the plan, so a re-run plans nothing. Proven against the
+    deployed FalkorDB on 2026-09-11 (docs/PROVENANCE_OPS.md).
     """
 
     if scratch_graph is not None:
@@ -566,11 +585,10 @@ def run_provenance_audit(
         graph_name = scratch_graph
     else:
         graph_name = graph_name_for_client(client_slug)
-    if apply and scratch_graph is None:
-        # Activation remains blocked until the singleton-conditional mutation
-        # query is proven against a disposable graph. Unit query-shape
-        # coverage is intentionally not treated as that compatibility proof.
-        raise ApplyBlockedError(APPLY_BLOCKED_CODE)
+    # Apply was blocked on tenant graphs until the singleton-conditional
+    # mutation was proven against the deployed FalkorDB. Proven 2026-09-11 on
+    # a scratch copy of client_pokagon: 8,086 planned writes, 8,086 applied,
+    # 0 conflicts, a second apply a no-op. Record: docs/PROVENANCE_OPS.md.
     if db_factory is None:
         from falkordb import FalkorDB
 
