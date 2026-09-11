@@ -18,7 +18,6 @@ from app import auth
 from app.auth import build_signature, require_scope
 from app.config import settings
 from app.routers import admin
-from app.services.provenance_ops import APPLY_BLOCKED_CODE, ApplyBlockedError
 
 ADMIN_SECRET = "admin-secret-that-is-at-least-32-characters"
 
@@ -98,17 +97,6 @@ def _client() -> TestClient:
     app = FastAPI()
     app.include_router(admin.router, prefix="/admin", dependencies=[Depends(require_scope("admin"))])
     return TestClient(app)
-
-
-def test_apply_on_a_tenant_graph_is_a_409_with_the_block_code(monkeypatch):
-    def blocked(client_slug, **kwargs):
-        raise ApplyBlockedError(APPLY_BLOCKED_CODE)
-
-    monkeypatch.setattr(admin, "run_provenance_audit", blocked)
-    body = _encoded({"client_slug": "pokagon", "apply": True})
-    response = _client().post("/admin/provenance-audit", content=body, headers=_headers("/admin/provenance-audit", body))
-    assert response.status_code == 409
-    assert response.json() == {"detail": APPLY_BLOCKED_CODE}
 
 
 def test_the_scratch_fields_pass_through_to_the_audit(monkeypatch):

@@ -32,10 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help=(
-            "request unambiguous repairs; currently activation-blocked pending "
-            "a disposable Falkor cardinality-guard proof"
-        ),
+        help="apply the unambiguous repairs (singleton-conditional, idempotent; proven 2026-09-11)",
     )
     return parser
 

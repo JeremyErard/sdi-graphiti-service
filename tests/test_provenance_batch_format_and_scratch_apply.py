@@ -12,9 +12,7 @@ deployed FalkorDB; tenant graphs stay locked until that proof is recorded.
 import pytest
 
 from app.services.provenance_ops import (
-    APPLY_BLOCKED_CODE,
     AUDIT_GRAPH_NOT_FOUND_CODE,
-    ApplyBlockedError,
     EdgeRecord,
     EpisodeRecord,
     ProvenanceAuditReadError,
@@ -35,6 +33,8 @@ def test_the_three_batch_kinds_anchor_to_what_the_tenant_database_holds():
     sop, code = parse_batch_extracted_anchor("SOP: C&E - Table Inventory Audit v2", "Approved artifact (batch-extracted): sop:cmsop123", ENGAGEMENT)
     assert code == "EPISODE_CANONICAL_BATCH"
     assert (sop.episode_type, sop.source_type, sop.source_id, sop.engagement_id) == ("sop_approved", "sop", "cmsop123", ENGAGEMENT)
+    # Not the legacy serializer record, so anchored as a v2 typed source.
+    assert (sop.anchor_mode, sop.producer_contract_version) == ("typed_source", "engage_episode_v2")
 
     map_anchor, _ = parse_batch_extracted_anchor("Map: C&E Game Protection Inspection v4", "Approved artifact (batch-extracted): map:cmpv456", ENGAGEMENT)
     assert (map_anchor.episode_type, map_anchor.source_type, map_anchor.source_id) == ("process_map_approved", "process_version", "cmpv456")
@@ -122,13 +122,27 @@ class _DB:
         return self.graph
 
 
-def test_apply_on_a_tenant_graph_stays_blocked_before_any_read():
+def test_apply_on_a_tenant_graph_runs_the_same_guarded_mutations():
     graph = _Graph()
     db = _DB(graph, ["client_pokagon"])
-    with pytest.raises(ApplyBlockedError) as caught:
-        run_provenance_audit("pokagon", apply=True, db_factory=lambda **_k: db)
-    assert str(caught.value) == APPLY_BLOCKED_CODE
-    assert graph.reads == [] and graph.writes == []
+    result = run_provenance_audit("pokagon", apply=True, db_factory=lambda **_k: db, batch_engagement_id=ENGAGEMENT)
+    assert db.selected == "client_pokagon"
+    assert result["mode"] == "apply"
+    assert result["counts"]["apply_succeeded"] == 2 and result["counts"]["apply_conflicts"] == 0
+    assert all(params["group_id"] == "client_pokagon" for _q, params in graph.reads + graph.writes)
+    assert all("cardinality = 1" in query for query, _p in graph.writes)
+
+
+def test_an_episode_already_under_the_v2_contract_is_left_alone_not_called_a_conflict():
+    modern = EpisodeRecord(
+        uuid=EPISODE_ID, name="raci_approved: raci/v3", source_description="Engagement e — raci_approved from raci",
+        source_id="v3", source_type="raci", engagement_id="e", episode_type="raci_approved",
+        anchor_mode="typed_source", producer_contract_version="engage_episode_v2",
+    )
+    plan = build_provenance_plan([modern], [_edge()])
+    assert plan.codes.get("EPISODE_ALREADY_ANCHORED") == 1
+    assert "EPISODE_UNRESOLVED_ANCHOR_CONFLICT" not in plan.codes
+    assert plan.episode_updates == ()
 
 
 def test_apply_on_a_scratch_copy_runs_the_guarded_mutations_and_reports_them():
