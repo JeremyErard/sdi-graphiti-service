@@ -20,8 +20,11 @@ logger = logging.getLogger("graphiti_service")
 router = APIRouter()
 
 
-async def _perform_ingest(req: IngestEpisodeRequest) -> dict:
+async def _perform_ingest(req: IngestEpisodeRequest, *, graph_name: str | None = None) -> dict:
     """Run the extraction and return the response payload as a plain dict.
+
+    `graph_name` is the admin rehearsal override (a scratch graph); the
+    tenant routes never pass it.
 
     Shared by the synchronous and asynchronous routes so the two cannot drift.
     Raises on failure; each route decides how to report that.
@@ -63,9 +66,10 @@ async def _perform_ingest(req: IngestEpisodeRequest) -> dict:
         episode_type=req.episode_type.value,
         anchor_mode=anchor_mode,
         producer_contract_version=producer_contract_version,
+        graph_name_override=graph_name,
     )
 
-    graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+    graph_name = graph_name or graphiti_client._graph_name_for_client(req.client_slug)
 
     logger.info(
         f"[graphiti] Ingested episode for {req.client_slug}: "
