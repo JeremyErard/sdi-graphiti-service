@@ -1519,3 +1519,77 @@ def test_episode_reference_character_limit_precedes_utf8_encoding():
     assert graphiti_client._episode_uuid_list(
         _HugeString("x" * 100_001)
     ) == ((), False)
+
+
+# ---------------------------------------------------------------------------
+# Read scope (ruled 2026-09-11): every record keeps the phase it was created
+# in; the client record is the union of a client's phases; a phase reads the
+# client record by default and can narrow to itself. The backend lists the
+# readable engagements; without a list the behaviour is the old one.
+# ---------------------------------------------------------------------------
+
+PRIOR_PHASE = "engagement-phase1"
+
+
+def _prior_phase_edge():
+    return _edge(FACT_IDS[0], sources=(_source(engagement_id=PRIOR_PHASE),))
+
+
+def test_client_scope_admits_a_prior_phase_source_and_keeps_its_engagement_on_the_wire(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _prior_phase_edge()})
+    body = {**_request(), "readable_engagement_ids": [PRIOR_PHASE]}
+    response = _client().post("/search/context", json=body)
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["facts"]) == 1
+    assert payload["facts"][0]["sources"][0]["engagement_id"] == PRIOR_PHASE
+    summary = payload["provenance_summary"]
+    assert summary["service_forwarded"] == 1
+    assert summary["cross_engagement_suppressed"] == 0
+
+
+def test_engagement_scope_narrows_to_the_requesting_phase_even_when_others_are_listed(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _prior_phase_edge()})
+    body = {**_request(), "engagement_scope": "engagement", "readable_engagement_ids": [PRIOR_PHASE]}
+    payload = _client().post("/search/context", json=body).json()
+    assert payload["facts"] == []
+    assert payload["provenance_summary"]["cross_engagement_suppressed"] == 1
+
+
+def test_without_a_readable_list_the_old_behaviour_holds(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _prior_phase_edge()})
+    payload = _client().post("/search/context", json=_request()).json()
+    assert payload["facts"] == []
+    assert payload["provenance_summary"]["cross_engagement_suppressed"] == 1
+
+
+def test_an_engagement_not_listed_stays_suppressed_in_client_scope(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _prior_phase_edge()})
+    body = {**_request(), "readable_engagement_ids": ["engagement-someone-else"]}
+    payload = _client().post("/search/context", json=body).json()
+    assert payload["facts"] == []
+    assert payload["provenance_summary"]["cross_engagement_suppressed"] == 1
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"engagement_scope": "tenant"},
+        {"readable_engagement_ids": ["not valid!"]},
+        {"readable_engagement_ids": [f"e{i}" for i in range(51)]},
+        {"readable_engagement_ids": "engagement-phase1"},
+    ],
+)
+def test_malformed_scope_requests_are_rejected_before_graph_access(monkeypatch, override):
+    calls = _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _prior_phase_edge()})
+    response = _client().post("/search/context", json={**_request(), **override})
+    assert response.status_code == 422
+    assert "search" not in calls
+
+
+def test_the_requesting_phase_is_always_readable_in_client_scope(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _edge(FACT_IDS[0])})
+    body = {**_request(), "readable_engagement_ids": [PRIOR_PHASE]}
+    payload = _client().post("/search/context", json=body).json()
+    assert len(payload["facts"]) == 1
+    assert payload["facts"][0]["sources"][0]["engagement_id"] == "engagement-123"

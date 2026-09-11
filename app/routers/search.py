@@ -177,6 +177,7 @@ async def _evaluate_provenance(
         resolved_by_id = {}
         malformed_response_events = 1
 
+    admitted_engagements = req.admitted_engagement_ids()
     facts: list[FactResult] = []
     seen_fact_ids: set[str] = set()
     malformed_item_suppressed = 0
@@ -216,10 +217,13 @@ async def _evaluate_provenance(
             pre_chain_suppressed += 1
             continue
 
+        # Sources from any engagement the request may read: the client record
+        # by default, the requesting phase alone on request. Each forwarded
+        # source keeps the engagement it was created in.
         same_engagement_sources = [
             source
             for source in complete_sources
-            if source.engagement_id == req.engagement_id
+            if source.engagement_id in admitted_engagements
         ]
         if not same_engagement_sources:
             cross_engagement_suppressed += 1
