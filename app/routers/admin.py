@@ -5,10 +5,14 @@ import time
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import settings
 from app.services import graphiti_client
+from app.services.provenance_ops import (
+    ProvenanceAuditReadError,
+    run_provenance_audit,
+)
 from app.services.provenance_stats import (
     ProvenanceStatsReadError,
     provenance_stats_for_graph,
@@ -827,3 +831,41 @@ async def graph_stats(req: GraphStatsRequest):
             str(exc)[:500],
         )
         raise HTTPException(status_code=502, detail="graph-stats failed")
+
+
+class ProvenanceAuditRequest(BaseModel):
+    """One exact tenant. No apply flag exists on the wire, by design."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_slug: str = Field(..., pattern=r"^[a-z0-9-]+$")
+
+
+@router.post("/provenance-audit")
+async def provenance_audit(req: ProvenanceAuditRequest):
+    """Metadata-only audit of one tenant graph's pre-contract provenance.
+
+    The first live graph-stats run (2026-09-11) found 7,244 of the Pokagon
+    graph's 7,757 facts "pre_chain": written before the provenance contract,
+    resolving to no typed source. The planner in provenance_ops can say, from
+    episode names and descriptions alone, how many of those can be anchored
+    deterministically and how many cannot, by code, but it had no surface: it
+    was reachable only as a CLI inside the container. This exposes the audit
+    and nothing more. It never mutates: the wire accepts no apply flag, and the
+    module refuses apply until its cardinality guard is proven on a disposable
+    instance. The response carries bounded counts and stable codes, never
+    graph values.
+    """
+    try:
+        return run_provenance_audit(req.client_slug)
+    except ProvenanceAuditReadError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "provenance-audit failed error_type=%s detail=%s",
+            type(exc).__name__,
+            str(exc)[:500],
+        )
+        raise HTTPException(status_code=502, detail="provenance-audit failed")
