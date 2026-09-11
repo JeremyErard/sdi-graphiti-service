@@ -1631,3 +1631,25 @@ def test_the_requesting_phase_is_always_readable_in_client_scope(monkeypatch):
     payload = _client().post("/search/context", json=body).json()
     assert len(payload["facts"]) == 1
     assert payload["facts"][0]["sources"][0]["engagement_id"] == "engagement-123"
+
+
+def test_provenance_preview_evaluates_one_request_while_the_service_stays_legacy(monkeypatch):
+    monkeypatch.setattr(search_router.settings, "graphiti_provenance_mode", "legacy")
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _edge(FACT_IDS[0])})
+    plain = _client().post("/search/context", json=_request()).json()
+    assert "provenance_shadow" not in plain
+    assert "provenance_summary" not in plain
+    previewed = _client().post("/search/context", json={**_request(), "provenance_preview": True}).json()
+    assert previewed["facts"] == plain["facts"]
+    assert previewed["provenance_shadow"]["enforcement_applied"] is False
+    assert previewed["provenance_shadow"]["provenance_summary"]["service_forwarded"] == 1
+    assert previewed["provenance_shadow"]["facts"][0]["fact_id"] == FACT_IDS[0]
+
+
+def test_provenance_preview_changes_nothing_under_enforce(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _edge(FACT_IDS[0])})
+    enforced = _client().post("/search/context", json=_request()).json()
+    previewed = _client().post("/search/context", json={**_request(), "provenance_preview": True}).json()
+    assert previewed == enforced
+    assert "provenance_shadow" not in previewed
+

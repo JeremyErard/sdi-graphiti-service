@@ -355,6 +355,8 @@ async def search_context(req: SearchContextRequest):
     try:
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
         mode = settings.graphiti_provenance_mode
+        if req.provenance_preview and mode == "legacy":
+            mode = "shadow"
         if mode in {"legacy", "shadow"}:
             legacy_edges, legacy_path = await graphiti_client.search_with_path(
                 client_slug=req.client_slug,
