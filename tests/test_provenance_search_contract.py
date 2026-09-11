@@ -1563,6 +1563,44 @@ def test_without_a_readable_list_the_old_behaviour_holds(monkeypatch):
     assert payload["provenance_summary"]["cross_engagement_suppressed"] == 1
 
 
+def _mixed_phase_edge():
+    """One fact derived from the requesting phase and from a prior phase."""
+    return _edge(
+        FACT_IDS[0],
+        sources=(
+            _source(),
+            _source(
+                episode_uuid="60000000-0000-4000-8000-000000000002",
+                episode_name="document_analysis: document/doc-457",
+                source_id="doc-457",
+                engagement_id=PRIOR_PHASE,
+            ),
+        ),
+    )
+
+
+def test_a_fact_co_derived_from_an_unadmitted_phase_is_suppressed_whole_not_trimmed(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _mixed_phase_edge()})
+    body = {**_request(), "engagement_scope": "engagement"}
+    payload = _client().post("/search/context", json=body).json()
+    # Trimming the prior-phase source and forwarding the rest would hide the
+    # derivation from the backend; the whole claim is suppressed instead.
+    assert payload["facts"] == []
+    assert payload["provenance_summary"]["cross_engagement_suppressed"] == 1
+    assert payload["provenance_summary"]["service_forwarded"] == 0
+
+
+def test_a_fact_co_derived_from_two_admitted_phases_is_forwarded_with_every_source(monkeypatch):
+    _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _mixed_phase_edge()})
+    body = {**_request(), "readable_engagement_ids": [PRIOR_PHASE]}
+    payload = _client().post("/search/context", json=body).json()
+    assert len(payload["facts"]) == 1
+    assert sorted(source["engagement_id"] for source in payload["facts"][0]["sources"]) == sorted(
+        ["engagement-123", PRIOR_PHASE]
+    )
+    assert payload["provenance_summary"]["cross_engagement_suppressed"] == 0
+
+
 def test_an_engagement_not_listed_stays_suppressed_in_client_scope(monkeypatch):
     _patch_search(monkeypatch, raw_edges=[_raw(FACT_IDS[0])], resolved={FACT_IDS[0]: _prior_phase_edge()})
     body = {**_request(), "readable_engagement_ids": ["engagement-someone-else"]}
