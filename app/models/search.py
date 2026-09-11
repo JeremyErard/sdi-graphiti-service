@@ -4,7 +4,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, StrictBool
+import re
+
+from pydantic import BaseModel, Field, StrictBool, field_validator
 
 from app.provenance_contract import (
     PROVENANCE_SUMMARY_CONTRACT_VERSION,
@@ -13,11 +15,28 @@ from app.provenance_contract import (
 )
 
 
+_ENGAGEMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,239}")
+
+
 class SearchContextRequest(BaseModel):
     client_slug: str = Field(..., description="Client identifier for graph isolation")
     engagement_id: str = Field(..., description="Engagement identifier")
     query: str = Field(..., description="Natural language search query")
     max_results: int = Field(default=10, ge=1, le=50)
+    # Ruled 2026-09-11: every record keeps the phase (engagement) it was created
+    # in, and the client record is the union of a client's phases. A phase reads
+    # the client record by default and can narrow to itself. The backend, which
+    # knows the client's engagements, lists the readable ones; the requesting
+    # engagement is always readable. With no list the behaviour is the old one.
+    engagement_scope: Literal["client", "engagement"] = Field(
+        default="client",
+        description="'client' admits sources from any readable engagement; 'engagement' only the requesting one",
+    )
+    readable_engagement_ids: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="The client's other engagements whose sources this request may draw on (client scope only)",
+    )
     include_segment: bool = Field(
         default=False,
         description=(
@@ -32,6 +51,20 @@ class SearchContextRequest(BaseModel):
             "probe deployment. Ordinary service processes reject true."
         ),
     )
+
+    @field_validator("readable_engagement_ids")
+    @classmethod
+    def _readable_ids_are_identifiers(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if not isinstance(item, str) or not _ENGAGEMENT_ID_PATTERN.fullmatch(item):
+                raise ValueError("readable_engagement_ids must be engagement identifiers")
+        return value
+
+    def admitted_engagement_ids(self) -> frozenset[str]:
+        """The engagements whose complete sources this request may forward."""
+        if self.engagement_scope == "engagement":
+            return frozenset({self.engagement_id})
+        return frozenset({self.engagement_id, *self.readable_engagement_ids})
 
 
 class ChainStatus(str, Enum):
