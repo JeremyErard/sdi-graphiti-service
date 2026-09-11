@@ -39,6 +39,25 @@ engagement; the 6 report ids are `InsightReport` rows under it.
 Runner: `scratchpad/kg-proof.ts` in the operator's session (signed admin calls
 only; no graph values leave the service except as counts).
 
+## The production apply (2026-09-11)
+
+Service commit de2a956 (apply unlocked on tenant graphs). Same batch
+engagement as the proof. The audit was run dry against `client_pokagon`
+first and read identically to the scratch rehearsal, then applied.
+
+| step | result |
+|---|---|
+| audit (dry run) | 329 anchors planned, 7,757 endpoint updates, 2,716 episode-list updates; 0 conflicts |
+| apply | 8,086 attempted, 8,086 succeeded, 0 conflicts |
+| audit again | 0 planned; everything already anchored, repaired, normalized |
+| apply again | 0 attempted |
+| graph-stats after | chained 7,757 of 7,757 facts (was 513); pre_chain 0 |
+
+The graph now chains every fact to an episode the backend contract can
+anchor. What remains outside the graph is not a repair problem but an
+ingestion one: the Phase 1 approval and feedback record in the tenant
+database has not been produced as episodes yet.
+
 ## Operating notes
 
 - Run the audit (dry) first and read the codes; `EPISODE_UNRESOLVED_*`
