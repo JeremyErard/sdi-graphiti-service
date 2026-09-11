@@ -602,6 +602,33 @@ async def evict_client(client_slug: str) -> None:
         logger.debug(f"[graphiti] evict_client close failed for {graph_name}: {exc}")
 
 
+async def get_client_for_graph(graph_name: str) -> Graphiti:
+    """Get or create a Graphiti client for an exact graph name.
+
+    Tenant graphs go through get_client (slug to name); this is for the
+    scratch graphs a rehearsal writes to, so the tenant graph is never the
+    target by accident.
+    """
+    if graph_name not in _clients:
+        logger.info(f"[graphiti] Initializing graph: {graph_name}")
+        driver = _create_driver(graph_name)
+        llm_client = _create_llm_client()
+        client = Graphiti(graph_driver=driver, llm_client=llm_client, embedder=_create_embedder())
+        _clients[graph_name] = client
+    return _clients[graph_name]
+
+
+async def evict_graph(graph_name: str) -> None:
+    """Drop a cached client by graph name; a broken pool must not be reused."""
+    client = _clients.pop(graph_name, None)
+    if client is None:
+        return
+    try:
+        await client.close()
+    except Exception as exc:  # noqa: BLE001 - closing a broken pool may itself fail
+        logger.debug(f"[graphiti] evict_graph close failed for {graph_name}: {exc}")
+
+
 async def get_client(client_slug: str) -> Graphiti:
     """Get or create a Graphiti client for a specific client graph.
 
@@ -735,8 +762,12 @@ async def add_episode(
     episode_type: str | None = None,
     anchor_mode: str | None = None,
     producer_contract_version: str | None = None,
+    graph_name_override: str | None = None,
 ) -> dict[str, Any]:
     """Add an episode to the client's knowledge graph.
+
+    `graph_name_override` (a scratch graph, admin rehearsals only) writes the
+    same episode to that graph instead of the tenant's; group_id follows it.
 
     Uses EpisodeType.text for all ingestion (plain text content).
     group_id is set to the graph name to prevent driver re-cloning.
@@ -757,8 +788,8 @@ async def add_episode(
     if anchor_mode is not None and anchor_mode not in STRUCTURALLY_ANCHORED_MODES:
         raise ValueError("episode anchor_mode is unsupported")
 
-    client = await get_client(client_slug)
-    graph_name = _graph_name_for_client(client_slug)
+    graph_name = graph_name_override or _graph_name_for_client(client_slug)
+    client = await get_client_for_graph(graph_name) if graph_name_override else await get_client(client_slug)
 
     start = time.time()
 
@@ -780,7 +811,7 @@ async def add_episode(
         # leaves the connection desynced. Catching only Exception would let the
         # most important one through uncleaned.
         await _log_slow_queries(graph_name)
-        await evict_client(client_slug)
+        await evict_graph(graph_name)
         raise
 
     elapsed_ms = (time.time() - start) * 1000

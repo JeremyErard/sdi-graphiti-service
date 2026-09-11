@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import settings
+from app.models.episode import IngestEpisodeRequest
+from app.routers import ingest as ingest_routes
 from app.services import graphiti_client
 from app.services.provenance_ops import (
     ApplyBlockedError,
@@ -888,3 +890,31 @@ async def provenance_audit(req: ProvenanceAuditRequest):
             str(exc)[:500],
         )
         raise HTTPException(status_code=502, detail="provenance-audit failed")
+
+
+class RehearseEpisodeRequest(IngestEpisodeRequest):
+    """The exact episode a producer would send to the tenant graph, written to a scratch graph instead."""
+
+    scratch_graph: str = Field(..., pattern=r"^scratch_[a-z0-9_]{1,60}$")
+
+
+@router.post("/rehearse-episode")
+async def rehearse_episode(req: RehearseEpisodeRequest):
+    """Ingest one episode into a scratch graph, synchronously.
+
+    Ruled 2026-09-11: a new producer is rehearsed on a scratch copy before the
+    tenant graph ever sees its records. The backend builds the same signed
+    parts it would queue and sends them here; the extraction, entity types
+    and provenance anchors are identical, only the target graph differs. The
+    scratch graph is read with graph-stats and export and removed with
+    delete-graph, all of which accept the scratch name.
+    """
+    episode = IngestEpisodeRequest(**req.model_dump(exclude={"scratch_graph"}))
+    try:
+        return await ingest_routes._perform_ingest(episode, graph_name=req.scratch_graph)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[graphiti] Rehearsal ingest failed for {req.scratch_graph}: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="Rehearsal ingest failed")
+
