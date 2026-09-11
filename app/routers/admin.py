@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.config import settings
 from app.services import graphiti_client
 from app.services.provenance_ops import (
+    ApplyBlockedError,
     ProvenanceAuditReadError,
     run_provenance_audit,
 )
@@ -53,6 +54,8 @@ class ResetGraphResponse(BaseModel):
 class DeleteGraphRequest(BaseModel):
     client_slug: str
     confirm: str  # must equal "I understand this wipes all data"
+    # Delete a scratch copy instead of the tenant graph; scratch names only.
+    scratch_graph: str | None = Field(default=None, pattern=r"^scratch_[a-z0-9_]{1,60}$")
 
 
 class DeleteGraphResponse(BaseModel):
@@ -117,7 +120,7 @@ async def delete_graph(req: DeleteGraphRequest):
     try:
         from app.services import graphiti_client as gc
 
-        graph_name = gc._graph_name_for_client(req.client_slug)
+        graph_name = req.scratch_graph or gc._graph_name_for_client(req.client_slug)
         # Evict cached Graphiti client so a new one won't reference a stale graph.
         if graph_name in gc._clients:
             try:
@@ -717,6 +720,8 @@ class GraphStatsResponse(BaseModel):
 class GraphStatsRequest(BaseModel):
     client_slug: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
     include_provenance: bool = False
+    # Read a scratch copy instead of the tenant graph (the apply proof).
+    scratch_graph: str | None = Field(default=None, pattern=r"^scratch_[a-z0-9_]{1,60}$")
 
     @model_validator(mode="after")
     def require_tenant_for_provenance(self):
@@ -776,7 +781,7 @@ async def graph_stats(req: GraphStatsRequest):
             raise RuntimeError("unsupported graph inventory response")
         available_graphs = frozenset(listed_graphs)
         if req.client_slug:
-            requested_name = graphiti_client._graph_name_for_client(req.client_slug)
+            requested_name = req.scratch_graph or graphiti_client._graph_name_for_client(req.client_slug)
             if requested_name not in available_graphs:
                 raise HTTPException(
                     status_code=404,
@@ -834,11 +839,18 @@ async def graph_stats(req: GraphStatsRequest):
 
 
 class ProvenanceAuditRequest(BaseModel):
-    """One exact tenant. No apply flag exists on the wire, by design."""
+    """One exact tenant, or a scratch copy of it for the apply proof."""
 
     model_config = ConfigDict(extra="forbid")
 
     client_slug: str = Field(..., pattern=r"^[a-z0-9-]+$")
+    # The 2026-04-24 batch extraction wrote no engagement; the operator
+    # supplies the one they verified against the tenant database.
+    batch_engagement_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$")
+    # A copy of the tenant graph made with export/import. Apply is allowed
+    # here and nowhere else until the proof is recorded.
+    scratch_graph: str | None = Field(default=None, pattern=r"^scratch_[a-z0-9_]{1,60}$")
+    apply: bool = False
 
 
 @router.post("/provenance-audit")
@@ -857,7 +869,14 @@ async def provenance_audit(req: ProvenanceAuditRequest):
     graph values.
     """
     try:
-        return run_provenance_audit(req.client_slug)
+        return run_provenance_audit(
+            req.client_slug,
+            apply=req.apply,
+            batch_engagement_id=req.batch_engagement_id,
+            scratch_graph=req.scratch_graph,
+        )
+    except ApplyBlockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except ProvenanceAuditReadError as exc:
         raise HTTPException(status_code=409, detail=exc.code) from None
     except HTTPException:

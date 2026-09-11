@@ -97,14 +97,14 @@ def test_the_audit_is_post_only_signed_and_scoped_to_one_tenant(monkeypatch):
     response = client.post("/admin/provenance-audit", content=body, headers=_headers(body))
     assert response.status_code == 200
     assert response.json() == SUMMARY
-    assert calls == [("pokagon", {})]
+    assert calls == [("pokagon", {"apply": False, "batch_engagement_id": None, "scratch_graph": None})]
 
 
-def test_no_apply_flag_exists_on_the_wire(monkeypatch):
+def test_unknown_fields_are_rejected_at_the_wire(monkeypatch):
     monkeypatch.setattr(admin, "run_provenance_audit", lambda client_slug, **kwargs: SUMMARY)
     client = _client()
 
-    body = _encoded({"client_slug": "pokagon", "apply": True})
+    body = _encoded({"client_slug": "pokagon", "graph_name": "client_pokagon"})
     response = client.post("/admin/provenance-audit", content=body, headers=_headers(body))
     assert response.status_code == 422
 

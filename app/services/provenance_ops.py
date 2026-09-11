@@ -195,6 +195,58 @@ def parse_exact_legacy_anchor(
     )
 
 
+_BATCH_DESCRIPTION_PATTERN = re.compile(
+    rf"Approved artifact \(batch-extracted\): (?P<kind>sop|map|report):(?P<source_id>{_IDENTIFIER})"
+)
+_BATCH_NAME_PREFIX = {"sop": "SOP: ", "map": "Map: ", "report": "Report: "}
+# What each April 2026 batch-extracted kind was, verified against the tenant
+# database on 2026-09-11: sop ids are SOPDocument rows, the map id is a
+# ProcessVersion row, report ids are InsightReport rows.
+_BATCH_ANCHOR_TYPES = {
+    "sop": ("sop_approved", "sop"),
+    "map": ("process_map_approved", "process_version"),
+    "report": ("insight_report", "insight_report"),
+}
+_SCRATCH_GRAPH_PATTERN = re.compile(r"scratch_[a-z0-9_]{1,60}")
+
+
+def parse_batch_extracted_anchor(
+    name: Any,
+    source_description: Any,
+    engagement_id: str,
+) -> tuple[ParsedLegacyAnchor | None, str]:
+    """Parse the one other legacy format: the 2026-04-24 batch extraction.
+
+    Those episodes were written as ``SOP: <title> vN`` / ``Map: <title>`` /
+    ``Report: <date>`` with ``Approved artifact (batch-extracted): <kind>:<id>``
+    and no engagement, so the engagement must be supplied by the operator,
+    who has verified it against the tenant database. Nothing is inferred.
+    """
+
+    if not isinstance(name, str) or not isinstance(source_description, str):
+        return None, "EPISODE_UNRESOLVED_FORMAT"
+    if len(name) > 512 or len(source_description) > 512:
+        return None, "EPISODE_UNRESOLVED_FORMAT"
+    if not isinstance(engagement_id, str) or not re.fullmatch(_IDENTIFIER, engagement_id):
+        return None, "EPISODE_UNRESOLVED_FORMAT"
+    match = _BATCH_DESCRIPTION_PATTERN.fullmatch(source_description)
+    if match is None:
+        return None, "EPISODE_UNRESOLVED_FORMAT"
+    kind = match.group("kind")
+    if not name.startswith(_BATCH_NAME_PREFIX[kind]):
+        return None, "EPISODE_UNRESOLVED_MISMATCH"
+    episode_type, source_type = _BATCH_ANCHOR_TYPES[kind]
+    return (
+        ParsedLegacyAnchor(
+            source_id=match.group("source_id"),
+            source_type=source_type,
+            engagement_id=engagement_id,
+            episode_type=episode_type,
+        ),
+        "EPISODE_CANONICAL_BATCH",
+    )
+
+
 def normalize_provable_episode_list(
     value: Any,
     *,
@@ -250,6 +302,8 @@ def _expected_value(anchor: ParsedLegacyAnchor, field: str) -> str:
 def build_provenance_plan(
     episodes: Iterable[EpisodeRecord],
     edges: Iterable[EdgeRecord],
+    *,
+    batch_engagement_id: str | None = None,
 ) -> ProvenancePlan:
     """Build a deterministic, idempotent plan from metadata-only observations."""
 
@@ -281,6 +335,12 @@ def build_provenance_plan(
             record.name,
             record.source_description,
         )
+        if anchor is None and parse_code == "EPISODE_UNRESOLVED_FORMAT" and batch_engagement_id:
+            anchor, parse_code = parse_batch_extracted_anchor(
+                record.name,
+                record.source_description,
+                batch_engagement_id,
+            )
         if anchor is None:
             codes[parse_code] += 1
             continue
@@ -488,13 +548,27 @@ def run_provenance_audit(
     *,
     apply: bool = False,
     db_factory: Callable[..., Any] | None = None,
+    batch_engagement_id: str | None = None,
+    scratch_graph: str | None = None,
 ) -> dict[str, Any]:
-    """Audit one exact tenant graph; reject apply until its guard is proven."""
+    """Audit one exact tenant graph, or a scratch copy of one.
 
-    graph_name = graph_name_for_client(client_slug)
-    if apply:
+    Apply is allowed only on a scratch graph (a name matching
+    ``scratch_[a-z0-9_]+``, made by export/import of a tenant graph): that is
+    where the singleton-conditional mutation is proven against the deployed
+    FalkorDB. On a tenant graph apply stays blocked until that proof is
+    recorded.
+    """
+
+    if scratch_graph is not None:
+        if not _SCRATCH_GRAPH_PATTERN.fullmatch(scratch_graph):
+            raise ProvenanceAuditReadError(AUDIT_GRAPH_NOT_FOUND_CODE)
+        graph_name = scratch_graph
+    else:
+        graph_name = graph_name_for_client(client_slug)
+    if apply and scratch_graph is None:
         # Activation remains blocked until the singleton-conditional mutation
-        # query is proven against a disposable FalkorDB instance. Unit query-shape
+        # query is proven against a disposable graph. Unit query-shape
         # coverage is intentionally not treated as that compatibility proof.
         raise ApplyBlockedError(APPLY_BLOCKED_CODE)
     if db_factory is None:
@@ -549,5 +623,9 @@ def run_provenance_audit(
     plan = build_provenance_plan(
         _episode_records(episode_rows),
         _edge_records(edge_rows),
+        batch_engagement_id=batch_engagement_id,
     )
-    return plan.summary(apply=False)
+    if not apply:
+        return plan.summary(apply=False)
+    succeeded, conflicts = _apply_plan(graph, graph_name, plan)
+    return plan.summary(apply=True, apply_succeeded=succeeded, apply_conflicts=conflicts)
