@@ -5,8 +5,16 @@ entity_types:
   # People
   - name: Stakeholder
     description: "Client organization employee, leader, or contact involved in the engagement"
+    attributes:
+      - name: platform_user_id
+        description: "The person's client user id on the platform, when the text states it (for example 'client user id cm...'); the durable key for the person"
+      - name: title
+        description: "The person's job title as stated in the text, when given"
   - name: Consultant
     description: "SDI team member working the engagement"
+    attributes:
+      - name: platform_user_id
+        description: "The consultant's platform user id, when the text states it"
 
   # Organizational
   - name: Department

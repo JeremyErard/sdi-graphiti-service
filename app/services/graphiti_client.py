@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType as GraphitiEpisodeType
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -247,9 +247,25 @@ def entity_type_models() -> dict[str, type[BaseModel]]:
         if not name or not isinstance(name, str):
             continue
         description = (entry or {}).get("description") or name
-        # type() rather than a literal class per entry: the taxonomy is data,
-        # and hand-writing 16 near-identical classes would put it in two places.
-        models[name] = type(name, (BaseModel,), {"__doc__": description})
+        # Attributes are optional string fields the extractor fills from the
+        # episode text and stores on the node. The people types carry the
+        # platform user id (ruled 2026-09-11: the durable key for a person,
+        # since two user records can share a name) and the title on record;
+        # without a field the extractor drops the id from the summary.
+        fields: dict[str, tuple[type, Any]] = {}
+        for attribute in (entry or {}).get("attributes") or []:
+            attr_name = (attribute or {}).get("name")
+            if not attr_name or not isinstance(attr_name, str) or not attr_name.isidentifier():
+                continue
+            fields[attr_name] = (
+                str | None,
+                Field(default=None, description=(attribute or {}).get("description") or attr_name),
+            )
+        # create_model rather than a literal class per entry: the taxonomy is
+        # data, and hand-writing 16 near-identical classes would put it in two
+        # places.
+        model = create_model(name, __doc__=description, **fields)  # type: ignore[call-overload]
+        models[name] = model
 
     _entity_type_models = models
     if models:
