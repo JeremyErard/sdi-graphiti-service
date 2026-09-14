@@ -91,6 +91,26 @@ def test_it_ensures_the_index_through_the_same_executor_once():
     assert len(creates) == 1, "one attempt per process, not one per call"
 
 
+def test_a_dead_override_is_visible_at_warning(caplog):
+    import logging
+    ex = _Executor(fail=True)
+    with caplog.at_level(logging.WARNING):
+        _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
+    assert "edge vector search unavailable, falling back to scan" in caplog.text
+
+
+def test_no_projection_references_its_own_alias():
+    import re
+    ex = _Executor()
+    _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
+    for q in _index_queries(ex):
+        for clause in re.split(r"\bWITH\b", q)[1:]:
+            head = clause.split("WHERE")[0].split("RETURN")[0]
+            for alias in re.findall(r"\bAS (\w+)", head):
+                before, _, after = head.partition(f"AS {alias}")
+                assert not re.search(rf"\b{alias}\.", before + after), f"{alias} used inside the WITH that defines it"
+
+
 def test_it_falls_back_to_the_scan_when_the_index_is_missing():
     ex = _Executor(fail=True)
     out = _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
