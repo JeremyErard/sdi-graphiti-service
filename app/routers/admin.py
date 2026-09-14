@@ -123,13 +123,10 @@ async def delete_graph(req: DeleteGraphRequest):
         from app.services import graphiti_client as gc
 
         graph_name = req.scratch_graph or gc._graph_name_for_client(req.client_slug)
-        # Evict cached Graphiti client so a new one won't reference a stale graph.
-        if graph_name in gc._clients:
-            try:
-                await gc._clients[graph_name].close()
-            except Exception:
-                pass
-            del gc._clients[graph_name]
+        # Evict the cached Graphiti client (one path: it also forgets the
+        # "index already ensured" marks) so a new one won't reference a
+        # stale graph.
+        await gc.evict_graph(graph_name)
 
         # Use the falkordb-py library directly. graphiti_core's FalkorDriver
         # wraps the connection in a way that doesn't expose raw Redis commands,
@@ -144,6 +141,9 @@ async def delete_graph(req: DeleteGraphRequest):
         except Exception as del_err:
             # Most common reason for delete to error: graph already gone.
             logger.info(f"[graphiti] graph.delete() {graph_name}: {del_err} (likely already absent)")
+        # Unconditionally: a graph that was already gone (a FalkorDB restart or
+        # flush) is the case where stale marks bite hardest.
+        gc.forget_graph_indexes(graph_name)
 
         return DeleteGraphResponse(graph_name=graph_name, status="deleted")
     except Exception as e:

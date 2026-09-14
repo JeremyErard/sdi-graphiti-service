@@ -675,8 +675,25 @@ async def get_client_for_graph(graph_name: str) -> Graphiti:
     return _clients[graph_name]
 
 
+def forget_graph_indexes(graph_name: str) -> None:
+    """Forget every "index already ensured" mark for a graph, on both paths.
+
+    See indexed_falkor.forget_graph. The search path keeps its own mark for
+    RELATES_TO.fact_embedding; a recreated graph needs that one ensured again
+    too, or the fast search raises and falls back to the hybrid scan.
+    """
+    from app.services.indexed_falkor import forget_graph  # noqa: PLC0415
+
+    _edge_vindex_ensured.discard(graph_name)
+    forget_graph(graph_name)
+    # Known, accepted: an ensure in flight across this call (it marks after
+    # its CREATE returns) can re-add a mark for the old graph. That needs a
+    # concurrent rehearsal and delete of the same graph, which nothing does.
+
+
 async def evict_graph(graph_name: str) -> None:
     """Drop a cached client by graph name; a broken pool must not be reused."""
+    forget_graph_indexes(graph_name)
     client = _clients.pop(graph_name, None)
     if client is None:
         return
@@ -769,12 +786,9 @@ async def reset_graph(client_slug: str) -> dict[str, Any]:
     logger.warning(f"[graphiti] RESETTING graph: {graph_name}")
 
     # Drop the cached client so the next operation reconnects fresh after wipe.
-    if graph_name in _clients:
-        try:
-            await _clients[graph_name].close()
-        except Exception:
-            pass
-        del _clients[graph_name]
+    # One path for "this graph is going away": close the cached client and
+    # forget the "index already ensured" marks.
+    await evict_graph(graph_name)
 
     # Use FalkorDB's underlying Redis connection to issue GRAPH.DELETE, which
     # removes all data for the named graph in a single atomic op. Reaching
@@ -791,6 +805,8 @@ async def reset_graph(client_slug: str) -> dict[str, Any]:
             # If the graph doesn't exist yet, GRAPH.DELETE errors. That's fine
             # for our reset-or-init semantics — just log and continue.
             logger.info(f"[graphiti] GRAPH.DELETE {graph_name}: {del_err} (expected if graph was empty)")
+        # Unconditionally, whether the graph was there or not.
+        forget_graph_indexes(graph_name)
     finally:
         try:
             await driver.close()
