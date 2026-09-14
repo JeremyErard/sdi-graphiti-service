@@ -86,22 +86,17 @@ def test_the_delete_route_forgets_even_when_the_graph_was_already_gone(monkeypat
     assert _marks() == CLEARED
 
 
-def test_reset_graph_ensures_the_indexes_again_whether_or_not_the_delete_succeeded(monkeypatch):
-    """reset_graph deletes the client graph and rebuilds it; the rebuild must
-    create the vector indexes again, which only happens if the marks were
-    forgotten in between, including when the graph was already gone."""
+def test_reset_graph_forgets_the_client_graph_marks_whether_or_not_the_delete_succeeded(monkeypatch):
+    """reset_graph deletes the CLIENT graph and rebuilds graphiti's own
+    indexes; the vector indexes are ensured lazily by the next search or
+    ingest, which only happens if the marks were forgotten, including when
+    the graph was already gone."""
     client_graph = "client_pokagon"
     for outcome in ("deleted", "absent"):
         indexed_falkor._node_vindex_ensured.add(client_graph)
+        indexed_falkor._edge_vindex_ensured_via.add(client_graph)
         graphiti_client._edge_vindex_ensured.add(client_graph)
         indexed_falkor._fallback_warned.add(("edge", client_graph, "ResponseError", "seen before"))
-        creates: list[str] = []
-
-        class _Graph:
-            def query(self, q, *args, **kwargs):
-                if "CREATE VECTOR INDEX" in q:
-                    creates.append(q)
-                return None
 
         class _Redis:
             def execute_command(self, *args):
@@ -124,10 +119,10 @@ def test_reset_graph_ensures_the_indexes_again_whether_or_not_the_delete_succeed
 
         monkeypatch.setattr(graphiti_client, "_create_driver", lambda name: _Driver())
         monkeypatch.setattr(graphiti_client, "get_client", fake_get_client)
-        monkeypatch.setattr(graphiti_client, "get_falkor_db", lambda: SimpleNamespace(select_graph=lambda name: _Graph()))
         asyncio.run(graphiti_client.reset_graph("pokagon"))
-        assert any("RELATES_TO" in q for q in creates), outcome
-        assert any("(n:Entity)" in q for q in creates), outcome
+        assert client_graph not in indexed_falkor._node_vindex_ensured, outcome
+        assert client_graph not in indexed_falkor._edge_vindex_ensured_via, outcome
+        assert client_graph not in graphiti_client._edge_vindex_ensured, outcome
         assert not any(k[1] == client_graph for k in indexed_falkor._fallback_warned), outcome
 
 
