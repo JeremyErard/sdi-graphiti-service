@@ -123,7 +123,7 @@ async def ensure_edge_vector_index_via(executor: Any, group_key: str, dim: int) 
     _edge_vindex_ensured_via.add(group_key)
 
 
-_fallback_warned: set[tuple[str, str]] = set()
+_fallback_warned: set[tuple[str, str, str, str]] = set()
 
 
 def _log_fallback(kind: str, group_key: str, error: BaseException) -> None:
@@ -135,7 +135,11 @@ def _log_fallback(kind: str, group_key: str, error: BaseException) -> None:
     identical WARNINGs. The signal is the first line; the query is still
     attempted every time so an index that appears later heals the path.
     """
-    key = (kind, group_key)
+    # Keyed on the error too: a second, different failure on the same graph
+    # (the index missing, then a query the server rejects) must warn again,
+    # or at INFO level it is exactly the invisible failure this exists to
+    # show. The same error repeating is the case the latch is for.
+    key = (kind, group_key, type(error).__name__, str(error)[:60])
     if key in _fallback_warned:
         logger.debug(f"[graphiti] {kind} vector search unavailable, falling back to scan: {error}")
         return

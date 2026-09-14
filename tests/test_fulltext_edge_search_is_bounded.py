@@ -82,3 +82,12 @@ def test_it_falls_back_rather_than_losing_the_search():
     out = _run(IndexedFalkorSearchOperations(), ex)
     assert out == []
     assert len(ex.queries) == 2, "it must retry via graphiti's own query"
+
+
+def test_the_bounded_query_passes_the_scope_check():
+    from tests.conftest import assert_with_scopes_are_sound
+
+    ex = _Executor()
+    _run(IndexedFalkorSearchOperations(), ex)
+    for q in ex.queries:
+        assert_with_scopes_are_sound(q)
