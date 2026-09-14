@@ -189,13 +189,18 @@ class _BoundedFulltextMixin:
         filter_query = (" WHERE " + " AND ".join(filter_queries)) if filter_queries else ""
 
         prefilter = max(int(limit) * FULLTEXT_OVERFETCH, int(limit))
+        # Endpoints come from the relationship itself (startNode/endNode):
+        # the former `MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m)`
+        # was planned as a full Entity label scan per yielded row with an
+        # edge-index probe for each, about 80 ms a candidate (profiled
+        # 2026-09-14), which is what made this leg cost 58 s under load.
         cypher = (
             "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
-            "YIELD relationship AS rel, score "
-            f"WITH rel, score ORDER BY score DESC LIMIT {prefilter} "
-            "MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)"
+            "YIELD relationship AS e, score "
+            f"WITH e, score ORDER BY score DESC LIMIT {prefilter} "
+            "WITH e, score, startNode(e) AS n, endNode(e) AS m"
             + filter_query
-            + " WITH e, score, n, m RETURN "
+            + " RETURN "
             + get_entity_edge_return_query(GraphProvider.FALKORDB)
             + " ORDER BY score DESC LIMIT $limit"
         )
@@ -317,16 +322,18 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
         )
 
         try:
-            gid_clause = " WHERE e.group_id IN $group_ids" if group_ids else ""
+            gid_clause = " AND e.group_id IN $group_ids" if group_ids else ""
             k = max(int(limit) * VECTOR_OVERFETCH, int(limit))
+            # Endpoints from the relationship (startNode/endNode), never a
+            # join by uuid: see edge_fulltext_search for the measured cost.
             cypher = (
                 f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {k}, vecf32($search_vector)) "
-                "YIELD relationship AS rel, score AS index_score "
-                "MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)"
-                + gid_clause
-                + " WITH e, n, m, "
+                "YIELD relationship AS e, score AS index_score "
+                "WITH e, startNode(e) AS n, endNode(e) AS m, "
                 + get_vector_cosine_func_query("e.fact_embedding", "$search_vector", GraphProvider.FALKORDB)
-                + " AS score WHERE score > $min_score RETURN "
+                + " AS score WHERE score > $min_score"
+                + gid_clause
+                + " RETURN "
                 + get_entity_edge_return_query(GraphProvider.FALKORDB)
                 + " ORDER BY score DESC LIMIT $limit"
             )

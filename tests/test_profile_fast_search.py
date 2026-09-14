@@ -35,6 +35,7 @@ class ProfilingGraph:
     def __init__(self):
         self.profiled: list[tuple[str, dict]] = []
         self.queried: list[str] = []
+        self.query_params: list[dict] = []
 
     def profile(self, q, params=None):
         self.profiled.append((q, params or {}))
@@ -42,6 +43,7 @@ class ProfilingGraph:
 
     def query(self, q, params=None, timeout=None):
         self.queried.append(q)
+        self.query_params.append(params or {})
         return SimpleNamespace(result_set=[ROW])
 
 
@@ -106,26 +108,54 @@ def test_a_server_refusal_is_not_retried_raw(monkeypatch):
         asyncio.run(graphiti_client.profile_fast_search("pokagon", "who approved", 1))
 
 
-def test_the_leg_queries_are_the_ones_the_search_issued_before_the_builder_existed():
+def test_the_leg_queries_are_pinned_byte_for_byte():
     """Pinned literals, so a drift in the shared builder moves the search and
-    the profiler together and this test still notices."""
+    the profiler together and this test still notices. These are the
+    startNode/endNode forms profiled on 2026-09-14; the uuid join they replace
+    was planned as a label scan per candidate."""
     vector, bm25 = graphiti_client.fast_search_leg_queries(20)
     assert vector == (
         "CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', 20, vecf32($q)) "
-        "YIELD relationship AS rel, score "
-        "MATCH (a:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(b:Entity) WHERE e.group_id = $group_id "
+        "YIELD relationship AS e, score "
+        "WITH e, score, startNode(e) AS a, endNode(e) AS b WHERE e.group_id = $group_id "
         "RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, a.uuid AS src, a.name AS src_name, "
         "b.uuid AS tgt, b.name AS tgt_name, e.episodes AS episodes, e.valid_at AS va, e.invalid_at AS ia, "
         "e.expired_at AS ea"
     )
     assert bm25 == (
-        "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) YIELD relationship AS rel, score "
-        "WITH rel, score ORDER BY score DESC LIMIT 200 "
-        "MATCH (a:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(b:Entity) WHERE e.group_id = $group_id "
-        "WITH a, e, b, score RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, a.uuid AS src, "
-        "a.name AS src_name, b.uuid AS tgt, b.name AS tgt_name, e.episodes AS episodes, e.valid_at AS va, "
-        "e.invalid_at AS ia, e.expired_at AS ea ORDER BY score DESC LIMIT 20"
+        "CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) YIELD relationship AS e, score "
+        "WITH e, score ORDER BY score DESC LIMIT 200 "
+        "WITH e, score, startNode(e) AS a, endNode(e) AS b WHERE e.group_id = $group_id "
+        "RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, a.uuid AS src, a.name AS src_name, "
+        "b.uuid AS tgt, b.name AS tgt_name, e.episodes AS episodes, e.valid_at AS va, e.invalid_at AS ia, "
+        "e.expired_at AS ea ORDER BY score DESC LIMIT 20"
     )
+
+
+def test_the_bm25_leg_sends_graphiti_s_query_form(monkeypatch):
+    """An OR of the question's terms under the group filter, never the bare
+    phrase (which RediSearch reads as AND of every term and matched nothing)."""
+    graph = ProfilingGraph()
+    _install(monkeypatch, graph)
+    asyncio.run(graphiti_client._search_fast("pokagon", "Who approved the Table Fill Inspection process map, and when?", 10))
+    (bm25_params,) = [p for q, p in [(q, p) for q, p in zip(graph.queried, graph.query_params)] if "fulltext" in q]
+    assert bm25_params["query"].startswith('(@group_id:"client_pokagon") (')
+    assert " | " in bm25_params["query"]
+    assert bm25_params["query"] == graphiti_client.fulltext_query_for("Who approved the Table Fill Inspection process map, and when?", "client_pokagon")
+    out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "Who approved the Table Fill Inspection process map, and when?", 10))
+    (profiled_bm25,) = [p for q, p in graph.profiled if "fulltext" in q]
+    assert profiled_bm25["query"] == bm25_params["query"], "the profiler measures the BM25 parameter the search sends"
+
+
+def test_a_question_of_only_stopwords_skips_the_bm25_leg_instead_of_sending_an_empty_term_group(monkeypatch):
+    assert graphiti_client.fulltext_query_for("a", "client_pokagon") == ""
+    assert graphiti_client.fulltext_query_for("the and of", "client_pokagon") == ""
+    assert graphiti_client.fulltext_query_for("approved", "client_pokagon").endswith("(approved)")
+    graph = ProfilingGraph()
+    _install(monkeypatch, graph)
+    out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "a", 1))
+    assert out["bm25"]["plan"] == ["(no searchable terms after sanitising)"]
+    assert not [q for q, _ in graph.profiled if "fulltext" in q]
 
 
 def test_the_profiler_returns_plan_lines_and_timings_only(monkeypatch):
