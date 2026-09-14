@@ -64,8 +64,11 @@ def test_it_queries_the_index_instead_of_scanning_every_entity():
     assert vq, "dedup must go through the index"
     assert vq[0].lstrip().startswith("CALL db.idx.vector.queryNodes"), "the index bounds the candidates"
     assert "MATCH (n:Entity)" not in vq[0], "a bare Entity MATCH means it is still scanning"
-    # The cosine is computed only for the yielded candidates, never as a scan.
-    assert "WITH node AS n, (2 - vec.cosineDistance(n.name_embedding, vecf32($search_vector)))/2 AS score" in vq[0]
+    # The cosine is computed only for the yielded candidates, never as a scan,
+    # and it reads `node.`: an alias cannot be referenced inside the WITH that
+    # defines it (FalkorDB: "'n' not defined", live on 2026-09-14).
+    assert "WITH node AS n, (2 - vec.cosineDistance(node.name_embedding, vecf32($search_vector)))/2 AS score" in vq[0]
+    assert "cosineDistance(n.name_embedding" not in vq[0]
 
 
 def test_the_threshold_uses_the_explicit_cosine_not_the_procedure_score():
@@ -89,6 +92,28 @@ def test_it_still_scopes_to_the_group():
     vq = [q for q in ex.queries if "db.idx.vector.queryNodes" in q]
     assert "group_id IN $group_ids" in vq[0]
     assert any(p.get("group_ids") == ["client_pokagon"] for p in ex.params)
+
+
+def test_no_projection_references_its_own_alias():
+    """Every WITH in both index queries must reference only variables bound
+    before it; the alias it defines is out of scope until the next clause."""
+    import re
+    ex = _Executor()
+    _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
+    for q in ex.queries:
+        for clause in re.split(r"\bWITH\b", q)[1:]:
+            head = clause.split("WHERE")[0].split("RETURN")[0]
+            for alias in re.findall(r"\bAS (\w+)", head):
+                before, _, after = head.partition(f"AS {alias}")
+                assert not re.search(rf"\b{alias}\.", before + after), f"{alias} used inside the WITH that defines it: {head.strip()[:120]}"
+
+
+def test_a_dead_override_is_visible_at_warning(caplog):
+    import logging
+    ex = _Executor(fail=True)
+    with caplog.at_level(logging.WARNING):
+        _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
+    assert "node vector search unavailable, falling back to scan" in caplog.text
 
 
 def test_it_falls_back_to_the_scan_when_the_index_is_missing():

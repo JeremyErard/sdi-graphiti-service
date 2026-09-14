@@ -251,8 +251,13 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
             cypher = (
                 f"CALL db.idx.vector.queryNodes('Entity', 'name_embedding', {k}, vecf32($search_vector)) "
                 f"YIELD node, score AS index_score{gid_clause} "
+                # `node.` inside this WITH, not `n.`: a projection cannot
+                # reference an alias defined in the same WITH. FalkorDB
+                # rejected the `n.` form with "'n' not defined" (live,
+                # 2026-09-14 12:31Z), which sent every entity dedup back to
+                # the full scan for an hour with only a DEBUG line to show it.
                 "WITH node AS n, "
-                + get_vector_cosine_func_query("n.name_embedding", "$search_vector", GraphProvider.FALKORDB)
+                + get_vector_cosine_func_query("node.name_embedding", "$search_vector", GraphProvider.FALKORDB)
                 + " AS score WHERE score > $min_score RETURN "
                 + get_entity_node_return_query(GraphProvider.FALKORDB)
                 + " ORDER BY score DESC LIMIT $limit"
@@ -265,7 +270,9 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
                 **({"group_ids": group_ids} if group_ids else {}),
             )
         except Exception as e:  # noqa: BLE001 - no index / no vector support
-            logger.debug(f"[graphiti] node vector search unavailable, falling back to scan: {e}")
+            # WARNING, not DEBUG: at DEBUG a dead override is invisible in
+            # production, and this one was dead for an hour on 2026-09-14.
+            logger.warning(f"[graphiti] node vector search unavailable, falling back to scan: {e}")
             return await super().node_similarity_search(
                 executor, search_vector, search_filter, group_ids, limit, min_score
             )
@@ -331,7 +338,7 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
                 **({"group_ids": group_ids} if group_ids else {}),
             )
         except Exception as e:  # noqa: BLE001 - no index / no vector support
-            logger.info(f"[graphiti] edge vector search unavailable, falling back to scan: {e}")
+            logger.warning(f"[graphiti] edge vector search unavailable, falling back to scan: {e}")
             return await super().edge_similarity_search(
                 executor, search_vector, source_node_uuid, target_node_uuid,
                 search_filter, group_ids, limit, min_score,
