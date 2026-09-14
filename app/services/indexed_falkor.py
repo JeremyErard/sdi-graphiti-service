@@ -113,6 +113,10 @@ def forget_graph(graph_name: str) -> None:
     """
     _node_vindex_ensured.discard(graph_name)
     _edge_vindex_ensured_via.discard(graph_name)
+    # The fallback latch too: a recreated graph's first failure must warn
+    # again, or at INFO level it is invisible.
+    for key in [k for k in _fallback_warned if k[1] == graph_name]:
+        _fallback_warned.discard(key)
 
 
 async def ensure_edge_vector_index_via(executor: Any, group_key: str, dim: int) -> None:

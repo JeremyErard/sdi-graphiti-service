@@ -686,6 +686,9 @@ def forget_graph_indexes(graph_name: str) -> None:
 
     _edge_vindex_ensured.discard(graph_name)
     forget_graph(graph_name)
+    # Known, accepted: an ensure in flight across this call (it marks after
+    # its CREATE returns) can re-add a mark for the old graph. That needs a
+    # concurrent rehearsal and delete of the same graph, which nothing does.
 
 
 async def evict_graph(graph_name: str) -> None:
@@ -783,12 +786,9 @@ async def reset_graph(client_slug: str) -> dict[str, Any]:
     logger.warning(f"[graphiti] RESETTING graph: {graph_name}")
 
     # Drop the cached client so the next operation reconnects fresh after wipe.
-    if graph_name in _clients:
-        try:
-            await _clients[graph_name].close()
-        except Exception:
-            pass
-        del _clients[graph_name]
+    # One path for "this graph is going away": close the cached client and
+    # forget the "index already ensured" marks.
+    await evict_graph(graph_name)
 
     # Use FalkorDB's underlying Redis connection to issue GRAPH.DELETE, which
     # removes all data for the named graph in a single atomic op. Reaching
@@ -800,12 +800,13 @@ async def reset_graph(client_slug: str) -> dict[str, Any]:
         redis_client = driver.client if hasattr(driver, "client") else driver._client
         try:
             redis_client.execute_command("GRAPH.DELETE", graph_name)
-            forget_graph_indexes(graph_name)
             logger.info(f"[graphiti] GRAPH.DELETE {graph_name} succeeded")
         except Exception as del_err:
             # If the graph doesn't exist yet, GRAPH.DELETE errors. That's fine
             # for our reset-or-init semantics — just log and continue.
             logger.info(f"[graphiti] GRAPH.DELETE {graph_name}: {del_err} (expected if graph was empty)")
+        # Unconditionally, whether the graph was there or not.
+        forget_graph_indexes(graph_name)
     finally:
         try:
             await driver.close()
