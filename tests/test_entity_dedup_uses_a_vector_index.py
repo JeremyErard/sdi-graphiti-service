@@ -62,7 +62,22 @@ def test_it_queries_the_index_instead_of_scanning_every_entity():
     _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
     vq = [q for q in ex.queries if "db.idx.vector.queryNodes" in q]
     assert vq, "dedup must go through the index"
-    assert "cosineDistance" not in vq[0], "an inline cosine means it is still scanning"
+    assert vq[0].lstrip().startswith("CALL db.idx.vector.queryNodes"), "the index bounds the candidates"
+    assert "MATCH (n:Entity)" not in vq[0], "a bare Entity MATCH means it is still scanning"
+    # The cosine is computed only for the yielded candidates, never as a scan.
+    assert "WITH node AS n, (2 - vec.cosineDistance(n.name_embedding, vecf32($search_vector)))/2 AS score" in vq[0]
+
+
+def test_the_threshold_uses_the_explicit_cosine_not_the_procedure_score():
+    """The procedure's own score is not relied on anywhere: candidates are
+    re-scored with graphiti's cosine so min_score and ordering keep their meaning."""
+    ex = _Executor()
+    _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
+    vq = [q for q in ex.queries if "db.idx.vector.queryNodes" in q][0]
+    assert "YIELD node" in vq and "YIELD node, score" not in vq
+    assert "WHERE score > $min_score" in vq
+    assert vq.rstrip().endswith("ORDER BY score DESC LIMIT $limit")
+    assert any(p.get("limit") == 10 and p.get("min_score") == 0.6 for p in ex.params)
 
 
 def test_it_still_scopes_to_the_group():
