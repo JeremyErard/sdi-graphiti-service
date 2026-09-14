@@ -13,6 +13,9 @@ the ordering keep their meaning.
 """
 
 import asyncio
+import re
+
+import pytest
 
 from graphiti_core.search.search_filters import SearchFilters
 
@@ -20,6 +23,57 @@ from app.services import indexed_falkor
 from app.services.indexed_falkor import VECTOR_OVERFETCH, IndexedFalkorSearchOperations
 
 SCAN = "MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)"
+
+
+CLAUSE_HEAD = re.compile(r"\b(WHERE|RETURN|ORDER BY|LIMIT|MATCH|CALL)\b")
+
+
+def _split_top_level(text: str) -> list[str]:
+    """Split a projection list on commas outside parentheses."""
+    items, depth, start = [], 0, 0
+    for i, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(text[start:i]); start = i + 1
+    items.append(text[start:])
+    return items
+
+
+def assert_with_scopes_are_sound(q: str) -> None:
+    """Cypher scope rules the fake cannot enforce: a WITH projection may only
+    read the incoming scope (an alias is not in scope inside the WITH that
+    defines it, unless it re-aliases the same name), and the clauses that
+    follow a WITH may dereference only what it projected."""
+    parts = re.split(r"\bWITH\b", q)
+    for segment in parts[1:]:
+        head = CLAUSE_HEAD.split(segment, 1)[0]
+        items = [i.strip() for i in _split_top_level(head)]
+        projected: set[str] = set()
+        exprs: list[str] = []
+        self_aliases: set[str] = set()
+        for item in items:
+            m = re.search(r"\bAS (\w+)\s*$", item)
+            if m:
+                alias, expr = m.group(1), item[: m.start()].strip()
+                projected.add(alias)
+                exprs.append(expr)
+                if expr == alias:
+                    self_aliases.add(alias)  # `node AS node` keeps the incoming name
+            elif re.fullmatch(r"\w+", item):
+                projected.add(item)
+                self_aliases.add(item)
+        # An alias defined by this WITH is not in scope inside it, in any item,
+        # unless it re-aliases the same incoming name.
+        forbidden = projected - self_aliases
+        for expr in exprs:
+            for deref in re.findall(r"\b(\w+)\.", expr):
+                assert deref not in forbidden, f"{deref} used inside the WITH that defines it: {head.strip()[:120]}"
+        tail = segment[len(head):]
+        for deref in re.findall(r"\b(\w+)\.", tail):
+            assert deref in projected, f"{deref} dereferenced after a WITH that did not project it: {tail.strip()[:120]}"
 
 
 class _Executor:
@@ -92,24 +146,32 @@ def test_it_ensures_the_index_through_the_same_executor_once():
     assert len(creates) == 1, "one attempt per process, not one per call"
 
 
-def test_a_dead_override_is_visible_at_warning(caplog):
+def test_a_dead_override_is_visible_once_at_warning_then_debug(caplog):
     import logging
+    indexed_falkor._fallback_warned.clear()
     ex = _Executor(fail=True)
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG, logger="graphiti_service"):
         _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
-    assert "edge vector search unavailable, falling back to scan" in caplog.text
+        _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
+    lines = [r for r in caplog.records if "edge vector search unavailable, falling back to scan" in r.getMessage()]
+    assert [r.levelname for r in lines] == ["WARNING", "DEBUG"], "one WARNING per graph per process, then DEBUG"
+    assert len([q for q in ex.queries if "db.idx.vector" in q]) == 2, "the index is still attempted every time"
 
 
-def test_no_projection_references_its_own_alias():
-    import re
+def test_no_projection_references_its_own_alias_and_nothing_after_a_with_reads_a_dropped_variable():
     ex = _Executor()
     _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
-    for q in _index_queries(ex):
-        for clause in re.split(r"\bWITH\b", q)[1:]:
-            head = clause.split("WHERE")[0].split("RETURN")[0]
-            for alias in re.findall(r"\bAS (\w+)", head):
-                before, _, after = head.partition(f"AS {alias}")
-                assert not re.search(rf"\b{alias}\.", before + after), f"{alias} used inside the WITH that defines it"
+    for q in ex.queries:
+        assert_with_scopes_are_sound(q)
+
+
+def test_the_scope_check_catches_both_live_failure_classes():
+    with pytest.raises(AssertionError):
+        assert_with_scopes_are_sound("CALL p() YIELD node WITH node AS n, (2 - vec.cosineDistance(n.name_embedding, vecf32($v)))/2 AS score WHERE score > $m RETURN n.uuid")
+    with pytest.raises(AssertionError):
+        assert_with_scopes_are_sound("CALL p() YIELD node WITH node AS n, 1 AS score WHERE score > $m RETURN node.uuid AS uuid")
+    assert_with_scopes_are_sound("CALL p() YIELD node WITH node AS node, (2 - vec.cosineDistance(node.name_embedding, vecf32($v)))/2 AS score WHERE score > $m RETURN node.uuid")
+    assert_with_scopes_are_sound("MATCH (n)-[e]->(m) WITH e, n, m, (2 - vec.cosineDistance(e.fact_embedding, vecf32($v)))/2 AS score WHERE score > $m RETURN e.uuid, n.uuid, m.uuid ORDER BY score DESC")
 
 
 def test_it_falls_back_to_the_scan_when_the_index_is_missing():

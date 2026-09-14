@@ -123,6 +123,26 @@ async def ensure_edge_vector_index_via(executor: Any, group_key: str, dim: int) 
     _edge_vindex_ensured_via.add(group_key)
 
 
+_fallback_warned: set[tuple[str, str]] = set()
+
+
+def _log_fallback(kind: str, group_key: str, error: BaseException) -> None:
+    """WARNING once per (leg, group) per process, DEBUG after.
+
+    A dead override must be visible (2026-09-14: one ran the full scan for an
+    hour behind a DEBUG line), but dedup runs 25 to 50 times per episode, so
+    on a build without vector support a backfill would emit thousands of
+    identical WARNINGs. The signal is the first line; the query is still
+    attempted every time so an index that appears later heals the path.
+    """
+    key = (kind, group_key)
+    if key in _fallback_warned:
+        logger.debug(f"[graphiti] {kind} vector search unavailable, falling back to scan: {error}")
+        return
+    _fallback_warned.add(key)
+    logger.warning(f"[graphiti] {kind} vector search unavailable, falling back to scan: {error}")
+
+
 # How many candidates to take from a vector index before the post-filters
 # (group, min_score) apply. One graph holds one group, so a small factor keeps
 # recall; the index bounds the work either way.
@@ -275,9 +295,7 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
                 **({"group_ids": group_ids} if group_ids else {}),
             )
         except Exception as e:  # noqa: BLE001 - no index / no vector support
-            # WARNING, not DEBUG: at DEBUG a dead override is invisible in
-            # production, and this one was dead for an hour on 2026-09-14.
-            logger.warning(f"[graphiti] node vector search unavailable, falling back to scan: {e}")
+            _log_fallback("node", group_ids[0] if group_ids else "*", e)
             return await super().node_similarity_search(
                 executor, search_vector, search_filter, group_ids, limit, min_score
             )
@@ -345,7 +363,7 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
                 **({"group_ids": group_ids} if group_ids else {}),
             )
         except Exception as e:  # noqa: BLE001 - no index / no vector support
-            logger.warning(f"[graphiti] edge vector search unavailable, falling back to scan: {e}")
+            _log_fallback("edge", group_ids[0] if group_ids else "*", e)
             return await super().edge_similarity_search(
                 executor, search_vector, source_node_uuid, target_node_uuid,
                 search_filter, group_ids, limit, min_score,
