@@ -112,15 +112,17 @@ class SearchBudgetExceeded(RuntimeError):
     """A fast-search leg exceeded its per-query budget; the request answers empty rather than late."""
 
 
-def _is_query_timeout(error: BaseException) -> bool:
-    """FalkorDB reports an exceeded TIMEOUT as an error whose text says the query timed out."""
-    text = str(error).lower()
-    return (
-        isinstance(error, (TimeoutError, asyncio.TimeoutError))
-        or type(error).__name__ == "TimeoutError"
-        or "timed out" in text
-        or "timeout" in text
-    )
+def _is_query_timeout(error: BaseException, elapsed_ms: float, budget_ms: int) -> bool:
+    """True only for a FalkorDB TIMEOUT that actually ran out.
+
+    FalkorDB abandons a query past its TIMEOUT with the text "Query timed out".
+    A rejected TIMEOUT argument (above the server's TIMEOUT_MAX, or a build
+    that refuses it) fails at once with text naming the parameter and no
+    "timed out"; a redis socket timeout reads "Timeout reading from socket".
+    Neither is a budget: they must keep the fallback behaviour they had, so
+    both the text and the elapsed time have to say the budget ran out.
+    """
+    return "timed out" in str(error).lower() and elapsed_ms >= 0.9 * budget_ms
 
 
 async def _graph_read_async(
@@ -962,14 +964,17 @@ _RRF_K = 60
 
 # Join the index-procedure relationship back to its endpoints. The relationship
 # procedures do not otherwise put endpoint nodes in scope.
-_EDGE_MATCH_RETURN = (
+_EDGE_MATCH = (
     "MATCH (a:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(b:Entity) "
     "WHERE e.group_id = $group_id "
+)
+_EDGE_RETURN = (
     "RETURN e.uuid AS uuid, e.fact AS fact, e.name AS name, "
     "a.uuid AS src, a.name AS src_name, b.uuid AS tgt, b.name AS tgt_name, "
     "e.episodes AS episodes, e.valid_at AS va, e.invalid_at AS ia, "
     "e.expired_at AS ea"
 )
+_EDGE_MATCH_RETURN = _EDGE_MATCH + _EDGE_RETURN
 
 
 def _lucene_sanitize(q: str) -> str:
@@ -1044,62 +1049,75 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
                 order.append(uuid)
         return order
 
-    # Cosine via HNSW (k inlined int; vector passed as the proven vecf32($param)).
-    # Budgeted: a leg past its budget answers empty for this request rather
-    # than late, since the backend discards anything after its own 8 s.
-    try:
-        vres = await _graph_read_async(
-            graph,
-            f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
-            f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
-            {"q": qvec, "group_id": graph_name},
-            timeout_ms=settings.search_vector_timeout_ms,
-        )
-    except Exception as error:
-        if _is_query_timeout(error):
-            logger.warning(
-                "[graphiti] fast vector leg exceeded %s ms on %s; answering empty",
-                settings.search_vector_timeout_ms,
-                graph_name,
-            )
-            raise SearchBudgetExceeded("fast vector leg exceeded its budget") from error
-        raise
-    vorder = _collect(vres.result_set)
-
-    # BM25 via the fulltext index, bounded BEFORE the join: the procedure yields
-    # every matching relationship, and joining each back to its endpoints before
-    # the limit cost one question 68 s once the graph held thousands of approval
-    # facts (2026-09-14; the hybrid path had the same defect and the same fix).
-    # Over-fetched because the group filter applies after the bound. Resilient:
-    # a parser hiccup or an exceeded budget degrades to vector-only rather than
-    # failing the whole search.
-    border: list[str] = []
-    safe_q = _lucene_sanitize(query)
-    if safe_q:
+    # The two legs run concurrently, each under its own FalkorDB TIMEOUT, so
+    # a call costs at most the larger budget rather than their sum: the backend
+    # gives a search 8 s and the preview path makes two calls per request.
+    # A leg past its budget answers empty for this request rather than late.
+    async def vector_leg() -> Any:
+        # Cosine via HNSW (k inlined int; vector passed as the proven vecf32($param)).
+        budget = settings.search_vector_timeout_ms
+        began = time.monotonic()
         try:
-            bres = await _graph_read_async(
+            return await _graph_read_async(
+                graph,
+                f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
+                f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
+                {"q": qvec, "group_id": graph_name},
+                timeout_ms=budget,
+            )
+        except Exception as error:
+            if _is_query_timeout(error, (time.monotonic() - began) * 1000, budget):
+                logger.warning(
+                    "[graphiti] fast vector leg exceeded %s ms on %s; answering empty",
+                    budget,
+                    graph_name,
+                )
+                raise SearchBudgetExceeded("fast vector leg exceeded its budget") from error
+            raise
+
+    async def bm25_leg() -> Any | None:
+        # BM25 via the fulltext index, bounded BEFORE the join: the procedure
+        # yields every matching relationship, and joining each back to its
+        # endpoints before the limit cost one question 68 s once the graph held
+        # thousands of approval facts (2026-09-14; the hybrid path had the same
+        # defect and the same fix, in indexed_falkor). Over-fetched because the
+        # group filter applies after the bound; the carrying WITH before RETURN
+        # mirrors the proven query. Resilient: a parser hiccup or an exceeded
+        # budget degrades to vector-only rather than failing the whole search.
+        safe_q = _lucene_sanitize(query)
+        if not safe_q:
+            return None
+        budget = settings.search_bm25_timeout_ms
+        began = time.monotonic()
+        try:
+            return await _graph_read_async(
                 graph,
                 f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
                 f"YIELD relationship AS rel, score "
                 f"WITH rel, score ORDER BY score DESC LIMIT {pool * FULLTEXT_OVERFETCH} "
-                f"{_EDGE_MATCH_RETURN} ORDER BY score DESC LIMIT {pool}",
+                f"{_EDGE_MATCH}WITH a, e, b, score {_EDGE_RETURN} "
+                f"ORDER BY score DESC LIMIT {pool}",
                 {"query": safe_q, "group_id": graph_name},
-                timeout_ms=settings.search_bm25_timeout_ms,
+                timeout_ms=budget,
             )
-            border = _collect(bres.result_set)
         except Exception as error:
-            if _is_query_timeout(error):
+            if _is_query_timeout(error, (time.monotonic() - began) * 1000, budget):
                 logger.warning(
                     "[graphiti] fast BM25 leg exceeded %s ms on %s; vector-only for this request",
-                    settings.search_bm25_timeout_ms,
+                    budget,
                     graph_name,
                 )
             else:
-                logger.debug(
-                    "[graphiti] fast BM25 leg skipped on %s error_type=%s",
+                logger.warning(
+                    "[graphiti] fast BM25 leg skipped on %s error_type=%s; vector-only for this request",
                     graph_name,
                     type(error).__name__,
                 )
+            return None
+
+    vres, bres = await asyncio.gather(vector_leg(), bm25_leg())
+    vorder = _collect(vres.result_set)
+    border: list[str] = _collect(bres.result_set) if bres is not None else []
 
     # Reciprocal rank fusion of the two ranked lists.
     scores: dict[str, float] = {}
@@ -1237,7 +1255,7 @@ async def resolve_search_provenance(
         if settings.graphiti_acceptance_probe_mode
         else db.select_graph(graph_name)
     )
-    edge_rows = _graph_read(
+    edge_result = await _graph_read_async(
         graph,
         """
         MATCH (subject:Entity)-[edge:RELATES_TO]->(object:Entity)
@@ -1247,7 +1265,8 @@ async def resolve_search_provenance(
                edge.valid_at, edge.invalid_at, edge.expired_at
         """,
         params={"edge_uuids": ordered_edge_ids, "group_id": graph_name},
-    ).result_set
+    )
+    edge_rows = edge_result.result_set
 
     preliminary: dict[str, dict[str, Any]] = {}
     corrupted_edge_ids: set[str] = set()
@@ -1308,7 +1327,7 @@ async def resolve_search_provenance(
     source_by_episode: dict[str, ResolvedEpisodeAnchor] = {}
     corrupted_episode_ids: set[str] = set()
     if episode_ids:
-        source_rows = _graph_read(
+        source_result = await _graph_read_async(
             graph,
             """
             MATCH (episode:Episodic)
@@ -1320,7 +1339,8 @@ async def resolve_search_provenance(
                    episode.valid_at, episode.provenance_write_state
             """,
             params={"episode_uuids": episode_ids, "group_id": graph_name},
-        ).result_set
+        )
+        source_rows = source_result.result_set
         for row in source_rows:
             episode_id = (
                 _uuid_string(row[0])

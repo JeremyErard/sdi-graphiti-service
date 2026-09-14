@@ -52,12 +52,14 @@ class Settings(BaseSettings):
     # passed to FalkorDB as the query TIMEOUT. The BM25 leg over RELATES_TO
     # grows with the number of facts matching common words ("approved",
     # "process"): after the Phase 1 record backfill (2026-09-14) one question
-    # took 68 s on the fast path while the backend gives a search 8 s. A leg
-    # that exceeds its budget is dropped for that request (BM25: vector-only;
-    # vector: an empty fast answer, never the slower hybrid fallback), so the
-    # request answers inside the budget instead of late and discarded.
+    # took 68 s on the fast path while the backend gives a search 8 s. The
+    # legs run concurrently, so one search call costs at most the larger
+    # budget plus the query embedding; the preview path makes two calls per
+    # request, so both together must stay well inside 8 s. A leg past its
+    # budget is dropped for that request (BM25: vector-only; vector: an empty
+    # fast answer, never the slower hybrid fallback).
     search_bm25_timeout_ms: int = 2500
-    search_vector_timeout_ms: int = 4000
+    search_vector_timeout_ms: int = 2500
 
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
