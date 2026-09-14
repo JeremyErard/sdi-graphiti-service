@@ -54,10 +54,13 @@ def assert_with_scopes_are_sound(q: str) -> None:
       item re-aliases the same incoming name (`node AS node`);
     - the clauses after a WITH, up to the next clause that binds new
       variables (MATCH, CALL, MERGE, UNWIND, CREATE) or the next WITH, may
-      dereference only what the WITH projected.
+      dereference only what the WITH projected. Anything after such a
+      clause is not checked (a CALL's YIELD fields are not tracked); no
+      query in this service has a WITH followed by a CALL.
     """
     for segment in _re.split(r"\bWITH\b", q)[1:]:
         head = CLAUSE_HEAD.split(segment, 1)[0]
+        head = _re.sub(r"^\s*DISTINCT\b", "", head)  # `WITH DISTINCT n` projects n
         items = [i.strip() for i in _split_top_level(head)]
         projected: set[str] = set()
         exprs: list[str] = []
@@ -75,7 +78,9 @@ def assert_with_scopes_are_sound(q: str) -> None:
                 self_aliases.add(item)
         forbidden = projected - self_aliases
         for expr in exprs:
-            for ident in _re.findall(r"\b([A-Za-z_]\w*)\b", expr):
+            # Identifiers only: not property names after a dot (`n.uuid AS uuid`)
+            # and not function names before a parenthesis (`size(e.episodes) AS size`).
+            for ident in _re.findall(r"(?<![.\w])([A-Za-z_]\w*)\b(?!\s*\()", expr):
                 assert ident not in forbidden, f"{ident} used inside the WITH that defines it: {head.strip()[:120]}"
         tail = segment[len(head):]
         tail = REBINDING.split(tail, 1)[0]

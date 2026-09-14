@@ -118,6 +118,11 @@ def test_the_scope_check_catches_both_live_failure_classes():
         assert_with_scopes_are_sound("MATCH (x) WITH x AS n, size(n) AS s RETURN s")
     with pytest.raises(AssertionError):
         assert_with_scopes_are_sound("MATCH (a) WITH a AS b, b AS c RETURN c")
+    # legal forms the bare-identifier rule must not reject
+    assert_with_scopes_are_sound("MATCH (n) WITH n.uuid AS uuid, n AS n RETURN uuid, n.name")
+    assert_with_scopes_are_sound("CALL p() YIELD node WITH node AS n, node.score AS score RETURN n.uuid, score")
+    assert_with_scopes_are_sound("MATCH ()-[e]->() WITH e, startNode(e) AS s, size(e.episodes) AS size RETURN e.uuid, s.uuid, size")
+    assert_with_scopes_are_sound("MATCH (n) WITH DISTINCT n RETURN n.group_id")
     # a MATCH after a WITH binds new variables the following clauses may read
     assert_with_scopes_are_sound("CALL p() YIELD relationship AS rel, score WITH rel, score ORDER BY score DESC LIMIT 200 MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity) WHERE e.group_id IN $g WITH e, score, n, m RETURN e.uuid, n.uuid, m.uuid ORDER BY score DESC LIMIT $l")
 
@@ -143,9 +148,9 @@ def test_a_different_failure_on_the_same_graph_warns_again(caplog):
         indexed_falkor._log_fallback("node", "client_pokagon", RuntimeError("vector index not found"))
         indexed_falkor._log_fallback("node", "client_pokagon", RuntimeError("'n' not defined"))
         indexed_falkor._log_fallback("node", "client_pokagon", RuntimeError("'n' not defined"))
-    levels = [r.levelname for r in caplog.records if "node vector search unavailable" in r.getMessage()]
-    assert levels == ["WARNING", "WARNING", "DEBUG"]
-    assert "'n' not defined" in caplog.text
+    lines = [r for r in caplog.records if "node vector search unavailable" in r.getMessage()]
+    assert [r.levelname for r in lines] == ["WARNING", "WARNING", "DEBUG"]
+    assert "'n' not defined" in lines[2].getMessage(), "the DEBUG line carries the error text"
 
 
 def test_it_falls_back_to_the_scan_when_the_index_is_missing():
