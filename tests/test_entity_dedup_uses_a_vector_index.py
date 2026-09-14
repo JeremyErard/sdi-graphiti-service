@@ -74,7 +74,9 @@ def test_the_threshold_uses_the_explicit_cosine_not_the_procedure_score():
     ex = _Executor()
     _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
     vq = [q for q in ex.queries if "db.idx.vector.queryNodes" in q][0]
-    assert "YIELD node" in vq and "YIELD node, score" not in vq
+    assert "YIELD node, score AS index_score" in vq, "every procedure field yielded, the score aliased away"
+    assert "index_score" not in vq.split("index_score", 1)[1], "the procedure score is never used after the YIELD"
+    assert "'name_embedding', 40, vecf32($search_vector)" in vq
     assert "WHERE score > $min_score" in vq
     assert vq.rstrip().endswith("ORDER BY score DESC LIMIT $limit")
     assert any(p.get("limit") == 10 and p.get("min_score") == 0.6 for p in ex.params)
