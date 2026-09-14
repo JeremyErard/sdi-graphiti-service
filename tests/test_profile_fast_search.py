@@ -63,6 +63,47 @@ def test_the_profiler_runs_exactly_the_queries_the_search_runs(monkeypatch):
     assert out["pool"] == 20
     assert out["graph_name"] == "client_pokagon"
     assert {p["group_id"] for _, p in graph.profiled} == {"client_pokagon"}
+    assert out["vector"]["query"] == graphiti_client.fast_search_leg_queries(20)[0]
+    assert out["bm25"]["query"] == graphiti_client.fast_search_leg_queries(20)[1]
+
+
+def test_a_plan_the_driver_cannot_parse_is_read_raw_from_the_server(monkeypatch):
+    """ExecutionPlan parses in __init__ and raises on an integer-formatted time
+    or four spaces inside an argument; the route then reads GRAPH.PROFILE raw."""
+    raw = ["Results", "    Project | Records produced: 20, Execution time: 0 ms"]
+
+    class Unparseable(ProfilingGraph):
+        _name = "client_pokagon"
+
+        def profile(self, q, params=None):
+            self.profiled.append((q, params or {}))
+            return ExecutionPlan(list(raw))  # raises inside the driver
+
+        def _build_params_header(self, params):
+            return "CYPHER q=[] "
+
+        def execute_command(self, *args):
+            assert args[0] == "GRAPH.PROFILE" and args[1] == "client_pokagon"
+            return [line.encode() for line in raw]
+
+    _install(monkeypatch, Unparseable())
+    out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "who approved", 1))
+    assert out["vector"]["plan"] == raw
+
+
+def test_a_server_refusal_is_not_retried_raw(monkeypatch):
+    from redis.exceptions import ResponseError
+
+    class Refusing(ProfilingGraph):
+        def profile(self, q, params=None):
+            raise ResponseError("Unknown procedure")
+
+        def execute_command(self, *args):
+            raise AssertionError("a refused query must not be re-sent")
+
+    _install(monkeypatch, Refusing())
+    with pytest.raises(ResponseError):
+        asyncio.run(graphiti_client.profile_fast_search("pokagon", "who approved", 1))
 
 
 def test_the_leg_queries_are_the_ones_the_search_issued_before_the_builder_existed():
@@ -110,9 +151,9 @@ def test_the_result_count_is_capped_where_the_search_budget_would_be(monkeypatch
 
 
 @pytest.mark.parametrize("slow_leg", ["db.idx.vector.queryRelationships", "db.idx.fulltext.queryRelationships"])
-def test_a_leg_past_the_profile_bound_answers_with_an_error_not_a_hang(monkeypatch, slow_leg):
+def test_a_leg_past_the_profile_bound_is_reported_and_the_other_leg_still_profiled(monkeypatch, slow_leg):
     """Each leg is bounded on its own: only the named leg is slow here, so an
-    unbounded leg would let the call return instead of raising."""
+    unbounded leg would return a real plan instead of the exceeded marker."""
     import time as _time
 
     class Slow(ProfilingGraph):
@@ -123,8 +164,11 @@ def test_a_leg_past_the_profile_bound_answers_with_an_error_not_a_hang(monkeypat
 
     _install(monkeypatch, Slow())
     monkeypatch.setattr(graphiti_client, "PROFILE_LEG_TIMEOUT_SECONDS", 0.05)
-    with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(graphiti_client.profile_fast_search("pokagon", "who approved the process map", 1))
+    out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "who approved the process map", 1))
+    slow, other = ("vector", "bm25") if "vector" in slow_leg else ("bm25", "vector")
+    assert out[slow]["plan"] == ["(exceeded the 0.05 s profile bound)"]
+    assert out[slow]["ms"] == 50
+    assert out[other]["plan"] == RAW_PLAN, "the other leg is still profiled"
 
 
 def test_a_scratch_graph_is_profiled_under_its_own_name(monkeypatch):

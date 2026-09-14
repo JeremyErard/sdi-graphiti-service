@@ -1171,9 +1171,19 @@ def _profile_read(graph: Any, query: str, params: dict[str, Any]) -> tuple[float
     and numbers leaves the database.
     """
     began = time.monotonic()
-    plan = graph.profile(query, params)
+    try:
+        plan = graph.profile(query, params)
+        raw = getattr(plan, "plan", plan)
+    except ResponseError:
+        raise  # the server refused the query: nothing to read
+    except Exception:  # noqa: BLE001 - the driver parses the plan in __init__
+        # The server answered but the driver's parser choked on a line (an
+        # integer-formatted time, or four spaces inside an argument). Take
+        # the raw reply; the lines are what this route returns anyway.
+        raw = graph.execute_command(
+            "GRAPH.PROFILE", getattr(graph, "name", None) or graph._name, graph._build_params_header(params) + query
+        )
     ms = (time.monotonic() - began) * 1000
-    raw = getattr(plan, "plan", plan)
     lines = []
     for line in raw if isinstance(raw, (list, tuple)) else str(raw).splitlines():
         text = line.decode() if isinstance(line, bytes) else str(line)
@@ -1210,19 +1220,24 @@ async def profile_fast_search(
     qvec = await embedder.create(input_data=[query.replace("\n", " ")])
     embed_ms = (time.monotonic() - began) * 1000
 
-    # GRAPH.PROFILE takes no per-query TIMEOUT in the driver, so the request
-    # is bounded here: a leg past PROFILE_LEG_TIMEOUT_SECONDS answers with an
-    # error instead of holding the request for the socket bound (900 s).
-    vector_ms, vector_plan = await asyncio.wait_for(
-        asyncio.to_thread(_profile_read, graph, vector_query, {"q": qvec, "group_id": graph_name}),
-        PROFILE_LEG_TIMEOUT_SECONDS,
-    )
+    # GRAPH.PROFILE takes no per-query TIMEOUT in the driver, so each leg is
+    # bounded here. A leg past PROFILE_LEG_TIMEOUT_SECONDS is reported as
+    # exceeded and the other leg is still profiled: "this leg exceeds the
+    # bound" is an answer, not a failure. The worker thread and its pooled
+    # connection stay busy until the database answers or the socket bound
+    # (900 s) fires; one of each per exceeded leg.
+    async def bounded(leg_query: str, params: dict[str, Any]) -> tuple[float, list[str]]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_profile_read, graph, leg_query, params), PROFILE_LEG_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            return PROFILE_LEG_TIMEOUT_SECONDS * 1000.0, [f"(exceeded the {PROFILE_LEG_TIMEOUT_SECONDS} s profile bound)"]
+
+    vector_ms, vector_plan = await bounded(vector_query, {"q": qvec, "group_id": graph_name})
     safe_q = _lucene_sanitize(query)
     if safe_q:
-        bm25_ms, bm25_plan = await asyncio.wait_for(
-            asyncio.to_thread(_profile_read, graph, bm25_query, {"query": safe_q, "group_id": graph_name}),
-            PROFILE_LEG_TIMEOUT_SECONDS,
-        )
+        bm25_ms, bm25_plan = await bounded(bm25_query, {"query": safe_q, "group_id": graph_name})
     else:
         bm25_ms, bm25_plan = 0.0, ["(no searchable terms after sanitising)"]
     return {
