@@ -1231,7 +1231,7 @@ def test_fast_query_joins_endpoints_and_projects_names_and_episodes(monkeypatch)
         def __init__(self):
             self.calls: list[tuple[str, dict]] = []
 
-        def query(self, query, params=None):
+        def query(self, query, params=None, timeout=None):
             self.calls.append((query, params or {}))
             return _QueryResult([fast_row])
 
@@ -1350,7 +1350,7 @@ def test_probe_fast_search_and_resolution_use_only_existing_graph_ro_queries(
         def query(self, *_args, **_kwargs):
             raise AssertionError("probe graph access must never use query")
 
-        def ro_query(self, query, params=None):
+        def ro_query(self, query, params=None, timeout=None):
             self.reads.append((query, params or {}))
             if "db.idx.vector.queryRelationships" in query:
                 return _QueryResult([fast_row])

@@ -19,7 +19,7 @@ from graphiti_core.llm_client.anthropic_client import AnthropicClient
 from graphiti_core.llm_client.config import LLMConfig
 
 from app.config import settings
-from app.services.indexed_falkor import IndexedFalkorDriver, ensure_node_vector_index
+from app.services.indexed_falkor import FULLTEXT_OVERFETCH, IndexedFalkorDriver, ensure_node_vector_index
 from app.graph_names import graph_name_for_client, segment_graph_name
 from app.provenance_contract import STRUCTURALLY_ANCHORED_MODES
 
@@ -90,15 +90,45 @@ def _select_existing_probe_graph(db: Any, graph_name: str) -> Any:
     return db.select_graph(graph_name)
 
 
-def _graph_read(graph: Any, query: str, params: dict[str, Any] | None = None) -> Any:
-    """Use FalkorDB's read-only command in acceptance-probe processes."""
+def _graph_read(
+    graph: Any,
+    query: str,
+    params: dict[str, Any] | None = None,
+    timeout_ms: int | None = None,
+) -> Any:
+    """Use FalkorDB's read-only command in acceptance-probe processes.
 
-    if settings.graphiti_acceptance_probe_mode:
-        return graph.ro_query(query, params)
-    return graph.query(query, params)
+    `timeout_ms` is FalkorDB's per-query TIMEOUT: the server abandons the
+    query and raises, instead of the caller waiting out the socket bound.
+    """
+
+    command = graph.ro_query if settings.graphiti_acceptance_probe_mode else graph.query
+    if timeout_ms is None:
+        return command(query, params)
+    return command(query, params, timeout=timeout_ms)
 
 
-async def _graph_read_async(graph: Any, query: str, params: dict[str, Any] | None = None) -> Any:
+class SearchBudgetExceeded(RuntimeError):
+    """A fast-search leg exceeded its per-query budget; the request answers empty rather than late."""
+
+
+def _is_query_timeout(error: BaseException) -> bool:
+    """FalkorDB reports an exceeded TIMEOUT as an error whose text says the query timed out."""
+    text = str(error).lower()
+    return (
+        isinstance(error, (TimeoutError, asyncio.TimeoutError))
+        or type(error).__name__ == "TimeoutError"
+        or "timed out" in text
+        or "timeout" in text
+    )
+
+
+async def _graph_read_async(
+    graph: Any,
+    query: str,
+    params: dict[str, Any] | None = None,
+    timeout_ms: int | None = None,
+) -> Any:
     """Run a synchronous graph read WITHOUT charging its duration to the loop.
 
     The FalkorDB handle is synchronous, so calling it inline on an async path
@@ -110,7 +140,7 @@ async def _graph_read_async(graph: Any, query: str, params: dict[str, Any] | Non
     The socket timeout bounds how long one call can take; this keeps that time
     from being taken out of everyone else's.
     """
-    return await asyncio.to_thread(_graph_read, graph, query, params)
+    return await asyncio.to_thread(_graph_read, graph, query, params, timeout_ms)
 
 
 def _parse_dt(v: Any) -> datetime | None:
@@ -1015,16 +1045,34 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         return order
 
     # Cosine via HNSW (k inlined int; vector passed as the proven vecf32($param)).
-    vres = await _graph_read_async(
-        graph,
-        f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
-        f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
-        {"q": qvec, "group_id": graph_name},
-    )
+    # Budgeted: a leg past its budget answers empty for this request rather
+    # than late, since the backend discards anything after its own 8 s.
+    try:
+        vres = await _graph_read_async(
+            graph,
+            f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
+            f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
+            {"q": qvec, "group_id": graph_name},
+            timeout_ms=settings.search_vector_timeout_ms,
+        )
+    except Exception as error:
+        if _is_query_timeout(error):
+            logger.warning(
+                "[graphiti] fast vector leg exceeded %s ms on %s; answering empty",
+                settings.search_vector_timeout_ms,
+                graph_name,
+            )
+            raise SearchBudgetExceeded("fast vector leg exceeded its budget") from error
+        raise
     vorder = _collect(vres.result_set)
 
-    # BM25 via the fulltext index. Resilient: a parser hiccup degrades to
-    # vector-only rather than failing the whole search.
+    # BM25 via the fulltext index, bounded BEFORE the join: the procedure yields
+    # every matching relationship, and joining each back to its endpoints before
+    # the limit cost one question 68 s once the graph held thousands of approval
+    # facts (2026-09-14; the hybrid path had the same defect and the same fix).
+    # Over-fetched because the group filter applies after the bound. Resilient:
+    # a parser hiccup or an exceeded budget degrades to vector-only rather than
+    # failing the whole search.
     border: list[str] = []
     safe_q = _lucene_sanitize(query)
     if safe_q:
@@ -1032,16 +1080,26 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
             bres = await _graph_read_async(
                 graph,
                 f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
-                f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN} LIMIT {pool}",
+                f"YIELD relationship AS rel, score "
+                f"WITH rel, score ORDER BY score DESC LIMIT {pool * FULLTEXT_OVERFETCH} "
+                f"{_EDGE_MATCH_RETURN} ORDER BY score DESC LIMIT {pool}",
                 {"query": safe_q, "group_id": graph_name},
+                timeout_ms=settings.search_bm25_timeout_ms,
             )
             border = _collect(bres.result_set)
         except Exception as error:
-            logger.debug(
-                "[graphiti] fast BM25 leg skipped on %s error_type=%s",
-                graph_name,
-                type(error).__name__,
-            )
+            if _is_query_timeout(error):
+                logger.warning(
+                    "[graphiti] fast BM25 leg exceeded %s ms on %s; vector-only for this request",
+                    settings.search_bm25_timeout_ms,
+                    graph_name,
+                )
+            else:
+                logger.debug(
+                    "[graphiti] fast BM25 leg skipped on %s error_type=%s",
+                    graph_name,
+                    type(error).__name__,
+                )
 
     # Reciprocal rank fusion of the two ranked lists.
     scores: dict[str, float] = {}
@@ -1098,6 +1156,15 @@ async def search_with_path(
             raise AcceptanceProbeReadError(
                 "acceptance probe fast search is unavailable"
             ) from error
+        if isinstance(error, SearchBudgetExceeded):
+            # The hybrid fallback is slower still (an O(N) cosine scan); a
+            # request past its budget answers empty, inside the budget.
+            logger.warning(
+                "[graphiti] Search(fast) in %s exceeded its budget after %.0fms; answering empty",
+                graph_name,
+                (time.time() - start) * 1000,
+            )
+            return [], "fast"
         logger.warning(
             "[graphiti] fast search failed on %s error_type=%s; falling back "
             "to hybrid",
