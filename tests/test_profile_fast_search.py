@@ -109,18 +109,22 @@ def test_the_result_count_is_capped_where_the_search_budget_would_be(monkeypatch
     assert res.status_code == 422
 
 
-def test_a_leg_past_the_profile_bound_answers_with_an_error_not_a_hang(monkeypatch):
+@pytest.mark.parametrize("slow_leg", ["db.idx.vector.queryRelationships", "db.idx.fulltext.queryRelationships"])
+def test_a_leg_past_the_profile_bound_answers_with_an_error_not_a_hang(monkeypatch, slow_leg):
+    """Each leg is bounded on its own: only the named leg is slow here, so an
+    unbounded leg would let the call return instead of raising."""
     import time as _time
 
     class Slow(ProfilingGraph):
         def profile(self, q, params=None):
-            _time.sleep(0.3)
+            if slow_leg in q:
+                _time.sleep(0.3)
             return super().profile(q, params)
 
     _install(monkeypatch, Slow())
     monkeypatch.setattr(graphiti_client, "PROFILE_LEG_TIMEOUT_SECONDS", 0.05)
     with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(graphiti_client.profile_fast_search("pokagon", "q", 1))
+        asyncio.run(graphiti_client.profile_fast_search("pokagon", "who approved the process map", 1))
 
 
 def test_a_scratch_graph_is_profiled_under_its_own_name(monkeypatch):
