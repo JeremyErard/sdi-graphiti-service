@@ -1155,17 +1155,30 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     return [by_uuid[u] for u in ranked]
 
 
+PROFILE_MAX_RESULTS = 30
+PROFILE_LEG_TIMEOUT_SECONDS = 30
+
+
 def _profile_read(graph: Any, query: str, params: dict[str, Any]) -> tuple[float, list[str]]:
-    """GRAPH.PROFILE one leg: wall time in ms and the plan's lines.
+    """GRAPH.PROFILE one leg: wall time in ms and the plan's raw lines.
 
     PROFILE runs the query and returns the plan with per-operation records
-    and timings. The result set is not returned, so nothing but operator
-    names and numbers leaves the database.
+    and timings. The driver's ExecutionPlan keeps the server's lines on
+    `.plan`; its `str()` re-renders the parsed tree WITHOUT the
+    "Records produced / Execution time" segments (it pops them into
+    per-operation stats), which is the one thing this route exists to
+    return. The result set is not returned, so nothing but operator names
+    and numbers leaves the database.
     """
     began = time.monotonic()
     plan = graph.profile(query, params)
     ms = (time.monotonic() - began) * 1000
-    lines = [line for line in str(plan).splitlines() if line.strip()]
+    raw = getattr(plan, "plan", plan)
+    lines = []
+    for line in raw if isinstance(raw, (list, tuple)) else str(raw).splitlines():
+        text = line.decode() if isinstance(line, bytes) else str(line)
+        if text.strip():
+            lines.append(text.rstrip())
     return ms, lines
 
 
@@ -1184,6 +1197,8 @@ async def profile_fast_search(
     executed, per leg, with its per-operation timings, for the exact Cypher
     the search runs. Read-only, admin-scoped, and returns no fact text.
     """
+    if not 1 <= int(max_results) <= PROFILE_MAX_RESULTS:
+        raise ValueError(f"max_results must be 1..{PROFILE_MAX_RESULTS}")
     graph_name = scratch_graph or _graph_name_for_client(client_slug)
     graph = get_falkor_db().select_graph(graph_name)
     embedder = _create_embedder()
@@ -1195,13 +1210,18 @@ async def profile_fast_search(
     qvec = await embedder.create(input_data=[query.replace("\n", " ")])
     embed_ms = (time.monotonic() - began) * 1000
 
-    vector_ms, vector_plan = await asyncio.to_thread(
-        _profile_read, graph, vector_query, {"q": qvec, "group_id": graph_name}
+    # GRAPH.PROFILE takes no per-query TIMEOUT in the driver, so the request
+    # is bounded here: a leg past PROFILE_LEG_TIMEOUT_SECONDS answers with an
+    # error instead of holding the request for the socket bound (900 s).
+    vector_ms, vector_plan = await asyncio.wait_for(
+        asyncio.to_thread(_profile_read, graph, vector_query, {"q": qvec, "group_id": graph_name}),
+        PROFILE_LEG_TIMEOUT_SECONDS,
     )
     safe_q = _lucene_sanitize(query)
     if safe_q:
-        bm25_ms, bm25_plan = await asyncio.to_thread(
-            _profile_read, graph, bm25_query, {"query": safe_q, "group_id": graph_name}
+        bm25_ms, bm25_plan = await asyncio.wait_for(
+            asyncio.to_thread(_profile_read, graph, bm25_query, {"query": safe_q, "group_id": graph_name}),
+            PROFILE_LEG_TIMEOUT_SECONDS,
         )
     else:
         bm25_ms, bm25_plan = 0.0, ["(no searchable terms after sanitising)"]

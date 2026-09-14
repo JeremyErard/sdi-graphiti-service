@@ -923,7 +923,7 @@ async def rehearse_episode(req: RehearseEpisodeRequest):
 class ProfileFastSearchRequest(BaseModel):
     client_slug: str = Field(..., min_length=1, max_length=64)
     query: str = Field(..., min_length=1, max_length=2000)
-    max_results: int = Field(default=10, ge=1, le=50)
+    max_results: int = Field(default=10, ge=1, le=graphiti_client.PROFILE_MAX_RESULTS)
     scratch_graph: str | None = Field(default=None, pattern=r"^scratch_[a-z0-9_]{1,60}$")
 
 
