@@ -20,6 +20,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from app.config import settings
@@ -50,6 +51,9 @@ class FakeGraph:
                 raise ResponseError("The query TIMEOUT exceeds the TIMEOUT_MAX configuration parameter")
             if self.how == "instant-timed-out":
                 raise ResponseError("Query timed out")
+            if self.how == "connection-lost":
+                time.sleep((timeout or BUDGET_MS) / 1000)
+                raise RedisConnectionError("Error 60 connecting to falkordb:6379. Operation timed out.")
             raise ResponseError("Invalid input")
         return SimpleNamespace(result_set=[ROW])
 
@@ -147,11 +151,12 @@ def test_a_vector_leg_that_runs_out_of_time_answers_empty_on_the_fast_path_witho
     assert path == "fast"
 
 
-@pytest.mark.parametrize("how", ["rejected", "parse", "instant-timed-out"])
+@pytest.mark.parametrize("how", ["rejected", "parse", "instant-timed-out", "connection-lost"])
 def test_a_vector_leg_error_that_is_not_a_spent_budget_still_falls_back_to_hybrid(fast, monkeypatch, how):
-    # A rejected TIMEOUT argument, a parse error, or a "timed out" that came
-    # back at once (the budget was not spent) all keep the prior behaviour.
-    fast(fail="vector", how=how, vector_ms=5000)
+    # A rejected TIMEOUT argument, a parse error, a "timed out" that came
+    # back at once (the budget was not spent), or a lost connection whose
+    # transport wording also says "timed out" all keep the prior behaviour.
+    fast(fail="vector", how=how, vector_ms=5000 if how != "connection-lost" else BUDGET_MS)
     called: list[str] = []
 
     class FakeClient:
@@ -207,6 +212,8 @@ def test_timeout_detection_needs_both_the_text_and_the_elapsed_time():
     assert not spent(ResponseError("Query timed out"), 5, 2500)
     assert not spent(ResponseError("The query TIMEOUT exceeds the TIMEOUT_MAX configuration parameter"), 5, 2500)
     assert not spent(TimeoutError("Timeout reading from socket"), 900000, 2500)
+    assert not spent(RedisConnectionError("Error 60 connecting to falkordb:6379. Operation timed out."), 3000, 2500)
+    assert not spent(RedisConnectionError("Error timed out connecting to falkordb:6379."), 3000, 2500)
     assert not spent(ResponseError("Invalid input"), 2500, 2500)
 
 

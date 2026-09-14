@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, create_model
+from redis.exceptions import ResponseError
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType as GraphitiEpisodeType
 from graphiti_core.driver.falkordb_driver import FalkorDriver
@@ -119,10 +120,18 @@ def _is_query_timeout(error: BaseException, elapsed_ms: float, budget_ms: int) -
     A rejected TIMEOUT argument (above the server's TIMEOUT_MAX, or a build
     that refuses it) fails at once with text naming the parameter and no
     "timed out"; a redis socket timeout reads "Timeout reading from socket".
-    Neither is a budget: they must keep the fallback behaviour they had, so
-    both the text and the elapsed time have to say the budget ran out.
+    A connection error also carries "timed out" in redis-py's wording
+    ("Error 60 connecting to host. Operation timed out.") when the database
+    restarts mid-request. None of these is a budget: they must keep the
+    fallback behaviour they had, so the error has to be the server's own
+    reply, and both its text and the elapsed time have to say the budget
+    ran out.
     """
-    return "timed out" in str(error).lower() and elapsed_ms >= 0.9 * budget_ms
+    return (
+        isinstance(error, ResponseError)
+        and "timed out" in str(error).lower()
+        and elapsed_ms >= 0.9 * budget_ms
+    )
 
 
 async def _graph_read_async(
