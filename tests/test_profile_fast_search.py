@@ -142,6 +142,20 @@ def test_the_bm25_leg_sends_graphiti_s_query_form(monkeypatch):
     assert bm25_params["query"].startswith('(@group_id:"client_pokagon") (')
     assert " | " in bm25_params["query"]
     assert bm25_params["query"] == graphiti_client.fulltext_query_for("Who approved the Table Fill Inspection process map, and when?", "client_pokagon")
+    out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "Who approved the Table Fill Inspection process map, and when?", 10))
+    (profiled_bm25,) = [p for q, p in graph.profiled if "fulltext" in q]
+    assert profiled_bm25["query"] == bm25_params["query"], "the profiler measures the BM25 parameter the search sends"
+
+
+def test_a_question_of_only_stopwords_skips_the_bm25_leg_instead_of_sending_an_empty_term_group(monkeypatch):
+    assert graphiti_client.fulltext_query_for("a", "client_pokagon") == ""
+    assert graphiti_client.fulltext_query_for("the and of", "client_pokagon") == ""
+    assert graphiti_client.fulltext_query_for("approved", "client_pokagon").endswith("(approved)")
+    graph = ProfilingGraph()
+    _install(monkeypatch, graph)
+    out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "a", 1))
+    assert out["bm25"]["plan"] == ["(no searchable terms after sanitising)"]
+    assert not [q for q, _ in graph.profiled if "fulltext" in q]
 
 
 def test_the_profiler_returns_plan_lines_and_timings_only(monkeypatch):

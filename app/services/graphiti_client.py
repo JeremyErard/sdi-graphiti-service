@@ -1005,7 +1005,13 @@ def fulltext_query_for(query: str, graph_name: str) -> str:
         _build_falkor_fulltext_query,
     )
 
-    return _build_falkor_fulltext_query(query, [graph_name])
+    built = _build_falkor_fulltext_query(query, [graph_name])
+    # A question made only of stopwords or specials builds to an empty term
+    # group, `(@group_id:"...") ()`, which the procedure rejects; the leg is
+    # skipped instead, as for an empty question.
+    if not built or built.rstrip().endswith("()"):
+        return ""
+    return built
 
 
 def fast_search_leg_queries(pool: int) -> tuple[str, str]:
@@ -1027,15 +1033,6 @@ def fast_search_leg_queries(pool: int) -> tuple[str, str]:
         f"ORDER BY score DESC LIMIT {pool}"
     )
     return vector, bm25
-
-
-def _lucene_sanitize(q: str) -> str:
-    """Strip RediSearch/fulltext special chars so a natural-language query never
-    breaks the BM25 parser (e.g. '&', '-', ':'). Mirrors graphiti's intent."""
-    out = []
-    for ch in q:
-        out.append(ch if (ch.isalnum() or ch.isspace()) else " ")
-    return " ".join("".join(out).split())
 
 
 def _row_to_edge(row) -> Any:

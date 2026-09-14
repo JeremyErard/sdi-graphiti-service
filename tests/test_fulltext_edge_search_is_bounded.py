@@ -49,6 +49,7 @@ def test_the_bound_comes_before_the_match():
     q = " ".join(ex.queries[0].split())
     assert "LIMIT" in q, "the procedure output must be bounded"
     assert "{uuid: rel.uuid}" not in q and "MATCH (n:Entity)" not in q, "no join by uuid: endpoints come from startNode/endNode"
+    assert "WITH e, score, startNode(e) AS n, endNode(e) AS m" in q, "n is the source, m the target: graphiti writes (source)-[:RELATES_TO]->(target)"
     assert q.index("LIMIT") < q.index("startNode(e)"), (
         "bounding after the join is the whole defect: every matched relationship "
         "gets re-matched by uuid before the limit applies"

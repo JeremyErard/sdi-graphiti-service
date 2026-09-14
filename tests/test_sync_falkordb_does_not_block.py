@@ -137,7 +137,7 @@ def test_the_search_path_does_not_freeze_the_event_loop(monkeypatch):
     monkeypatch.setattr(graphiti_client, "get_falkor_db", lambda: slow)
     monkeypatch.setattr(graphiti_client, "_ensure_edge_vector_index", lambda *_a, **_k: None)
     monkeypatch.setattr(graphiti_client, "_row_to_edge", lambda row: row)
-    monkeypatch.setattr(graphiti_client, "_lucene_sanitize", lambda q: "")
+    monkeypatch.setattr(graphiti_client, "fulltext_query_for", lambda q, g: "")  # no BM25 leg: one timed leg
 
     class _Embedder:
         async def create(self, input_data):
