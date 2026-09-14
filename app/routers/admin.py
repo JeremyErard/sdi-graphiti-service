@@ -918,3 +918,46 @@ async def rehearse_episode(req: RehearseEpisodeRequest):
         logger.error(f"[graphiti] Rehearsal ingest failed for {req.scratch_graph}: {type(e).__name__}")
         raise HTTPException(status_code=500, detail="Rehearsal ingest failed")
 
+
+
+class ProfileFastSearchRequest(BaseModel):
+    client_slug: str = Field(..., min_length=1, max_length=64)
+    query: str = Field(..., min_length=1, max_length=2000)
+    max_results: int = Field(default=10, ge=1, le=50)
+    scratch_graph: str | None = Field(default=None, pattern=r"^scratch_[a-z0-9_]{1,60}$")
+
+
+class ProfileLeg(BaseModel):
+    ms: int
+    query: str
+    plan: list[str]
+
+
+class ProfileFastSearchResponse(BaseModel):
+    graph_name: str
+    pool: int
+    embed_ms: int
+    vector: ProfileLeg
+    bm25: ProfileLeg
+
+
+@router.post("/profile-fast-search", response_model=ProfileFastSearchResponse)
+async def profile_fast_search(req: ProfileFastSearchRequest):
+    """GRAPH.PROFILE of the fast path's two legs for one question.
+
+    Read-only diagnostic for the search latency, which grew with the
+    candidate pool on an idle graph (2026-09-14). Runs the exact Cypher the
+    search runs, through the same embedder, and returns the executed plan
+    with per-operation timings. No fact text, names or descriptions are
+    returned: only operator lines and numbers. Inherits the admin scope.
+    """
+    try:
+        return await graphiti_client.profile_fast_search(
+            client_slug=req.client_slug,
+            query=req.query,
+            max_results=req.max_results,
+            scratch_graph=req.scratch_graph,
+        )
+    except Exception as error:  # noqa: BLE001 - surface as a clean 502, not a stack
+        logger.warning("[graphiti] profile-fast-search failed error_type=%s", type(error).__name__)
+        raise HTTPException(status_code=502, detail="profile unavailable") from error

@@ -986,6 +986,27 @@ _EDGE_RETURN = (
 _EDGE_MATCH_RETURN = _EDGE_MATCH + _EDGE_RETURN
 
 
+def fast_search_leg_queries(pool: int) -> tuple[str, str]:
+    """The exact Cypher of the fast path's two legs for a candidate pool.
+
+    One builder, so the search and the profiler cannot drift: what the
+    profiler measures is what the search runs.
+    """
+    pool = int(pool)
+    vector = (
+        f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
+        f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}"
+    )
+    bm25 = (
+        f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
+        f"YIELD relationship AS rel, score "
+        f"WITH rel, score ORDER BY score DESC LIMIT {pool * FULLTEXT_OVERFETCH} "
+        f"{_EDGE_MATCH}WITH a, e, b, score {_EDGE_RETURN} "
+        f"ORDER BY score DESC LIMIT {pool}"
+    )
+    return vector, bm25
+
+
 def _lucene_sanitize(q: str) -> str:
     """Strip RediSearch/fulltext special chars so a natural-language query never
     breaks the BM25 parser (e.g. '&', '-', ':'). Mirrors graphiti's intent."""
@@ -1045,6 +1066,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
 
     # Pull a candidate pool 2x the requested size from each method, then fuse.
     pool = max(int(max_results) * 2, int(max_results))
+    vector_query, bm25_query = fast_search_leg_queries(pool)
 
     by_uuid: dict[str, Any] = {}
 
@@ -1069,8 +1091,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         try:
             return await _graph_read_async(
                 graph,
-                f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
-                f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}",
+                vector_query,
                 {"q": qvec, "group_id": graph_name},
                 timeout_ms=budget,
             )
@@ -1101,11 +1122,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         try:
             return await _graph_read_async(
                 graph,
-                f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
-                f"YIELD relationship AS rel, score "
-                f"WITH rel, score ORDER BY score DESC LIMIT {pool * FULLTEXT_OVERFETCH} "
-                f"{_EDGE_MATCH}WITH a, e, b, score {_EDGE_RETURN} "
-                f"ORDER BY score DESC LIMIT {pool}",
+                bm25_query,
                 {"query": safe_q, "group_id": graph_name},
                 timeout_ms=budget,
             )
@@ -1136,6 +1153,65 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
 
     ranked = sorted(scores, key=lambda u: scores[u], reverse=True)[: int(max_results)]
     return [by_uuid[u] for u in ranked]
+
+
+def _profile_read(graph: Any, query: str, params: dict[str, Any]) -> tuple[float, list[str]]:
+    """GRAPH.PROFILE one leg: wall time in ms and the plan's lines.
+
+    PROFILE runs the query and returns the plan with per-operation records
+    and timings. The result set is not returned, so nothing but operator
+    names and numbers leaves the database.
+    """
+    began = time.monotonic()
+    plan = graph.profile(query, params)
+    ms = (time.monotonic() - began) * 1000
+    lines = [line for line in str(plan).splitlines() if line.strip()]
+    return ms, lines
+
+
+async def profile_fast_search(
+    client_slug: str,
+    query: str,
+    max_results: int,
+    scratch_graph: str | None = None,
+) -> dict[str, Any]:
+    """Profile the fast path's two legs for a question, on the live graph.
+
+    Added 2026-09-14: the fast path's latency grew linearly with the candidate
+    pool on an idle graph (about 70 ms per vector-index candidate at 25.9k
+    edges), which nothing could explain from outside the database. The slow
+    log ranks queries but has no operators; this returns the plan FalkorDB
+    executed, per leg, with its per-operation timings, for the exact Cypher
+    the search runs. Read-only, admin-scoped, and returns no fact text.
+    """
+    graph_name = scratch_graph or _graph_name_for_client(client_slug)
+    graph = get_falkor_db().select_graph(graph_name)
+    embedder = _create_embedder()
+    if embedder is None:
+        raise RuntimeError("fast search requires an explicit (Voyage) embedder")
+    pool = max(int(max_results) * 2, int(max_results))
+    vector_query, bm25_query = fast_search_leg_queries(pool)
+    began = time.monotonic()
+    qvec = await embedder.create(input_data=[query.replace("\n", " ")])
+    embed_ms = (time.monotonic() - began) * 1000
+
+    vector_ms, vector_plan = await asyncio.to_thread(
+        _profile_read, graph, vector_query, {"q": qvec, "group_id": graph_name}
+    )
+    safe_q = _lucene_sanitize(query)
+    if safe_q:
+        bm25_ms, bm25_plan = await asyncio.to_thread(
+            _profile_read, graph, bm25_query, {"query": safe_q, "group_id": graph_name}
+        )
+    else:
+        bm25_ms, bm25_plan = 0.0, ["(no searchable terms after sanitising)"]
+    return {
+        "graph_name": graph_name,
+        "pool": pool,
+        "embed_ms": round(embed_ms),
+        "vector": {"ms": round(vector_ms), "query": vector_query, "plan": vector_plan},
+        "bm25": {"ms": round(bm25_ms), "query": bm25_query, "plan": bm25_plan},
+    }
 
 
 async def search_with_path(
