@@ -675,8 +675,22 @@ async def get_client_for_graph(graph_name: str) -> Graphiti:
     return _clients[graph_name]
 
 
+def forget_graph_indexes(graph_name: str) -> None:
+    """Forget every "index already ensured" mark for a graph, on both paths.
+
+    See indexed_falkor.forget_graph. The search path keeps its own mark for
+    RELATES_TO.fact_embedding; a recreated graph needs that one ensured again
+    too, or the fast search raises and falls back to the hybrid scan.
+    """
+    from app.services.indexed_falkor import forget_graph  # noqa: PLC0415
+
+    _edge_vindex_ensured.discard(graph_name)
+    forget_graph(graph_name)
+
+
 async def evict_graph(graph_name: str) -> None:
     """Drop a cached client by graph name; a broken pool must not be reused."""
+    forget_graph_indexes(graph_name)
     client = _clients.pop(graph_name, None)
     if client is None:
         return
@@ -786,6 +800,7 @@ async def reset_graph(client_slug: str) -> dict[str, Any]:
         redis_client = driver.client if hasattr(driver, "client") else driver._client
         try:
             redis_client.execute_command("GRAPH.DELETE", graph_name)
+            forget_graph_indexes(graph_name)
             logger.info(f"[graphiti] GRAPH.DELETE {graph_name} succeeded")
         except Exception as del_err:
             # If the graph doesn't exist yet, GRAPH.DELETE errors. That's fine

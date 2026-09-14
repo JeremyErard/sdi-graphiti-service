@@ -101,6 +101,20 @@ async def ensure_node_vector_index_via(executor: Any, group_key: str, dim: int) 
 _edge_vindex_ensured_via: set[str] = set()
 
 
+def forget_graph(graph_name: str) -> None:
+    """Drop the "index already ensured" memory for a graph that no longer exists.
+
+    The ensures run once per process per graph name. A graph deleted and
+    recreated under the same name in one process (a scratch rehearsal, an
+    admin reset) came back without its vector indexes, the ensures were
+    skipped, and FalkorDB rejected every index query with "Attempted to
+    access undefined attribute" until the process restarted (live,
+    2026-09-14 17:15Z). Every graph delete must call this.
+    """
+    _node_vindex_ensured.discard(graph_name)
+    _edge_vindex_ensured_via.discard(graph_name)
+
+
 async def ensure_edge_vector_index_via(executor: Any, group_key: str, dim: int) -> None:
     """Ensure the RELATES_TO.fact_embedding HNSW index over an open connection.
 

@@ -141,6 +141,7 @@ async def delete_graph(req: DeleteGraphRequest):
         try:
             graph.delete()
             logger.warning(f"[graphiti] Graph deleted via falkordb-py: {graph_name}")
+            gc.forget_graph_indexes(graph_name)
         except Exception as del_err:
             # Most common reason for delete to error: graph already gone.
             logger.info(f"[graphiti] graph.delete() {graph_name}: {del_err} (likely already absent)")
