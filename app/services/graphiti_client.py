@@ -971,10 +971,15 @@ def _ensure_edge_vector_index(graph, graph_name: str) -> None:
 # smoother. The exact value barely changes the top-K. Kept explicit for clarity.
 _RRF_K = 60
 
-# Join the index-procedure relationship back to its endpoints. The relationship
-# procedures do not otherwise put endpoint nodes in scope.
-_EDGE_MATCH = (
-    "MATCH (a:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(b:Entity) "
+# Put the yielded relationship's endpoints in scope WITHOUT a join. The
+# former `MATCH (a:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(b:Entity)` was
+# planned by FalkorDB as a full Entity label scan per yielded row with an
+# edge-index probe for each (profiled 2026-09-14 on client_pokagon: the
+# procedure answered 20 rows in 0.5 ms, the join took 1,649 ms and touched
+# 116,380 nodes; about 80 ms per candidate, linear in the pool). startNode
+# and endNode read the endpoints off the relationship itself.
+_EDGE_ENDPOINTS = (
+    "WITH e, score, startNode(e) AS a, endNode(e) AS b "
     "WHERE e.group_id = $group_id "
 )
 _EDGE_RETURN = (
@@ -983,7 +988,24 @@ _EDGE_RETURN = (
     "e.episodes AS episodes, e.valid_at AS va, e.invalid_at AS ia, "
     "e.expired_at AS ea"
 )
-_EDGE_MATCH_RETURN = _EDGE_MATCH + _EDGE_RETURN
+_EDGE_ENDPOINTS_RETURN = _EDGE_ENDPOINTS + _EDGE_RETURN
+
+
+def fulltext_query_for(query: str, graph_name: str) -> str:
+    """The RediSearch query for the BM25 leg, in graphiti's own form.
+
+    graphiti builds `(@group_id:"<graph>") (term | term | ...)`: an OR of the
+    question's terms under the group filter, stopwords dropped, specials
+    escaped. The leg used to send the bare sanitised phrase, which RediSearch
+    reads as an AND of every term; no fact contains all nine words of a real
+    question, so the leg matched nothing (profiled 2026-09-14: the procedure
+    produced 0 records for every question) and the fast path was vector-only.
+    """
+    from graphiti_core.driver.falkordb.operations.search_ops import (  # noqa: PLC0415
+        _build_falkor_fulltext_query,
+    )
+
+    return _build_falkor_fulltext_query(query, [graph_name])
 
 
 def fast_search_leg_queries(pool: int) -> tuple[str, str]:
@@ -995,13 +1017,13 @@ def fast_search_leg_queries(pool: int) -> tuple[str, str]:
     pool = int(pool)
     vector = (
         f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {pool}, vecf32($q)) "
-        f"YIELD relationship AS rel, score {_EDGE_MATCH_RETURN}"
+        f"YIELD relationship AS e, score {_EDGE_ENDPOINTS_RETURN}"
     )
     bm25 = (
         f"CALL db.idx.fulltext.queryRelationships('RELATES_TO', $query) "
-        f"YIELD relationship AS rel, score "
-        f"WITH rel, score ORDER BY score DESC LIMIT {pool * FULLTEXT_OVERFETCH} "
-        f"{_EDGE_MATCH}WITH a, e, b, score {_EDGE_RETURN} "
+        f"YIELD relationship AS e, score "
+        f"WITH e, score ORDER BY score DESC LIMIT {pool * FULLTEXT_OVERFETCH} "
+        f"{_EDGE_ENDPOINTS_RETURN} "
         f"ORDER BY score DESC LIMIT {pool}"
     )
     return vector, bm25
@@ -1114,7 +1136,7 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
         # group filter applies after the bound; the carrying WITH before RETURN
         # mirrors the proven query. Resilient: a parser hiccup or an exceeded
         # budget degrades to vector-only rather than failing the whole search.
-        safe_q = _lucene_sanitize(query)
+        safe_q = fulltext_query_for(query, graph_name)
         if not safe_q:
             return None
         budget = settings.search_bm25_timeout_ms
@@ -1235,7 +1257,7 @@ async def profile_fast_search(
             return PROFILE_LEG_TIMEOUT_SECONDS * 1000.0, [f"(exceeded the {PROFILE_LEG_TIMEOUT_SECONDS} s profile bound)"]
 
     vector_ms, vector_plan = await bounded(vector_query, {"q": qvec, "group_id": graph_name})
-    safe_q = _lucene_sanitize(query)
+    safe_q = fulltext_query_for(query, graph_name)
     if safe_q:
         bm25_ms, bm25_plan = await bounded(bm25_query, {"query": safe_q, "group_id": graph_name})
     else:

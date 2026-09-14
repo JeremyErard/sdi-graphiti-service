@@ -106,10 +106,11 @@ def test_the_bm25_leg_is_bounded_before_the_join_and_both_legs_carry_their_budge
     bm25 = graph.call("db.idx.fulltext.queryRelationships")
     assert bm25[1] == 2500
     q = " ".join(bm25[0].split())
-    bound = f"WITH rel, score ORDER BY score DESC LIMIT {10 * 2 * graphiti_client.FULLTEXT_OVERFETCH} MATCH (a:Entity)"
-    assert bound in q, "the bound must precede the join"
-    assert q.index("LIMIT") < q.index("MATCH (a:Entity)")
-    assert "WHERE e.group_id = $group_id WITH a, e, b, score RETURN" in q, "score is carried into the final ordering, as in the proven query"
+    bound = f"WITH e, score ORDER BY score DESC LIMIT {10 * 2 * graphiti_client.FULLTEXT_OVERFETCH} WITH e, score, startNode(e) AS a, endNode(e) AS b"
+    assert bound in q, "the bound must precede the endpoint projection"
+    assert q.index("LIMIT") < q.index("startNode(e)")
+    assert "{uuid: rel.uuid}" not in q and "MATCH (" not in q, "no join back to the endpoints: startNode/endNode read them off the relationship"
+    assert "WHERE e.group_id = $group_id RETURN" in q
     assert q.endswith("ORDER BY score DESC LIMIT 20"), "the caller's pool is still the final limit"
 
 

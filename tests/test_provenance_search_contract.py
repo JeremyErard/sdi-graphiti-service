@@ -1255,8 +1255,9 @@ def test_fast_query_joins_endpoints_and_projects_names_and_episodes(monkeypatch)
     assert edges[0].episodes == [EPISODE_ID]
     assert len(graph.calls) == 2
     for query, params in graph.calls:
-        assert "YIELD relationship AS rel, score" in query
-        assert "MATCH (a:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(b:Entity)" in query
+        assert "YIELD relationship AS e, score" in query
+        assert "startNode(e) AS a, endNode(e) AS b" in query
+        assert "{uuid: rel.uuid}" not in query
         assert "WHERE e.group_id = $group_id" in query
         assert "a.uuid AS src, a.name AS src_name" in query
         assert "b.uuid AS tgt, b.name AS tgt_name" in query

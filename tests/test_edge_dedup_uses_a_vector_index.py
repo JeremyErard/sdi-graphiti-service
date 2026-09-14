@@ -54,14 +54,15 @@ def test_it_queries_the_index_instead_of_scanning_every_edge():
     _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
     (q,) = _index_queries(ex)
     assert not any(SCAN in x for x in ex.queries), "a bare endpoint MATCH means it is still scanning"
-    assert "RELATES_TO {uuid: rel.uuid}" in q, "candidates are joined by uuid, not scanned"
+    assert "{uuid: rel.uuid}" not in q, "no join by uuid: it was planned as a label scan per candidate"
+    assert "WITH e, startNode(e) AS n, endNode(e) AS m" in q, "endpoints come from the relationship itself"
 
 
 def test_the_candidates_are_rescored_with_the_scan_cosine_and_the_procedure_score_is_not_used():
     ex = _Executor()
     _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"], limit=10)
     (q,) = _index_queries(ex)
-    assert "YIELD relationship AS rel, score AS index_score " in q, "every procedure field yielded, the score aliased away"
+    assert "YIELD relationship AS e, score AS index_score " in q, "every procedure field yielded, the score aliased away"
     assert "index_score" not in q.split("index_score ", 1)[1], "the procedure score is never used after the YIELD"
     assert "vec.cosineDistance(e.fact_embedding, vecf32($search_vector))" in q
     assert "WHERE score > $min_score" in q
@@ -76,7 +77,7 @@ def test_it_still_scopes_to_the_group():
     ex = _Executor()
     _search(IndexedFalkorSearchOperations(), ex, ["client_pokagon"])
     (q,) = _index_queries(ex)
-    assert "WHERE e.group_id IN $group_ids" in q
+    assert "WHERE score > $min_score AND e.group_id IN $group_ids" in q
     assert any(p.get("group_ids") == ["client_pokagon"] for p in ex.params)
 
 
