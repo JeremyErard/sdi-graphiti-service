@@ -35,6 +35,7 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.driver.record_parsers import entity_edge_from_record, entity_node_from_record
 from graphiti_core.models.nodes.node_db_queries import get_entity_node_return_query
 from graphiti_core.edges import EntityEdge
+from graphiti_core.graph_queries import get_vector_cosine_func_query
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.nodes import EntityNode
 
@@ -77,7 +78,12 @@ async def ensure_node_vector_index_via(executor: Any, group_key: str, dim: int) 
     """
     if group_key in _node_vindex_ensured:
         return
-    _node_vindex_ensured.add(group_key)  # mark first: one attempt, not one per call
+    # Marked AFTER the attempt: graphiti fans the dedup searches out
+    # concurrently, and a caller that found the key marked while the first
+    # CREATE was still in flight would query an index that does not exist yet
+    # and fall back to the scan. A duplicate CREATE from that burst only
+    # raises "already exists", which is caught below; after the burst it is
+    # one attempt per process.
     try:
         await executor.execute_query(
             f"CREATE VECTOR INDEX FOR (n:Entity) ON (n.name_embedding) "
@@ -89,6 +95,38 @@ async def ensure_node_vector_index_via(executor: Any, group_key: str, dim: int) 
         # "did the index get built?" could not be answered from the logs --
         # and that question was load-bearing while diagnosing the outage.
         logger.info(f"[graphiti] node vector index not created ({group_key}): {e}")
+    _node_vindex_ensured.add(group_key)
+
+
+_edge_vindex_ensured_via: set[str] = set()
+
+
+async def ensure_edge_vector_index_via(executor: Any, group_key: str, dim: int) -> None:
+    """Ensure the RELATES_TO.fact_embedding HNSW index over an open connection.
+
+    The search path ensures the same index per graph name through its own
+    handle (`graphiti_client._ensure_edge_vector_index`); the ingest path has
+    only the executor it is about to query with, so it ensures it here, once
+    per process, the way the Entity index is.
+    """
+    if group_key in _edge_vindex_ensured_via:
+        return
+    # Marked after the attempt, for the reason given on the Entity ensure.
+    try:
+        await executor.execute_query(
+            f"CREATE VECTOR INDEX FOR ()-[r:RELATES_TO]->() ON (r.fact_embedding) "
+            f"OPTIONS {{dimension:{int(dim)}, similarityFunction:'cosine'}}"
+        )
+        logger.info(f"[graphiti] created RELATES_TO.fact_embedding vector index ({group_key})")
+    except Exception as e:  # noqa: BLE001 - "already exists" is the common case
+        logger.info(f"[graphiti] edge vector index not created ({group_key}): {e}")
+    _edge_vindex_ensured_via.add(group_key)
+
+
+# How many candidates to take from a vector index before the post-filters
+# (group, min_score) apply. One graph holds one group, so a small factor keeps
+# recall; the index bounds the work either way.
+VECTOR_OVERFETCH = 4
 
 
 # How many extra fulltext hits to pull before filtering. The bound is applied
@@ -176,7 +214,7 @@ class _BoundedFulltextMixin:
 
 
 class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperations):
-    """FalkorSearchOperations, but entity dedup goes through the vector index."""
+    """FalkorSearchOperations, but entity and edge dedup go through the vector indexes."""
 
     async def node_similarity_search(
         self,
@@ -203,18 +241,27 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
         )
 
         try:
+            # The procedure's own score is yielded (every field, as the proven
+            # queries here do) but never used: its meaning (similarity or
+            # distance) this module does not depend on. The k candidates are
+            # re-scored with the same cosine expression graphiti's scan uses,
+            # so min_score and the ordering mean exactly what they mean there.
             gid_clause = " WHERE node.group_id IN $group_ids" if group_ids else ""
+            k = max(int(limit) * VECTOR_OVERFETCH, int(limit))
             cypher = (
-                f"CALL db.idx.vector.queryNodes('Entity', 'name_embedding', {int(limit)}, vecf32($search_vector)) "
-                f"YIELD node, score{gid_clause} "
-                f"WITH node AS n, score WHERE score > $min_score RETURN "
+                f"CALL db.idx.vector.queryNodes('Entity', 'name_embedding', {k}, vecf32($search_vector)) "
+                f"YIELD node, score AS index_score{gid_clause} "
+                "WITH node AS n, "
+                + get_vector_cosine_func_query("n.name_embedding", "$search_vector", GraphProvider.FALKORDB)
+                + " AS score WHERE score > $min_score RETURN "
                 + get_entity_node_return_query(GraphProvider.FALKORDB)
-                + " ORDER BY score DESC"
+                + " ORDER BY score DESC LIMIT $limit"
             )
             records, _, _ = await executor.execute_query(
                 cypher,
                 search_vector=search_vector,
                 min_score=min_score,
+                limit=int(limit),
                 **({"group_ids": group_ids} if group_ids else {}),
             )
         except Exception as e:  # noqa: BLE001 - no index / no vector support
@@ -225,16 +272,90 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
 
         return [entity_node_from_record(r) for r in records]
 
+    async def edge_similarity_search(
+        self,
+        executor: Any,
+        search_vector: list[float],
+        source_node_uuid: str | None,
+        target_node_uuid: str | None,
+        search_filter: Any,
+        group_ids: list[str] | None = None,
+        limit: int = 10,
+        min_score: float = 0.6,
+    ) -> list[EntityEdge]:
+        """Edge dedup through the RELATES_TO vector index instead of a full scan.
+
+        graphiti's edge resolution runs, per extracted edge, a cosine over EVERY
+        RELATES_TO in the group (`MATCH (n)-[e]->(m) ... vec.cosineDistance(
+        e.fact_embedding, ...)`), dozens of times per episode. On client_pokagon
+        at 25.9k edges (2026-09-14) those scans are what queue the service's
+        own searches past their budget while an ingest runs. The search path
+        has used the HNSW index since the 7k-edge days; this gives the ingest
+        path the same treatment, with the same fallback discipline.
+
+        Only the plain group-scoped call is rerouted, which is the one graphiti
+        makes (source and target None, no filters). An endpoint-constrained
+        call is already bounded by the Entity.uuid index on the scan path.
+        """
+        if _has_filters(search_filter) or source_node_uuid is not None or target_node_uuid is not None:
+            return await super().edge_similarity_search(
+                executor, search_vector, source_node_uuid, target_node_uuid,
+                search_filter, group_ids, limit, min_score,
+            )
+
+        from app.config import settings  # noqa: PLC0415 - avoids an import cycle
+
+        await ensure_edge_vector_index_via(
+            executor, group_ids[0] if group_ids else "*", int(settings.embedding_dim)
+        )
+
+        try:
+            gid_clause = " WHERE e.group_id IN $group_ids" if group_ids else ""
+            k = max(int(limit) * VECTOR_OVERFETCH, int(limit))
+            cypher = (
+                f"CALL db.idx.vector.queryRelationships('RELATES_TO', 'fact_embedding', {k}, vecf32($search_vector)) "
+                "YIELD relationship AS rel, score AS index_score "
+                "MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)"
+                + gid_clause
+                + " WITH e, n, m, "
+                + get_vector_cosine_func_query("e.fact_embedding", "$search_vector", GraphProvider.FALKORDB)
+                + " AS score WHERE score > $min_score RETURN "
+                + get_entity_edge_return_query(GraphProvider.FALKORDB)
+                + " ORDER BY score DESC LIMIT $limit"
+            )
+            records, _, _ = await executor.execute_query(
+                cypher,
+                search_vector=search_vector,
+                min_score=min_score,
+                limit=int(limit),
+                **({"group_ids": group_ids} if group_ids else {}),
+            )
+        except Exception as e:  # noqa: BLE001 - no index / no vector support
+            logger.info(f"[graphiti] edge vector search unavailable, falling back to scan: {e}")
+            return await super().edge_similarity_search(
+                executor, search_vector, source_node_uuid, target_node_uuid,
+                search_filter, group_ids, limit, min_score,
+            )
+
+        return [entity_edge_from_record(r) for r in records]
+
 
 def _has_filters(search_filter: Any) -> bool:
-    """True when the caller asked for more than a group scope."""
+    """True when the caller asked for more than a group scope.
+
+    Any field the caller set counts, an empty list included: graphiti's filter
+    constructors test `is not None`, so `SearchFilters(edge_uuids=[])` means
+    "none of the edges" (its related-edges search for a node pair with no
+    edges yet), not "no filter". Reading it as no filter would hand the
+    duplicate resolver the nearest edges of the whole graph.
+    """
     if search_filter is None:
         return False
     try:
         data = search_filter.model_dump(exclude_none=True)
     except Exception:  # noqa: BLE001 - not a pydantic model
         return True
-    return any(v for v in data.values())
+    return bool(data)
 
 
 class IndexedFalkorDriver(FalkorDriver):
