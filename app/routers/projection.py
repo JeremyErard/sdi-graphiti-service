@@ -50,14 +50,20 @@ from app.auth import GraphPrincipal, require_scope
 from app.config import settings
 from app.graph_names import graph_name_for_client
 from app.models.projection import (
+    POINTER_ANCHOR_KIND,
+    POINTER_RECORD_KINDS,
     PROJECTION_NODE_LABEL,
     PROJECTION_RECEIPT_LABEL,
+    RECORD_SET_COUNTED_AT,
+    RECORD_TEXT_PROPERTY,
+    SOURCE_KIND_NODE_LABEL,
     FindingLifecycle,
     ProjectionEdgeOp,
     ProjectionEnvelopeV2,
     ProjectionNodeOp,
     ProjectionOrigin,
     ProjectionRelation,
+    ProjectionSourceKind,
     canonical_json,
     operation_hash,
     relation_endpoint_error,
@@ -514,8 +520,48 @@ def _edge_row(
     }
 
 
+# Kinds whose nodes are restated in place on every run. A record of an approved
+# version is written once under an id that carries its version and never
+# touched again. A summary is the opposite: one node for each thing counted,
+# restated with the current count by every run that counts, so nothing is left
+# behind to pile up in the indexes. Restating replaces the whole property map,
+# which would throw away the node's vector every night; it is kept when, and
+# only when, the statement still says exactly what the vector was made from.
+RESTATED_IN_PLACE_LABELS = frozenset(
+    SOURCE_KIND_NODE_LABEL[kind]
+    for pointer, kinds in POINTER_RECORD_KINDS.items()
+    if POINTER_ANCHOR_KIND[pointer] is ProjectionSourceKind.RECORD_SET
+    for kind in kinds
+)
+# The record set of such a kind is written before anything else in its envelope,
+# however the envelope orders them. A summary keeps its id from one run to the
+# next, so "records first, pointer last" (right for records that are new nodes
+# every version) would be the wrong way round here: until the pointer moved,
+# and for as long as a write that stopped half-way was left, the only summaries
+# still matching the old pointer would be the ones the new run no longer makes,
+# which are the ones no longer true. Pointer first, nothing is served until it
+# has been restated by this run.
+POINTER_FIRST_LABELS = frozenset(
+    SOURCE_KIND_NODE_LABEL[POINTER_ANCHOR_KIND[pointer]]
+    for pointer, kinds in POINTER_RECORD_KINDS.items()
+    if any(SOURCE_KIND_NODE_LABEL[kind] in RESTATED_IN_PLACE_LABELS for kind in kinds)
+)
+# A record set says when its summaries were counted, and retrieval serves them
+# for a few days after that. A time far ahead (milliseconds sent as seconds, a
+# clock set wrong) would be served for good, so it is refused when written.
+COUNTED_AT_AHEAD_SECONDS = 24 * 3600
+
+
 def _node_apply_query(type_label: str) -> str:
     """MERGE on the exact identity, then restate the full property map.
+
+    For a kind that is restated in place (RESTATED_IN_PLACE_LABELS) what the
+    embedding pass wrote on the node survives the restatement when its
+    statement has not changed: its vector, or the mark that says the provider
+    refused this statement (without it a refused statement would be asked
+    again every night). Both are read before any row of the batch is written,
+    so this relies on a node appearing once in a batch, which the envelope
+    model enforces (a repeated node_id is refused before anything is written).
 
     The MERGE key is the constant projection label plus the tenant, engagement,
     and caller-supplied uuid. Identity therefore does not depend on the node's
@@ -524,6 +570,22 @@ def _node_apply_query(type_label: str) -> str:
     inlined because Cypher cannot parameterize a label; it is never caller text,
     it is the fixed label this service maps the declared source kind to.
     """
+    if type_label in RESTATED_IN_PLACE_LABELS:
+        return (
+            "UNWIND $rows AS row "
+            f"MERGE (n:{PROJECTION_NODE_LABEL} {{uuid: row.node_id, "
+            "group_id: $group_id, engagement_id: $engagement_id}) "
+            f"WITH n, row, n.{RECORD_TEXT_PROPERTY} AS said, n.text_embedding AS vector, n.text_emb_model AS model, "
+            "n.text_emb_failed AS failed, n.text_emb_failed_at AS failed_at "
+            f"SET n:{type_label} "
+            "SET n = row.props "
+            "WITH n, row, said, vector, model, failed, failed_at "
+            f"FOREACH (_ IN CASE WHEN vector IS NOT NULL AND said = row.props.{RECORD_TEXT_PROPERTY} THEN [1] ELSE [] END | "
+            "SET n.text_embedding = vector, n.text_emb_model = model) "
+            f"FOREACH (_ IN CASE WHEN failed IS NOT NULL AND said = row.props.{RECORD_TEXT_PROPERTY} THEN [1] ELSE [] END | "
+            "SET n.text_emb_failed = failed, n.text_emb_failed_at = failed_at) "
+            "RETURN count(n) AS applied"
+        )
     return (
         "UNWIND $rows AS row "
         f"MERGE (n:{PROJECTION_NODE_LABEL} {{uuid: row.node_id, "
@@ -969,6 +1031,33 @@ async def apply_projection_v2(
             "once the lane is switched on",
         )
 
+    for op in envelope.node_ops:
+        counted_at = op.properties.get(RECORD_SET_COUNTED_AT)
+        if (
+            op.source.kind is ProjectionSourceKind.RECORD_SET
+            and isinstance(counted_at, int)
+            and not isinstance(counted_at, bool)
+            and counted_at > int(time.time()) + COUNTED_AT_AHEAD_SECONDS
+        ):
+            raise _fail(
+                422,
+                f"record set '{op.node_id}' says its summaries were counted at a time more than a day "
+                f"ahead of this service's clock ('{RECORD_SET_COUNTED_AT}' is whole seconds since 1970 "
+                "UTC, not milliseconds); a time that far ahead would be served as current for good",
+            )
+
+    if envelope.carries_summaries() and not (
+        settings.projection_v2_allow_summaries and settings.projection_v2_allow_process_structure
+    ):
+        raise _fail(
+            422,
+            "summary projection (a statement counted from an engagement's approved "
+            "records, the record set of that engagement and its pointer to the "
+            "summaries in force) is not authorized on this deployment in this "
+            "phase; set PROJECTION_V2_ALLOW_SUMMARIES, with "
+            "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE, once the lane is switched on",
+        )
+
     envelope_hash = envelope.canonical_hash()
     scope = {"group_id": graph_name, "engagement_id": envelope.engagement_id}
     receipt_key = {**scope, "operation_id": envelope.operation_id}
@@ -1097,7 +1186,9 @@ async def apply_projection_v2(
         node_rows_all = [row for rows in grouped_nodes.values() for row in rows]
 
         nodes_written = 0
-        for type_label, rows in grouped_nodes.items():
+        # In the order the kinds first appear, except that a pointer that must move first does (the sort keeps
+        # the rest as they were).
+        for type_label, rows in sorted(grouped_nodes.items(), key=lambda group: group[0] not in POINTER_FIRST_LABELS):
             statement = _node_apply_query(type_label)
             for chunk in _chunks(rows, APPLY_CHUNK_ROWS):
                 result = await _query(graph, statement, params={**scope, "rows": chunk})

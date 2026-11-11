@@ -1063,19 +1063,27 @@ def test_graphiti_owned_labels_cannot_be_written_because_labels_are_not_caller_s
 
 def test_every_declared_source_kind_is_classified_into_exactly_one_phase():
     kinds = set(pm.ProjectionSourceKind)
-    phases = [pm.P2_PRIME_SOURCE_KINDS, pm.PROCESS_STRUCTURE_SOURCE_KINDS, pm.P3_SOURCE_KINDS]
+    phases = [pm.P2_PRIME_SOURCE_KINDS, pm.PROCESS_STRUCTURE_SOURCE_KINDS, pm.P3_SOURCE_KINDS, pm.SUMMARY_SOURCE_KINDS]
     assert frozenset().union(*phases) == kinds
     assert sum(len(phase) for phase in phases) == len(kinds)
     assert set(pm.SOURCE_KIND_NODE_LABEL) == kinds
     assert len(set(pm.SOURCE_KIND_NODE_LABEL.values())) == len(kinds)
     assert {pm.SOURCE_KIND_NODE_LABEL[k] for k in pm.P3_SOURCE_KINDS} <= pm.P3_NODE_LABELS
-    assert pm.RECORD_RULE_SOURCE_KINDS == pm.PROCESS_STRUCTURE_SOURCE_KINDS | pm.P3_SOURCE_KINDS
+    assert pm.RECORD_RULE_SOURCE_KINDS == pm.PROCESS_STRUCTURE_SOURCE_KINDS | pm.P3_SOURCE_KINDS | pm.SUMMARY_SOURCE_KINDS
     assert pm.VERSIONED_RECORD_KINDS < pm.RECORD_RULE_SOURCE_KINDS
     assert pm.P3_SOURCE_KINDS < pm.VERSIONED_RECORD_KINDS
+    # Every summary is a record of a version; the record set that points at them is not.
+    assert pm.SUMMARY_SOURCE_KINDS - pm.VERSIONED_RECORD_KINDS == {pm.ProjectionSourceKind.RECORD_SET}
+    # Every pointer has its records and the one kind of node that carries it, and every
+    # versioned record kind is put in force by exactly one pointer.
+    assert set(pm.POINTER_RECORD_KINDS) == set(pm.POINTER_ANCHOR_KIND) == set(pm.CURRENT_VERSION_PROPERTIES)
+    served = [kind for kinds_ in pm.POINTER_RECORD_KINDS.values() for kind in kinds_]
+    assert sorted(served, key=lambda k: k.value) == sorted(pm.VERSIONED_RECORD_KINDS, key=lambda k: k.value)
+    assert {pointer for pointer, anchor in pm.POINTER_ANCHOR_KIND.items() if anchor is pm.ProjectionSourceKind.RECORD_SET} == {"current_summary_version_id"}
     assert set(pm.RELATION_ENDPOINT_KINDS) == set(pm.ProjectionRelation)
     # Every relation belongs to exactly one lane, so each lane's switch covers its own edges.
     finding_relations = {pm.ProjectionRelation.DERIVED_FROM, pm.ProjectionRelation.ATTESTED_BY}
-    lanes = [finding_relations, set(pm.PROCESS_STRUCTURE_RELATIONS), set(pm.RACI_RELATIONS)]
+    lanes = [finding_relations, set(pm.PROCESS_STRUCTURE_RELATIONS), set(pm.RACI_RELATIONS), set(pm.SUMMARY_RELATIONS)]
     assert set().union(*lanes) == set(pm.ProjectionRelation)
     assert sum(len(lane) for lane in lanes) == len(pm.ProjectionRelation)
     # What is still refused by name is not also admitted.
@@ -2446,3 +2454,321 @@ def test_the_structure_lane_is_as_it_was_with_the_chart_lane_on(store, client, l
     assert apply(client, structure_envelope()).status_code == 200
     by_id = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
     assert by_id["wf-1"].get("current_raci_version_id") is None and by_id["wf-1"]["current_map_version_id"] == "pv-3"
+
+
+# ==========================================================================
+# Summaries: statements counted by code from an engagement's approved records
+# ==========================================================================
+
+
+@pytest.fixture
+def summaries_on(monkeypatch):
+    monkeypatch.setattr(settings, "projection_v2_allow_summaries", True, raising=False)
+
+
+COUNTED_AT = 1_790_000_000
+
+
+def record_set_envelope(**overrides):
+    """Two summaries of an engagement's approved records and the engagement's record set pointing at them."""
+    node_ops = overrides.pop(
+        "node_ops",
+        [
+            structure_op("set-1:dept:receiving", "RECORD_SET_SUMMARY", version="sum-1", workflow="set-1", properties={"text": "The Receiving department has 3 approved SOPs: A; B; C.", "count": 3, "names": ["A", "B", "C"]}),
+            structure_op("set-1:months", "RECORD_SET_SUMMARY", version="sum-1", workflow="set-1", properties={"text": "SOPs approved by month: March 2026: 2; April 2026: 1."}),
+            structure_op("set-1", "RECORD_SET", version="set-1@a", workflow=None, properties={"name": "Approved records", "current_summary_version_id": "sum-1", "counted_at": COUNTED_AT}),
+        ],
+    )
+    edge_ops = overrides.pop(
+        "edge_ops",
+        [
+            edge_op("e-sum-1", relation="SUMMARIZES", from_id="set-1:dept:receiving", to_id="set-1"),
+            edge_op("e-sum-2", relation="SUMMARIZES", from_id="set-1:months", to_id="set-1"),
+        ],
+    )
+    return envelope(node_ops=node_ops, edge_ops=edge_ops, **overrides)
+
+
+SUMMARY_ALONE = {
+    "a summary alone": lambda: envelope(node_ops=[structure_op("set-1:months", "RECORD_SET_SUMMARY", version="sum-1", workflow="set-1", properties={"text": "By month: 2."})]),
+    "a record set alone": lambda: envelope(node_ops=[structure_op("set-1", "RECORD_SET", version="set-1@a", workflow=None, properties={"name": "Approved records"})]),
+    "a record set that points at summaries": lambda: envelope(node_ops=[structure_op("set-1", "RECORD_SET", version="set-1@a", workflow=None, properties={"current_summary_version_id": "sum-1", "counted_at": COUNTED_AT})]),
+    "a summary edge alone": lambda: envelope(edge_ops=[edge_op("e-sum-1", relation="SUMMARIZES", from_id="set-1:months", to_id="set-1")]),
+}
+SUMMARY_BUILDS = [record_set_envelope, *SUMMARY_ALONE.values()]
+SUMMARY_IDS = ["with its record set", *SUMMARY_ALONE]
+
+
+@pytest.mark.parametrize("build", SUMMARY_BUILDS, ids=SUMMARY_IDS)
+def test_a_summary_is_refused_until_its_lane_is_switched_on(build, store, client, lane_on):
+    response = apply(client, build())
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_SUMMARIES" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+@pytest.mark.parametrize("build", SUMMARY_BUILDS, ids=SUMMARY_IDS)
+def test_the_summary_lane_needs_the_structure_lane_too(build, store, client, summaries_on):
+    # None of these carries a process-structure kind, so only the summary lane's own check can stop them.
+    response = apply(client, build())
+    assert response.status_code == 422
+    said = json.dumps(response.json())
+    assert "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE" in said and "PROJECTION_V2_ALLOW_SUMMARIES" in said
+    assert store.mutating_queries() == []
+
+
+def test_summaries_apply_and_the_record_set_points_at_them(store, client, lane_on, summaries_on):
+    response = apply(client, record_set_envelope())
+    assert response.status_code == 200, response.json()
+    assert response.json()["nodes_applied"] == 3 and response.json()["edges_applied"] == 2
+    labels = {node["props"]["uuid"]: sorted(set(node["labels"]) - {pm.PROJECTION_NODE_LABEL}) for node in store.nodes.values()}
+    assert labels == {"set-1": ["RecordSet"], "set-1:dept:receiving": ["RecordSetSummary"], "set-1:months": ["RecordSetSummary"]}
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert props["set-1"]["current_summary_version_id"] == "sum-1" and props["set-1"]["counted_at"] == COUNTED_AT
+    assert {props[n]["projection_source_version_id"] for n in ("set-1:dept:receiving", "set-1:months")} == {"sum-1"}
+    assert {props[n]["workflow_node_id"] for n in ("set-1:dept:receiving", "set-1:months")} == {"set-1"}
+    assert props["set-1:dept:receiving"]["count"] == 3 and props["set-1:dept:receiving"]["names"] == ["A", "B", "C"]
+
+
+def test_sending_the_same_summaries_again_replays_and_writes_nothing(store, client, lane_on, summaries_on):
+    assert apply(client, record_set_envelope()).status_code == 200
+    before = store.snapshot()
+    again = apply(client, record_set_envelope())
+    assert again.status_code == 200 and again.json()["replay"] is True and again.json()["applied"] is False
+    assert store.snapshot() == before
+
+
+def test_a_summary_names_its_record_set_and_each_pointer_sits_only_on_its_own_kind_of_node(store, client, lane_on, summaries_on):
+    adrift = record_set_envelope()
+    del adrift["node_ops"][0]["properties"]["workflow_node_id"]
+    response = apply(client, adrift)
+    assert response.status_code == 422 and "must name its workflow node" in json.dumps(response.json())
+
+    # A workflow cannot say which summaries are in force...
+    on_a_workflow = envelope(node_ops=[structure_op("wf-1", "WORKFLOW", version="wf-1@b", workflow=None, properties={"name": "Receiving", "current_summary_version_id": "sum-1"})])
+    response = apply(client, on_a_workflow)
+    assert response.status_code == 422 and "'current_summary_version_id' says which version is in force and is only carried by a RECORD_SET node, not by a WORKFLOW node" in json.dumps(response.json())
+
+    # ...a record set cannot say which map, SOP or chart is in force...
+    for pointer in ("current_map_version_id", "current_sop_version_id", "current_raci_version_id"):
+        on_a_set = record_set_envelope()
+        on_a_set["node_ops"][2]["properties"][pointer] = "pv-3"
+        response = apply(client, on_a_set)
+        assert response.status_code == 422 and f"'{pointer}' says which version is in force and is only carried by a WORKFLOW node, not by a RECORD_SET node" in json.dumps(response.json())
+
+    # ...and no summary carries a pointer at all.
+    pointing = record_set_envelope()
+    pointing["node_ops"][0]["properties"]["current_summary_version_id"] = "sum-1"
+    response = apply(client, pointing)
+    assert response.status_code == 422 and "only carried by a RECORD_SET node, not by a RECORD_SET_SUMMARY node" in json.dumps(response.json())
+
+    # A record set is not a record of a version and does not name a workflow.
+    named = record_set_envelope()
+    named["node_ops"][2]["properties"]["workflow_node_id"] = "wf-1"
+    response = apply(client, named)
+    assert response.status_code == 422 and "is only carried by records of an approved version, not by a RECORD_SET node" in json.dumps(response.json())
+
+    blank = record_set_envelope()
+    blank["node_ops"][0]["properties"]["text"] = "   "
+    response = apply(client, blank)
+    assert response.status_code == 422 and "must be a non-empty string" in json.dumps(response.json())
+    assert store.nodes == {}
+
+
+@pytest.mark.parametrize(
+    "extra, edge, message",
+    [
+        (("wf-1", "WORKFLOW", "wf-1@b", None), ("SUMMARIZES", "set-1:months", "wf-1"), "relation SUMMARIZES ends at a WORKFLOW node; it must end at a RECORD_SET node"),
+        (("pv-3", "PROCESS_VERSION", "pv-3", "wf-1"), ("SUMMARIZES", "set-1:months", "pv-3"), "relation SUMMARIZES ends at a PROCESS_VERSION node; it must end at a RECORD_SET node"),
+        (None, ("SUMMARIZES", "set-1", "set-1:months"), "relation SUMMARIZES starts at a RECORD_SET node; it must start at a RECORD_SET_SUMMARY node"),
+        (None, ("SUMMARIZES", "set-1:months", "set-1:dept:receiving"), "relation SUMMARIZES ends at a RECORD_SET_SUMMARY node; it must end at a RECORD_SET node"),
+        (("pv-3", "PROCESS_VERSION", "pv-3", "wf-1"), ("HAS_STEP", "pv-3", "set-1:months"), "relation HAS_STEP ends at a RECORD_SET_SUMMARY node"),
+        (("wf-1", "WORKFLOW", "wf-1@b", None), ("VERSION_OF", "set-1", "wf-1"), "relation VERSION_OF starts at a RECORD_SET node; it must start at a PROCESS_VERSION node"),
+    ],
+)
+def test_a_summary_edge_joins_a_summary_to_its_record_set_and_nothing_else(extra, edge, message, store, client, lane_on, summaries_on):
+    relation, from_id, to_id = edge
+    body = record_set_envelope()
+    if extra:
+        node_id, kind, version, workflow = extra
+        body["node_ops"].append(structure_op(node_id, kind, version=version, workflow=workflow, properties={"name": "Receiving"} if kind == "WORKFLOW" else {"text": "Version 3 of the map was approved."}))
+    body["edge_ops"].append(edge_op("e-wrong", relation=relation, from_id=from_id, to_id=to_id))
+    response = apply(client, body)
+    assert response.status_code == 422, response.json()
+    assert message in json.dumps(response.json())
+    assert store.nodes == {}
+
+
+@pytest.mark.parametrize("counted_at", ["absent", None, 0, -5, 1.5, "1790000000", True, [COUNTED_AT]])
+def test_a_record_set_that_points_at_summaries_must_say_when_they_were_counted(counted_at, store, client, lane_on, summaries_on):
+    body = record_set_envelope()
+    if counted_at == "absent":
+        del body["node_ops"][2]["properties"]["counted_at"]
+    else:
+        body["node_ops"][2]["properties"]["counted_at"] = counted_at
+    response = apply(client, body)
+    assert response.status_code == 422, response.json()
+    assert "must say when they were counted in 'counted_at'" in json.dumps(response.json())
+    assert store.nodes == {}
+
+
+def test_a_record_set_that_points_at_nothing_needs_no_time_and_takes_its_summaries_out_of_force(store, client, lane_on, summaries_on):
+    assert apply(client, record_set_envelope()).status_code == 200
+    without = envelope(operation_id="op-2", ordinal=1, node_ops=[structure_op("set-1", "RECORD_SET", version="set-1@b", workflow=None, properties={"name": "Approved records"})])
+    response = apply(client, without)
+    assert response.status_code == 200, response.json()
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert props["set-1"].get("current_summary_version_id") is None and props["set-1"].get("counted_at") is None
+
+
+@pytest.mark.parametrize("ahead, refused", [(0, False), (3600, False), (2 * 24 * 3600, True), ("milliseconds", True)])
+def test_a_counting_time_far_ahead_of_the_clock_is_refused(ahead, refused, store, client, lane_on, summaries_on):
+    # Milliseconds sent as seconds, or a clock set wrong, would be served as current for good.
+    now = int(time.time())
+    body = record_set_envelope()
+    body["node_ops"][2]["properties"]["counted_at"] = now * 1000 if ahead == "milliseconds" else now + ahead
+    response = apply(client, body)
+    if refused:
+        assert response.status_code == 422 and "more than a day ahead of this service's clock" in json.dumps(response.json())
+        assert store.nodes == {}
+    else:
+        assert response.status_code == 200, response.json()
+
+
+def test_a_summary_is_restated_in_place_and_keeps_its_vector_only_while_it_says_the_same_thing():
+    from app.routers import projection as route
+
+    assert route.RESTATED_IN_PLACE_LABELS == {"RecordSetSummary"}
+    assert route.COUNTED_AT_AHEAD_SECONDS == 24 * 3600
+    # Word for word: the node is found by its exact identity, its statement and vector are read before the
+    # whole property map is replaced, and the vector is put back only if the statement has not changed.
+    assert route._node_apply_query("RecordSetSummary") == (
+        "UNWIND $rows AS row "
+        "MERGE (n:ProjectionNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) "
+        "WITH n, row, n.text AS said, n.text_embedding AS vector, n.text_emb_model AS model, "
+        "n.text_emb_failed AS failed, n.text_emb_failed_at AS failed_at "
+        "SET n:RecordSetSummary "
+        "SET n = row.props "
+        "WITH n, row, said, vector, model, failed, failed_at "
+        "FOREACH (_ IN CASE WHEN vector IS NOT NULL AND said = row.props.text THEN [1] ELSE [] END | "
+        "SET n.text_embedding = vector, n.text_emb_model = model) "
+        # The mark that says the provider refused this statement is kept on the same terms, or a refused
+        # statement would be asked again by every night's run.
+        "FOREACH (_ IN CASE WHEN failed IS NOT NULL AND said = row.props.text THEN [1] ELSE [] END | "
+        "SET n.text_emb_failed = failed, n.text_emb_failed_at = failed_at) "
+        "RETURN count(n) AS applied"
+    )
+    # Every other kind is written exactly as it always was: restated whole, nothing carried over.
+    for label in sorted(set(pm.SOURCE_KIND_NODE_LABEL.values()) - route.RESTATED_IN_PLACE_LABELS):
+        assert route._node_apply_query(label) == (
+            "UNWIND $rows AS row "
+            "MERGE (n:ProjectionNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) "
+            f"SET n:{label} "
+            "SET n = row.props "
+            "RETURN count(n) AS applied"
+        )
+
+
+def _node_writes(store):
+    """The type label of each node write the store received, in the order it received them."""
+    return [re.search(r"SET n:(\w+) ", q).group(1) for q, _ in store.queries if q.startswith("UNWIND $rows AS row MERGE (n:")]
+
+
+def _second_count(operation_id="op-2", ordinal=1):
+    """The next run's counts: one statement restated, one no longer made, and the pointer moved on."""
+    return envelope(
+        operation_id=operation_id,
+        ordinal=ordinal,
+        node_ops=[
+            structure_op("set-1:dept:receiving", "RECORD_SET_SUMMARY", version="sum-2", workflow="set-1", properties={"text": "The Receiving department has 2 approved SOPs: A; B.", "count": 2}),
+            structure_op("set-1", "RECORD_SET", version="set-1@b", workflow=None, properties={"name": "Approved records", "current_summary_version_id": "sum-2", "counted_at": COUNTED_AT + 60}),
+        ],
+        edge_ops=[edge_op("e-sum-1", relation="SUMMARIZES", from_id="set-1:dept:receiving", to_id="set-1")],
+    )
+
+
+def _in_force(store):
+    """The summaries whose version is the one the record set points at: what retrieval would serve."""
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    pointer = props["set-1"].get("current_summary_version_id")
+    return sorted(uuid for uuid, p in props.items() if p.get("projection_source_kind") == "RECORD_SET_SUMMARY" and p["projection_source_version_id"] == pointer)
+
+
+def test_the_record_set_is_written_before_its_summaries_however_the_envelope_orders_them(store, client, lane_on, summaries_on):
+    from app.routers import projection as route
+
+    assert route.POINTER_FIRST_LABELS == {"RecordSet"}
+    # Sent with the summaries first and the record set last...
+    assert [op["source"]["kind"] for op in record_set_envelope()["node_ops"]] == ["RECORD_SET_SUMMARY", "RECORD_SET_SUMMARY", "RECORD_SET"]
+    assert apply(client, record_set_envelope()).status_code == 200
+    # ...and written the other way round.
+    assert _node_writes(store) == ["RecordSet", "RecordSetSummary"]
+
+
+def test_every_other_lane_is_still_written_in_the_order_it_was_sent(store, client, lane_on, raci_on, summaries_on):
+    # A workflow's pointer goes last, after the records of the version it names: those are new nodes, and
+    # must be there before anything points at them.
+    sent = structure_envelope()
+    order = list(dict.fromkeys(pm.SOURCE_KIND_NODE_LABEL[pm.ProjectionSourceKind(op["source"]["kind"])] for op in sent["node_ops"]))
+    assert apply(client, sent).status_code == 200
+    assert _node_writes(store) == order and "RecordSet" not in order
+
+
+def test_a_write_that_stops_half_way_leaves_no_count_in_force_rather_than_an_outdated_one(store, client, lane_on, summaries_on):
+    assert apply(client, record_set_envelope()).status_code == 200
+    assert _in_force(store) == ["set-1:dept:receiving", "set-1:months"]
+    # The next run no longer makes the by-month statement. Its write dies after the record set, before the summaries.
+    store.fail_node_apply_on = store.node_apply_calls + 2
+    assert apply(client, _second_count()).status_code == 500
+    # The pointer has moved and nothing has been restated: nothing is served. With the summaries written
+    # first, the by-month statement (the one that is no longer made) would be the only one still served.
+    assert _in_force(store) == []
+    # The run that follows writes everything, and only what it makes is in force.
+    store.fail_node_apply_on = None
+    assert apply(client, _second_count("op-3", 2)).status_code == 200
+    assert _in_force(store) == ["set-1:dept:receiving"]
+
+
+def test_a_statement_sent_twice_in_one_envelope_is_refused_before_anything_is_written(store, client, lane_on, summaries_on):
+    # The in-place write reads what a node said before the batch, once. Two rows for one node in a batch could
+    # put a vector back on words it was not made from, so the envelope may never carry them.
+    twice = record_set_envelope()
+    twice["node_ops"].insert(1, copy.deepcopy(twice["node_ops"][0]))
+    twice["node_ops"][1]["properties"]["text"] = "The Receiving department has 4 approved SOPs: A; B; C; D."
+    response = apply(client, twice)
+    assert response.status_code == 422 and "node_id is repeated within the envelope" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+def test_an_envelope_reports_whether_it_belongs_to_the_summary_lane():
+    load = pm.ProjectionEnvelopeV2.model_validate
+    record_set, structure, chart = load(record_set_envelope()), load(structure_envelope()), load(raci_envelope())
+    assert [record_set.carries_summaries(), record_set.carries_process_structure(), record_set.carries_raci()] == [True, False, False]
+    assert [structure.carries_summaries(), chart.carries_summaries()] == [False, False]
+    for name, build in SUMMARY_ALONE.items():
+        alone = load(build())
+        assert alone.carries_summaries() is True, name
+        assert alone.carries_process_structure() is False and alone.carries_raci() is False, name
+
+
+def test_the_structure_and_chart_lanes_are_as_they_were_with_the_summary_lane_on(store, client, lane_on, raci_on, summaries_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    assert apply(client, raci_envelope(operation_id="op-2", ordinal=1)).status_code == 200
+    by_id = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert by_id["wf-1"].get("current_summary_version_id") is None
+    assert not [uuid for uuid, props in by_id.items() if props.get("projection_source_kind", "").startswith("RECORD_SET")]
+
+
+def test_the_records_of_a_map_an_sop_and_a_chart_are_put_in_force_by_the_pointers_they_always_were():
+    assert pm.POINTER_RECORD_KINDS["current_map_version_id"] == {pm.ProjectionSourceKind.PROCESS_VERSION, pm.ProjectionSourceKind.PROCESS_STEP}
+    assert pm.POINTER_RECORD_KINDS["current_sop_version_id"] == {
+        pm.ProjectionSourceKind.SOP, pm.ProjectionSourceKind.SOP_STEP, pm.ProjectionSourceKind.SOP_SECTION,
+        pm.ProjectionSourceKind.SOP_EXCEPTION, pm.ProjectionSourceKind.SOP_DEFINITION,
+    }
+    assert pm.POINTER_RECORD_KINDS["current_raci_version_id"] == pm.P3_SOURCE_KINDS
+    assert pm.POINTER_RECORD_KINDS["current_summary_version_id"] == {pm.ProjectionSourceKind.RECORD_SET_SUMMARY}
+    assert pm.SUMMARY_SOURCE_KINDS == {pm.ProjectionSourceKind.RECORD_SET, pm.ProjectionSourceKind.RECORD_SET_SUMMARY}
+
+
+def test_the_summary_switch_is_off_unless_it_is_set():
+    assert type(settings).model_fields["projection_v2_allow_summaries"].default is False

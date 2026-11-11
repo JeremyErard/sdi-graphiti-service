@@ -44,7 +44,9 @@ from typing import Any
 
 from app.config import settings
 from app.models.projection import (
+    POINTER_ANCHOR_KIND,
     POINTER_RECORD_KINDS,
+    RECORD_SET_COUNTED_AT,
     PROJECTION_NODE_LABEL,
     RECORD_TEXT_PROPERTY,
     RECORD_WORKFLOW_PROPERTY,
@@ -144,7 +146,8 @@ def _marker() -> str:
 # different model or size than the one in use now. A statement this model has
 # refused (with the provider answering) is set aside for a while: not asked
 # again until REFUSED_RETRY_AFTER_SECONDS have passed, it is restated (which
-# clears the mark), or the model changes. Otherwise the same refusals would
+# clears the mark; a kind restated in place every run keeps it while it says
+# the same thing), or the model changes. Otherwise the same refusals would
 # sit at the front of every pass and nothing behind them would be reached.
 # Ordered, so passes walk rows in the same order.
 PENDING_QUERY = (
@@ -359,29 +362,69 @@ _CANDIDATES = (
     "UNWIND candidates AS candidate "
     "WITH candidate.n AS n, candidate.score AS score, seen "
 )
-# A record is in force when the node it names as its workflow IS a workflow, in
-# the same tenant and engagement, and that workflow's pointer for the record's
-# own kind holds the record's version. The kinds are written into the query
-# from the model's own table (they are enum values, never caller text): without
-# them any row carrying a pointer-shaped property could stand in for a
-# workflow, and one pointer could put another kind's records in force.
+# A record is in force when the node it names is of the kind that carries the
+# pointer for the record's own kind (a workflow for a map, an SOP or a chart; a
+# record set for a summary), in the same tenant and
+# engagement, and that pointer holds the record's version. The kinds are
+# written into the query from the model's own tables (they are enum values,
+# never caller text): without them any row carrying a pointer-shaped property
+# could stand in for a workflow, and one pointer could put another kind's
+# records in force.
+# A summary is served only while it is being kept current. An approved map is
+# in force until another is approved, however long that takes. A count is
+# different: it is only as good as the last time it was made, and nothing
+# withdraws one that is no longer being made again (the setting switched off,
+# a run that fails night after night). So the record set says when its
+# summaries were counted (RECORD_SET_COUNTED_AT, restated on every run that
+# counts them), and one counted longer ago than `summaries_served_for_seconds`
+# stops feeding retrieval by itself, with nothing to remember to do. A time
+# ahead of the clock by more than a day is no time at all (the route refuses
+# to write one, and a node written some other way is not served either).
+_POINTER_ALSO = {
+    "current_summary_version_id": (
+        f"w.{RECORD_SET_COUNTED_AT} >= $counted_after AND w.{RECORD_SET_COUNTED_AT} <= $counted_before"
+    ),
+}
+COUNTED_AT_AHEAD_SECONDS = 24 * 3600
 _POINTER_BRANCHES = " OR ".join(
-    "(n.projection_source_kind IN ["
+    f"(w.projection_source_kind = '{POINTER_ANCHOR_KIND[pointer].value}' "
+    "AND n.projection_source_kind IN ["
     + ", ".join(f"'{kind.value}'" for kind in sorted(kinds, key=lambda kind: kind.value))
-    + f"] AND n.projection_source_version_id = w.{pointer})"
+    + f"] AND n.projection_source_version_id = w.{pointer}"
+    + (f" AND {_POINTER_ALSO[pointer]}" if pointer in _POINTER_ALSO else "")
+    + ")"
     for pointer, kinds in POINTER_RECORD_KINDS.items()
 )
 _IN_FORCE = (
     "n.group_id = $group_id AND n.engagement_id IN $engagement_ids "
     f"MATCH (w:{PROJECTION_NODE_LABEL} {{uuid: n.{RECORD_WORKFLOW_PROPERTY}}}) "
     "WHERE w.group_id = $group_id AND w.engagement_id = n.engagement_id "
-    f"AND w.projection_source_kind = '{ProjectionSourceKind.WORKFLOW.value}' "
     f"AND ({_POINTER_BRANCHES}) "
     f"RETURN n.uuid AS uuid, n.{RECORD_TEXT_PROPERTY} AS text, "
     "n.projection_source_kind AS kind, n.projection_source_id AS source_id, "
     "n.projection_source_version_id AS version_id, n.engagement_id AS engagement_id, "
     "n.workflow_id AS workflow_id, n.workflow_name AS workflow_name, score, seen"
 )
+
+
+# A summary is found by what it means, never by the words it shares. It is a
+# statement about a whole engagement, so it shares common words and a great
+# many names with almost any question, and through the keyword leg it turned
+# up where it had no business: on a rehearsal with real records (2026-11-11),
+# among the five records returned for 22 of 190 questions that were not about
+# counts, usually in second place. Found by meaning only, 7 of 190, each of
+# them on the question's own subject, and every counting question still got
+# its count first. The kinds are the ones a record set puts in force, read
+# from the model's own tables.
+MEANING_ONLY_KINDS = tuple(
+    sorted(
+        kind.value
+        for pointer, kinds in POINTER_RECORD_KINDS.items()
+        if POINTER_ANCHOR_KIND[pointer] is ProjectionSourceKind.RECORD_SET
+        for kind in kinds
+    )
+)
+_NOT_BY_KEYWORD = "NOT n.projection_source_kind IN [" + ", ".join(f"'{kind}'" for kind in MEANING_ONLY_KINDS) + "]"
 
 
 # Is anything in force at all for the engagements asked about? Only a workflow
@@ -391,8 +434,14 @@ _IN_FORCE = (
 _HOLDS_RECORDS = (
     f"MATCH (w:{PROJECTION_NODE_LABEL}) "
     "WHERE w.engagement_id IN $engagement_ids AND w.group_id = $group_id "
-    f"AND w.projection_source_kind = '{ProjectionSourceKind.WORKFLOW.value}' "
-    "AND (" + " OR ".join(f"w.{pointer} IS NOT NULL" for pointer in sorted(POINTER_RECORD_KINDS)) + ") "
+    "AND ("
+    + " OR ".join(
+        f"(w.projection_source_kind = '{POINTER_ANCHOR_KIND[pointer].value}' AND w.{pointer} IS NOT NULL"
+        + (f" AND {_POINTER_ALSO[pointer]}" if pointer in _POINTER_ALSO else "")
+        + ")"
+        for pointer in sorted(POINTER_RECORD_KINDS)
+    )
+    + ") "
     "RETURN w.uuid LIMIT 1"
 )
 # The check runs before the two legs and its time is not taken from theirs, so
@@ -408,9 +457,12 @@ def _leg_heads(window: int) -> tuple[str, str]:
         f"CALL db.idx.vector.queryNodes('{PROJECTION_NODE_LABEL}', 'text_embedding', "
         f"{int(window)}, vecf32($q)) YIELD node AS n, score "
     )
+    # The kinds found by meaning only are left out before the window is cut, so they never take a place in it
+    # from a record the keyword leg could return.
     keyword = (
         f"CALL db.idx.fulltext.queryNodes('{PROJECTION_NODE_LABEL}', $query) "
         "YIELD node AS n, score "
+        f"WITH n, score WHERE {_NOT_BY_KEYWORD} "
         f"WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT {int(window)} "
     )
     return vector, keyword
@@ -422,7 +474,9 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     Each leg takes `window` candidates from its index, then keeps the ones in
     force for the engagements asked about, ordered again after the join: the
     vector procedure scores by distance (nearest first), the keyword procedure
-    by relevance (highest first). Two records with the same score are put in
+    by relevance (highest first). A summary of a whole engagement is kept by
+    the vector leg only (see MEANING_ONLY_KINDS): it is found by what it means,
+    not by the words it shares. Two records with the same score are put in
     order by their id, in the final cut and in the keyword leg's window, so
     which of them is kept does not depend on the order the engine happened to
     hand them over. (Which candidates the vector index puts in its own window
@@ -594,7 +648,14 @@ async def search_records(
     graph = graphiti_client.get_falkor_db().select_graph(name)
 
     pool = max(int(max_results) * 2, int(max_results))
-    scope = {"group_id": name, "engagement_ids": list(engagement_ids)}
+    now = int(time.time())
+    # What every read is asked with. A summary is served only while its counting run is recent (see _POINTER_ALSO).
+    scope = {
+        "group_id": name,
+        "engagement_ids": list(engagement_ids),
+        "counted_after": now - int(settings.summaries_served_for_seconds),
+        "counted_before": now + COUNTED_AT_AHEAD_SECONDS,
+    }
 
     # A client's records sit under the engagement that approved them, so a
     # search is often asked of engagements that hold none: a later engagement

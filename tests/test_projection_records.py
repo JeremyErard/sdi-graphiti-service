@@ -296,14 +296,23 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
         # From the record to its workflow node, in the same tenant and engagement...
         assert f"MATCH (w:{PROJECTION_NODE_LABEL} {{uuid: n.workflow_node_id}})" in leg
         assert "w.group_id = $group_id AND w.engagement_id = n.engagement_id" in leg
-        # ...which must itself be a workflow, not any row that carries a pointer-shaped property...
-        assert "w.projection_source_kind = 'WORKFLOW'" in leg
-        # ...and in force only when the pointer for the record's own kind names its version.
-        assert "(n.projection_source_kind IN ['PROCESS_STEP', 'PROCESS_VERSION'] AND n.projection_source_version_id = w.current_map_version_id)" in leg
-        assert "(n.projection_source_kind IN ['SOP', 'SOP_DEFINITION', 'SOP_EXCEPTION', 'SOP_SECTION', 'SOP_STEP'] AND n.projection_source_version_id = w.current_sop_version_id)" in leg
-        assert "(n.projection_source_kind IN ['RACI', 'RACI_MATRIX'] AND n.projection_source_version_id = w.current_raci_version_id)" in leg
-        # A version is compared with a pointer nowhere outside those three branches.
-        assert leg.count("n.projection_source_version_id = w.") == 3
+        # ...which must itself be the kind of node that carries the pointer (a workflow, or for a
+        # summary a record set), not any row that carries a pointer-shaped property,
+        # and in force only when the pointer for the record's own kind names its version.
+        assert "(w.projection_source_kind = 'WORKFLOW' AND n.projection_source_kind IN ['PROCESS_STEP', 'PROCESS_VERSION'] AND n.projection_source_version_id = w.current_map_version_id)" in leg
+        assert "(w.projection_source_kind = 'WORKFLOW' AND n.projection_source_kind IN ['SOP', 'SOP_DEFINITION', 'SOP_EXCEPTION', 'SOP_SECTION', 'SOP_STEP'] AND n.projection_source_version_id = w.current_sop_version_id)" in leg
+        assert "(w.projection_source_kind = 'WORKFLOW' AND n.projection_source_kind IN ['RACI', 'RACI_MATRIX'] AND n.projection_source_version_id = w.current_raci_version_id)" in leg
+        # A summary is in force only while it is being kept current: its record set says when it was counted,
+        # and a time ahead of the clock is no time at all.
+        assert "(w.projection_source_kind = 'RECORD_SET' AND n.projection_source_kind IN ['RECORD_SET_SUMMARY'] AND n.projection_source_version_id = w.current_summary_version_id AND w.counted_at >= $counted_after AND w.counted_at <= $counted_before)" in leg
+        assert leg.count("$counted_after") == 1 and leg.count("$counted_before") == 1
+        # A version is compared with a pointer nowhere outside those four branches, and every
+        # branch names the kind of node its pointer sits on: no pointer is read off any other.
+        assert leg.count("n.projection_source_version_id = w.") == 4
+        assert leg.count("w.projection_source_kind = ") == 4
+        # The four branches are alternatives of one condition that is ANDed with the scope.
+        assert "w.engagement_id = n.engagement_id AND ((w.projection_source_kind = 'WORKFLOW' AND" in leg
+        assert "w.current_summary_version_id AND w.counted_at >= $counted_after AND w.counted_at <= $counted_before)) RETURN n.uuid AS uuid" in leg
         # Every pointer the model lets a workflow carry is one the search reads, and no other.
         named = sorted(set(re.findall(r"w\.(current_[a-z]+_version_id)", leg)))
         assert named == sorted(CURRENT_VERSION_PROPERTIES)
@@ -311,9 +320,23 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
     assert keyword.index("LIMIT 30") < keyword.index("MATCH (w:")
     assert "'text_embedding', 30," in vector
     assert "'text_embedding', 480," in projection_records.record_leg_queries(6, 480)[0]
+    # A summary of a whole engagement is found by meaning only: the keyword leg leaves it out, the vector leg does
+    # not. It is left out BEFORE the window is cut, so no summary, in force or not, ever takes a place in the window
+    # from a record the keyword leg could return.
+    assert keyword.startswith(
+        "CALL db.idx.fulltext.queryNodes('ProjectionNode', $query) YIELD node AS n, score "
+        "WITH n, score WHERE NOT n.projection_source_kind IN ['RECORD_SET_SUMMARY'] "
+        "WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT 30 "
+        "WITH collect({n: n, score: score}) AS candidates "
+    )
+    assert keyword.count("NOT n.projection_source_kind IN") == 1 and "NOT n.projection_source_kind IN" not in vector
+    assert "seen WHERE n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in keyword
+    assert "seen WHERE n.text_emb_model = $marker AND n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in vector
+    assert projection_records.MEANING_ONLY_KINDS == ("RECORD_SET_SUMMARY",)
+    # The count asked when nothing survives is of the same window, cut the same way.
+    assert projection_records.record_leg_counts(30)[1].startswith(keyword[: keyword.index("WITH collect(")])
     # Equal scores are put in order by record id, so the cut is the same on every ask: in the keyword
     # leg's window (before the join) and in each leg's final cut.
-    assert "WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT 30 " in keyword
     assert vector.rstrip().endswith("ORDER BY score ASC, uuid ASC LIMIT 6")
     assert keyword.rstrip().endswith("ORDER BY score DESC, uuid ASC LIMIT 6")
     # A vector made by another embedding model is not compared with this one's.
@@ -376,9 +399,10 @@ def test_engagements_that_hold_no_record_in_force_are_answered_at_once(wired, ca
     graph = wired(FakeGraph(vector_rows=[], keyword_rows=[], need_window=10**9, holds=False), embedder)
     with caplog.at_level("WARNING", logger="graphiti_service"):
         assert asyncio.run(projection_records.search_records("unit-tenant", ["eng-later", "eng-other"], "seal number", 5)) == []
-    assert [(q, p) for q, p in graph.reads] == [
-        (projection_records._HOLDS_RECORDS, {"group_id": graphiti_client._graph_name_for_client("unit-tenant"), "engagement_ids": ["eng-later", "eng-other"]})
-    ]
+    ((asked, params),) = graph.reads
+    assert asked == projection_records._HOLDS_RECORDS
+    assert {name: params[name] for name in ("group_id", "engagement_ids")} == {"group_id": graphiti_client._graph_name_for_client("unit-tenant"), "engagement_ids": ["eng-later", "eng-other"]}
+    assert set(params) == {"group_id", "engagement_ids", "counted_after", "counted_before"}
     assert calls == []
     assert graph.queries == []
     assert [r.getMessage() for r in caplog.records] == []
@@ -392,8 +416,11 @@ def test_the_presence_check_asks_for_a_workflow_that_points_at_a_version_in_this
     assert q == (
         "MATCH (w:ProjectionNode) "
         "WHERE w.engagement_id IN $engagement_ids AND w.group_id = $group_id "
-        "AND w.projection_source_kind = 'WORKFLOW' "
-        "AND (w.current_map_version_id IS NOT NULL OR w.current_raci_version_id IS NOT NULL OR w.current_sop_version_id IS NOT NULL) "
+        "AND ((w.projection_source_kind = 'WORKFLOW' AND w.current_map_version_id IS NOT NULL) "
+        "OR (w.projection_source_kind = 'WORKFLOW' AND w.current_raci_version_id IS NOT NULL) "
+        "OR (w.projection_source_kind = 'WORKFLOW' AND w.current_sop_version_id IS NOT NULL) "
+        "OR (w.projection_source_kind = 'RECORD_SET' AND w.current_summary_version_id IS NOT NULL "
+        "AND w.counted_at >= $counted_after AND w.counted_at <= $counted_before)) "
         "RETURN w.uuid LIMIT 1"
     )
     # Every pointer the model knows, from both of its tables, so a new kind of record cannot be left out of the check.
@@ -401,7 +428,7 @@ def test_the_presence_check_asks_for_a_workflow_that_points_at_a_version_in_this
     for pointer in CURRENT_VERSION_PROPERTIES:
         assert f"w.{pointer} IS NOT NULL" in q
     # Nothing from a caller is written into the statement.
-    assert "$" in q and "'" not in q.replace("'WORKFLOW'", "")
+    assert "$" in q and "'" not in q.replace("'WORKFLOW'", "").replace("'RECORD_SET'", "")
 
 
 def test_the_presence_check_has_a_short_time_limit_of_its_own_and_the_legs_keep_theirs(wired):
@@ -674,3 +701,18 @@ def test_embedding_runs_for_the_authenticated_tenant_only(perimeter, monkeypatch
 
     refused = signed_post("/ingest/projection/v2/embed", {"client_slug": "unit-tenant"}, "search", SEARCH_SECRET)
     assert refused.status_code in (401, 403)
+
+
+def test_a_summary_is_served_for_three_days_after_it_was_counted_and_every_read_is_asked_with_that_window(wired, monkeypatch):
+    assert type(settings).model_fields["summaries_served_for_seconds"].default == 3 * 24 * 3600
+    assert projection_records.COUNTED_AT_AHEAD_SECONDS == 24 * 3600
+    monkeypatch.setattr(settings, "summaries_served_for_seconds", 3 * 24 * 3600, raising=False)
+    monkeypatch.setattr(projection_records.time, "time", lambda: 1_800_000_000.75)
+    graph = wired(FakeGraph(vector_rows=[row("r1")], keyword_rows=[row("r2")]), FakeEmbedder())
+    asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], "seal number", 1))
+    legs = [(statement, params) for statement, params in graph.reads if "queryNodes" in statement]
+    assert {"vector" if "db.idx.vector" in statement else "keyword" for statement, _ in legs} == {"vector", "keyword"}
+    # Counted no longer ago than three days, and not more than a day ahead of the clock.
+    assert {(params["counted_after"], params["counted_before"]) for _, params in graph.reads} == {(1_800_000_000 - 259_200, 1_800_000_000 + 86_400)}
+    # The presence check asks it too: an engagement whose only counts have gone stale holds nothing to search.
+    assert any(statement == projection_records._HOLDS_RECORDS for statement, _ in graph.reads)

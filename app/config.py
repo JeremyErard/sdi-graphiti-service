@@ -167,6 +167,23 @@ class Settings(BaseSettings):
     # already written stays searchable with it off; what takes a chart out of
     # retrieval is its workflow no longer pointing at it.
     projection_v2_allow_raci: bool = False
+    # Summaries: statements counted, by code, from an engagement's approved
+    # records already projected (how many SOPs a department has approved, which
+    # maps name one system), on top of the process structure they are counted
+    # from. Its own switch, off by default: an envelope that carries a
+    # summary, a record set or a SUMMARIZES edge is refused until this is set,
+    # and needs the process-structure switch as well. The switch governs
+    # WRITING. A summary already written stays searchable with it off; what
+    # takes it out of retrieval is its record set no longer naming its version,
+    # or the counting run growing older than summaries_served_for_seconds.
+    projection_v2_allow_summaries: bool = False
+    # How long a summary is served after the run that counted it. Each run that
+    # counts an engagement's summaries restates when it did, so with a nightly
+    # run this never comes into play. It is for when the counting stops (the
+    # setting switched off, a run that fails night after night): the counts
+    # then drop out of retrieval by themselves after this long, where they
+    # would otherwise be served as current for good. Three days.
+    summaries_served_for_seconds: int = 3 * 24 * 3600
 
     class Config:
         env_file = ".env"
