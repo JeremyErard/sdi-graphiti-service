@@ -25,8 +25,10 @@ class FakeGraph:
     the leg finds them (below it the window is full of history and nothing
     survives); `total` is how many candidates the index holds at all."""
 
-    def __init__(self, pending=None, vector_rows=None, keyword_rows=None, fail=(), need_window=0, total=10_000, refuse_text=None):
+    def __init__(self, pending=None, vector_rows=None, keyword_rows=None, fail=(), need_window=0, total=10_000, refuse_text=None, holds=True):
         self.pending = list(pending or [])
+        # Whether the engagements asked about have a workflow that points at a version: the search asks this first.
+        self.holds = holds
         self.vector_rows = vector_rows or []
         self.keyword_rows = keyword_rows or []
         self.fail = set(fail)
@@ -65,6 +67,10 @@ class FakeGraph:
     def ro_query(self, statement, params=None, timeout=None):
         params = params or {}
         self.reads.append((statement, params))
+        if statement == projection_records._HOLDS_RECORDS:
+            if "presence" in self.fail:
+                raise RuntimeError("the presence read timed out")
+            return SimpleNamespace(result_set=[["wf-1"]] if self.holds else [])
         if "db.idx.vector.queryNodes" in statement:
             leg, rows = "vector", self.vector_rows
             window = int(statement.split("'text_embedding', ")[1].split(",")[0])
@@ -355,6 +361,47 @@ def test_widening_stops_when_the_index_has_nothing_more_or_at_the_cap(wired):
     assert windows == [30, 120, 480, 1920, projection_records.MAX_CANDIDATES]
 
 
+def test_engagements_that_hold_no_record_in_force_are_answered_at_once(wired, caplog):
+    """A later engagement asking for its own records, or the other engagements
+    of the one that holds them all. Nothing to rank: no leg is read, the
+    question is not embedded, and nothing warns that the index is crowded."""
+    embedder = FakeEmbedder()
+    calls: list = []
+    embedder.create = lambda input_data: calls.append(input_data)  # must never be reached
+    graph = wired(FakeGraph(vector_rows=[], keyword_rows=[], need_window=10**9, holds=False), embedder)
+    with caplog.at_level("WARNING", logger="graphiti_service"):
+        assert asyncio.run(projection_records.search_records("unit-tenant", ["eng-later", "eng-other"], "seal number", 5)) == []
+    assert [(q, p) for q, p in graph.reads] == [
+        (projection_records._HOLDS_RECORDS, {"group_id": graphiti_client._graph_name_for_client("unit-tenant"), "engagement_ids": ["eng-later", "eng-other"]})
+    ]
+    assert calls == []
+    assert graph.queries == []
+    assert [r.getMessage() for r in caplog.records] == []
+
+
+def test_the_presence_check_asks_for_a_workflow_that_points_at_a_version_in_this_tenant_and_these_engagements():
+    q = projection_records._HOLDS_RECORDS
+    assert f"MATCH (w:{PROJECTION_NODE_LABEL})" in q
+    assert "w.engagement_id IN $engagement_ids" in q and "w.group_id = $group_id" in q
+    assert "w.projection_source_kind = 'WORKFLOW'" in q
+    # Every pointer the model knows, so a new kind of record cannot be left out of the check.
+    for pointer in CURRENT_VERSION_PROPERTIES:
+        assert f"w.{pointer} IS NOT NULL" in q
+    assert q.endswith("RETURN w.uuid LIMIT 1")
+    # Nothing from a caller is written into the statement.
+    assert "$" in q and "'" not in q.replace("'WORKFLOW'", "")
+
+
+def test_a_presence_check_that_fails_says_nothing_and_the_search_goes_on(wired, caplog):
+    wired(FakeGraph(vector_rows=[row("v1")], keyword_rows=[row("k1")], fail={"presence"}, total=1), FakeEmbedder())
+    with caplog.at_level("WARNING", logger="graphiti_service"):
+        out = asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], "seal number", 3))
+    assert [record["record_id"] for record in out] == ["v1", "k1"]
+    assert [r.getMessage() for r in caplog.records] == [
+        f"[graphiti] record presence check failed on {graphiti_client._graph_name_for_client('unit-tenant')} error_type=RuntimeError; searching anyway"
+    ]
+
+
 def test_records_found_in_a_narrower_window_are_kept_when_a_wider_one_fails(wired):
     graph = FakeGraph(vector_rows=[row(f"v{i}") for i in range(6)], keyword_rows=[], need_window=400)
     graph.early_rows = [row("v0")]
@@ -373,7 +420,8 @@ def test_a_search_reads_and_never_writes_or_creates(wired):
     graph = wired(FakeGraph(vector_rows=[row("a")], keyword_rows=[row("a")], total=1), FakeEmbedder())
     asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], "seal number", 3))
     assert graph.queries == []
-    assert len(graph.reads) == 2
+    # The presence check, then one read per leg.
+    assert [q == projection_records._HOLDS_RECORDS for q, _ in graph.reads] == [True, False, False]
 
 
 def test_a_property_written_as_a_number_comes_back_as_text_instead_of_failing_the_answer(wired):
