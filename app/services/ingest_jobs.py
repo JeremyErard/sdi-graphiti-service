@@ -36,9 +36,17 @@ from typing import Any, Literal
 
 JobStatus = Literal["running", "succeeded", "failed"]
 
-# Finished jobs are kept this long so a poller that is briefly behind can still
+# Finished jobs are kept this long so a caller that comes back late can still
 # read the outcome, then pruned so the registry cannot grow without bound.
-FINISHED_TTL_SECONDS = 30 * 60
+#
+# "Late" is not only a poller a few seconds behind. The caller's queue worker
+# can be restarted by a deploy mid-poll, and when its queue retries the row it
+# asks about this job before sending the episode again. If the answer is 404
+# it has to send again, which is a second extraction of an episode that is
+# already written. The row may sit behind another extraction first, so the
+# window has to outlast one: two hours, comfortably above RUNNING_MAX_AGE_SECONDS.
+# MAX_JOBS still caps the registry, and a finished job holds only its counts.
+FINISHED_TTL_SECONDS = 2 * 60 * 60
 
 # A running job older than this is abandoned. Nothing should take this long —
 # the caller's own poll budget is 2400s — and without a ceiling a job whose task
