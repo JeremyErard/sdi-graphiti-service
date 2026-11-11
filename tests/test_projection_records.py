@@ -8,13 +8,14 @@ for the engagements asked about, fused from a keyword leg and a vector leg,
 and answers empty rather than failing.
 """
 
+import re
 import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from app.config import settings
-from app.models.projection import PROJECTION_NODE_LABEL
+from app.models.projection import CURRENT_VERSION_PROPERTIES, PROJECTION_NODE_LABEL
 from app.services import graphiti_client, projection_records
 
 
@@ -290,6 +291,10 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
         # ...and in force only when its own version is one the workflow names.
         assert "n.projection_source_version_id = w.current_map_version_id" in leg
         assert "n.projection_source_version_id = w.current_sop_version_id" in leg
+        assert "n.projection_source_version_id = w.current_raci_version_id" in leg
+        # Every pointer the model lets a workflow carry is one the search reads, and no other.
+        named = sorted(set(re.findall(r"w\.(current_[a-z]+_version_id)", leg)))
+        assert named == sorted(CURRENT_VERSION_PROPERTIES)
     # The candidate window is taken before the join, and can be widened.
     assert keyword.index("LIMIT 30") < keyword.index("MATCH (w:")
     assert "'text_embedding', 30," in vector

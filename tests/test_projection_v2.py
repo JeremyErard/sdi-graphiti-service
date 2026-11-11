@@ -969,11 +969,13 @@ def test_the_cursor_is_recorded_on_the_receipt_in_a_readable_form(store, client)
 # ==========================================================================
 
 
-def test_p3_source_kinds_are_refused_today(store, client):
-    body = envelope(node_ops=[node_op(source={**finding_source(), "kind": "RACI"}, lifecycle=None)])
+@pytest.mark.parametrize("kind", ["RACI_MATRIX", "RACI"])
+def test_a_responsibility_chart_is_refused_until_its_lane_is_switched_on(kind, store, client):
+    """The model admits the shape; the deployment has to authorize the write."""
+    body = envelope(node_ops=[structure_op("chart-row", kind, version="rv-1", properties={"text": "Who does it."})])
     response = apply(client, body)
     assert response.status_code == 422
-    assert "P3" in json.dumps(response.json())
+    assert "PROJECTION_V2_ALLOW_RACI" in json.dumps(response.json())
     assert store.mutating_queries() == []
 
 
@@ -995,13 +997,24 @@ def test_a_p3_shaped_payload_cannot_ride_in_under_an_admitted_source_kind(store,
     assert apply(client, labelled).status_code == 422
     assert store.nodes == {}
 
+    still_p3 = envelope(
+        node_ops=[node_op(), driver_op()],
+        edge_ops=[edge_op(relation="OWNED_BY")],
+    )
+    response = apply(client, still_p3)
+    assert response.status_code == 422
+    assert "P3" in json.dumps(response.json())
+    assert store.nodes == {}
+
+    # A chart edge between two Finding rows is a chart edge all the same: it
+    # meets the chart lane's switch, not the Finding lane's open door.
     raci = envelope(
         node_ops=[node_op(), driver_op()],
         edge_ops=[edge_op(relation="ACCOUNTABLE_FOR")],
     )
     response = apply(client, raci)
     assert response.status_code == 422
-    assert "P3" in json.dumps(response.json())
+    assert "PROJECTION_V2_ALLOW_RACI" in json.dumps(response.json())
     assert store.nodes == {}
 
 
@@ -1056,8 +1069,17 @@ def test_every_declared_source_kind_is_classified_into_exactly_one_phase():
     assert set(pm.SOURCE_KIND_NODE_LABEL) == kinds
     assert len(set(pm.SOURCE_KIND_NODE_LABEL.values())) == len(kinds)
     assert {pm.SOURCE_KIND_NODE_LABEL[k] for k in pm.P3_SOURCE_KINDS} <= pm.P3_NODE_LABELS
-    assert pm.VERSIONED_RECORD_KINDS < pm.PROCESS_STRUCTURE_SOURCE_KINDS
+    assert pm.RECORD_RULE_SOURCE_KINDS == pm.PROCESS_STRUCTURE_SOURCE_KINDS | pm.P3_SOURCE_KINDS
+    assert pm.VERSIONED_RECORD_KINDS < pm.RECORD_RULE_SOURCE_KINDS
+    assert pm.P3_SOURCE_KINDS < pm.VERSIONED_RECORD_KINDS
     assert set(pm.RELATION_ENDPOINT_KINDS) == set(pm.ProjectionRelation)
+    # Every relation belongs to exactly one lane, so each lane's switch covers its own edges.
+    finding_relations = {pm.ProjectionRelation.DERIVED_FROM, pm.ProjectionRelation.ATTESTED_BY}
+    lanes = [finding_relations, set(pm.PROCESS_STRUCTURE_RELATIONS), set(pm.RACI_RELATIONS)]
+    assert set().union(*lanes) == set(pm.ProjectionRelation)
+    assert sum(len(lane) for lane in lanes) == len(pm.ProjectionRelation)
+    # What is still refused by name is not also admitted.
+    assert not (pm.P3_EDGE_RELATIONS | pm.P3_DEPENDENT_EDGE_RELATIONS) & {r.value for r in pm.ProjectionRelation}
 
 
 def test_an_edge_must_join_the_endpoint_kinds_its_relation_declares(store, client):
@@ -2063,6 +2085,44 @@ def lane_on(monkeypatch):
     monkeypatch.setattr(settings, "projection_v2_allow_process_structure", True, raising=False)
 
 
+@pytest.fixture
+def raci_on(monkeypatch):
+    monkeypatch.setattr(settings, "projection_v2_allow_raci", True, raising=False)
+
+
+def raci_envelope(**overrides):
+    """An approved chart of two rows for workflow wf-1, the roles it names, and the workflow pointing at it."""
+    node_ops = overrides.pop(
+        "node_ops",
+        [
+            structure_op("chart-1", "RACI_MATRIX", version="rv-1", properties={"text": "Version 1 of the chart was approved."}),
+            structure_op("chart-1:r1", "RACI", version="rv-1", properties={"text": "Step 6.1: Clerk is Responsible; Lead is Accountable.", "row_label": "6.1"}),
+            structure_op("chart-1:r2", "RACI", version="rv-1", properties={"text": "Step 6.2: Clerk is Responsible and Accountable; Lead is Informed.", "sop_step_numbers": ["6.2"]}),
+            structure_op("role:clerk", "ROLE", version="clerk@a", workflow=None, properties={"name": "Clerk"}),
+            structure_op("role:lead", "ROLE", version="lead@a", workflow=None, properties={"name": "Lead"}),
+            structure_op(
+                "wf-1", "WORKFLOW", version="wf-1@b", workflow=None,
+                properties={"name": "Receiving", "current_raci_version_id": "rv-1"},
+            ),
+        ],
+    )
+    edge_ops = overrides.pop(
+        "edge_ops",
+        [
+            edge_op("e-chart", relation="CHART_OF", from_id="chart-1", to_id="wf-1"),
+            edge_op("e-row-1", relation="HAS_ASSIGNMENT", from_id="chart-1", to_id="chart-1:r1"),
+            edge_op("e-row-2", relation="HAS_ASSIGNMENT", from_id="chart-1", to_id="chart-1:r2"),
+            edge_op("e-r1-r", relation="RESPONSIBLE_FOR", from_id="role:clerk", to_id="chart-1:r1"),
+            edge_op("e-r1-a", relation="ACCOUNTABLE_FOR", from_id="role:lead", to_id="chart-1:r1"),
+            edge_op("e-r2-r", relation="RESPONSIBLE_FOR", from_id="role:clerk", to_id="chart-1:r2"),
+            edge_op("e-r2-a", relation="ACCOUNTABLE_FOR", from_id="role:clerk", to_id="chart-1:r2"),
+            edge_op("e-r2-i", relation="INFORMED", from_id="role:lead", to_id="chart-1:r2"),
+            edge_op("e-r1-c", relation="CONSULTED", from_id="role:lead", to_id="chart-1:r2"),
+        ],
+    )
+    return envelope(node_ops=node_ops, edge_ops=edge_ops, **overrides)
+
+
 def test_the_process_structure_shape_applies_when_its_lane_is_on(store, client, lane_on):
     response = apply(client, structure_envelope())
     assert response.status_code == 200, response.text
@@ -2188,11 +2248,10 @@ def test_reprojecting_the_same_approved_version_converges(store, client, lane_on
     assert edges_after == edges_before
 
 
-def test_raci_stays_refused_with_the_lane_on(store, client, lane_on):
-    body = envelope(node_ops=[node_op(source={**finding_source(), "kind": "RACI"}, lifecycle=None)])
-    response = apply(client, body)
+def test_a_responsibility_chart_stays_refused_with_only_the_structure_lane_on(store, client, lane_on):
+    response = apply(client, raci_envelope())
     assert response.status_code == 422
-    assert "P3" in json.dumps(response.json())
+    assert "PROJECTION_V2_ALLOW_RACI" in json.dumps(response.json())
     assert store.mutating_queries() == []
 
 
@@ -2253,3 +2312,102 @@ def test_the_new_property_rules_do_not_reach_the_kinds_admitted_before_them(stor
         node_ops=[node_op(properties={"text": "   ", "workflow_node_id": "wf-1", "workflow_name": 7})]
     )
     assert apply(client, body).status_code == 200
+
+
+# ==========================================================================
+# Responsibility charts: the approved chart and its rows, behind their own switch
+# ==========================================================================
+
+
+def test_an_approved_chart_applies_with_both_lanes_on_and_the_workflow_points_at_it(store, client, lane_on, raci_on):
+    response = apply(client, raci_envelope())
+    assert response.status_code == 200, response.json()
+    assert response.json()["nodes_applied"] == 6 and response.json()["edges_applied"] == 9
+    labels = {node["props"]["uuid"]: sorted(set(node["labels"]) - {pm.PROJECTION_NODE_LABEL}) for node in store.nodes.values()}
+    assert labels == {
+        "chart-1": ["RaciMatrix"], "chart-1:r1": ["RaciAssignment"], "chart-1:r2": ["RaciAssignment"],
+        "role:clerk": ["Role"], "role:lead": ["Role"], "wf-1": ["Workflow"],
+    }
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert props["wf-1"]["current_raci_version_id"] == "rv-1"
+    assert {props[n]["projection_source_version_id"] for n in ("chart-1", "chart-1:r1", "chart-1:r2")} == {"rv-1"}
+    assert {props[n]["workflow_node_id"] for n in ("chart-1", "chart-1:r1", "chart-1:r2")} == {"wf-1"}
+    assert props["chart-1:r2"]["sop_step_numbers"] == ["6.2"]
+
+
+def test_sending_the_same_chart_again_replays_and_writes_nothing(store, client, lane_on, raci_on):
+    assert apply(client, raci_envelope()).status_code == 200
+    before = store.snapshot()
+    again = apply(client, raci_envelope())
+    assert again.status_code == 200 and again.json()["replay"] is True and again.json()["applied"] is False
+    assert store.snapshot() == before
+
+
+def test_the_chart_lane_needs_the_structure_lane_too(store, client, raci_on):
+    response = apply(client, raci_envelope())
+    assert response.status_code == 422
+    assert store.mutating_queries() == []
+
+
+def test_a_workflow_that_only_points_at_a_chart_is_a_chart_write(store, client, lane_on):
+    """The pointer is what puts a chart in force, so it cannot be written past the chart lane's switch."""
+    pointer_only = envelope(node_ops=[structure_op("wf-1", "WORKFLOW", version="wf-1@c", workflow=None, properties={"name": "Receiving", "current_raci_version_id": "rv-1"})])
+    response = apply(client, pointer_only)
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_RACI" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+    without = envelope(node_ops=[structure_op("wf-1", "WORKFLOW", version="wf-1@d", workflow=None, properties={"name": "Receiving", "current_map_version_id": "pv-3"})])
+    assert apply(client, without).status_code == 200
+
+
+def test_a_chart_row_must_say_which_workflow_it_belongs_to_and_only_a_workflow_points_at_a_chart(store, client, lane_on, raci_on):
+    adrift = raci_envelope()
+    del adrift["node_ops"][1]["properties"]["workflow_node_id"]
+    response = apply(client, adrift)
+    assert response.status_code == 422 and "must name its workflow node" in json.dumps(response.json())
+
+    misplaced = raci_envelope()
+    misplaced["node_ops"][1]["properties"]["current_raci_version_id"] = "rv-1"
+    response = apply(client, misplaced)
+    assert response.status_code == 422 and "only carried by a WORKFLOW node" in json.dumps(response.json())
+
+    blank = raci_envelope()
+    blank["node_ops"][1]["properties"]["text"] = "   "
+    response = apply(client, blank)
+    assert response.status_code == 422 and "must be a non-empty string" in json.dumps(response.json())
+    assert store.nodes == {}
+
+
+@pytest.mark.parametrize(
+    "edge, message",
+    [
+        (("RESPONSIBLE_FOR", "chart-1:r1", "chart-1:r2"), "relation RESPONSIBLE_FOR starts at a RACI node; it must start at a ROLE node"),
+        (("ACCOUNTABLE_FOR", "role:clerk", "chart-1"), "relation ACCOUNTABLE_FOR ends at a RACI_MATRIX node; it must end at a RACI node"),
+        (("HAS_ASSIGNMENT", "chart-1", "role:clerk"), "relation HAS_ASSIGNMENT ends at a ROLE node; it must end at a RACI node"),
+        (("CHART_OF", "chart-1:r1", "wf-1"), "relation CHART_OF starts at a RACI node; it must start at a RACI_MATRIX node"),
+        (("PERFORMED_BY", "chart-1:r1", "role:clerk"), "relation PERFORMED_BY starts at a RACI node; it must start at a PROCESS_STEP or SOP_STEP node"),
+    ],
+)
+def test_a_chart_edge_must_join_the_kinds_its_relation_declares(edge, message, store, client, lane_on, raci_on):
+    relation, from_id, to_id = edge
+    body = raci_envelope()
+    body["edge_ops"].append(edge_op("e-wrong", relation=relation, from_id=from_id, to_id=to_id))
+    response = apply(client, body)
+    assert response.status_code == 422
+    assert message in json.dumps(response.json())
+    assert store.nodes == {}
+
+
+def test_a_chart_envelope_reports_which_lanes_it_belongs_to():
+    chart = pm.ProjectionEnvelopeV2.model_validate(raci_envelope())
+    structure = pm.ProjectionEnvelopeV2.model_validate(structure_envelope())
+    rows_only = pm.ProjectionEnvelopeV2.model_validate(envelope(node_ops=[structure_op("chart-1:r1", "RACI", version="rv-1", properties={"text": "Who does it."})]))
+    assert [chart.carries_raci(), chart.carries_process_structure()] == [True, True]
+    assert [structure.carries_raci(), structure.carries_process_structure()] == [False, True]
+    assert [rows_only.carries_raci(), rows_only.carries_process_structure()] == [True, False]
+
+
+def test_the_structure_lane_is_as_it_was_with_the_chart_lane_on(store, client, lane_on, raci_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    by_id = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert by_id["wf-1"].get("current_raci_version_id") is None and by_id["wf-1"]["current_map_version_id"] == "pv-3"

@@ -105,18 +105,14 @@ PROJECTION_RECEIPT_LABEL = "ProjectionReceipt"
 # part of it (":Workflow", ":ProcessVersion", ":SOP"; GOVERNS, VERSION_OF) is
 # admitted by this module and gated by the route behind
 # PROJECTION_V2_ALLOW_PROCESS_STRUCTURE (see PROCESS_STRUCTURE_SOURCE_KINDS).
-# The RACI part is still refused here with an error that names P3, so a caller
-# who sends it learns the phase rule rather than a generic validation message.
+# The RACI part (":RaciMatrix", ":RaciAssignment"; RESPONSIBLE_FOR,
+# ACCOUNTABLE_FOR, CONSULTED, INFORMED) is admitted by this module too, and
+# gated by the route behind PROJECTION_V2_ALLOW_RACI (see P3_SOURCE_KINDS and
+# RACI_RELATIONS). What is left of the ratified P3 edge vocabulary is still
+# refused here, with an error that names P3, so a caller who sends it learns the
+# phase rule rather than a generic validation message.
 P3_NODE_LABELS = frozenset({"RaciMatrix", "RaciAssignment"})
-P3_EDGE_RELATIONS = frozenset(
-    {
-        "ACCOUNTABLE_FOR",
-        "RESPONSIBLE_FOR",
-        "CONSULTED",
-        "INFORMED",
-        "OWNED_BY",
-    }
-)
+P3_EDGE_RELATIONS = frozenset({"OWNED_BY"})
 
 # Ratified, but it links a Finding to P3 node types (workflow, system,
 # department), so it cannot be projected before those types exist.
@@ -143,8 +139,11 @@ class ProjectionSourceKind(str, Enum):
     steps name. This module admits
     the shape; the route refuses it unless the lane is switched on.
 
-    RACI is P3 backfill that this module still refuses: the envelope carries
-    the kind so the shape does not change later.
+    RACI is the approved responsibility chart projected exactly: the chart as
+    approved (RACI_MATRIX) and one record for each of its rows (RACI), which
+    says who is Responsible, Accountable, Consulted and Informed for that row's
+    activity. This module admits the shape; the route refuses it unless its own
+    lane is switched on.
     """
 
     FINDING = "FINDING"
@@ -160,6 +159,7 @@ class ProjectionSourceKind(str, Enum):
     SOP_DEFINITION = "SOP_DEFINITION"
     ROLE = "ROLE"
     SYSTEM = "SYSTEM"
+    RACI_MATRIX = "RACI_MATRIX"
     RACI = "RACI"
 
 
@@ -180,6 +180,7 @@ SOURCE_KIND_NODE_LABEL: dict[ProjectionSourceKind, str] = {
     ProjectionSourceKind.SOP_DEFINITION: "SopDefinition",
     ProjectionSourceKind.ROLE: "Role",
     ProjectionSourceKind.SYSTEM: "System",
+    ProjectionSourceKind.RACI_MATRIX: "RaciMatrix",
     ProjectionSourceKind.RACI: "RaciAssignment",
 }
 
@@ -207,12 +208,20 @@ PROCESS_STRUCTURE_SOURCE_KINDS = frozenset(
     }
 )
 
+# The RACI part of P3: an approved responsibility chart and its rows. Admitted
+# by the model, gated by the route (PROJECTION_V2_ALLOW_RACI).
+P3_SOURCE_KINDS = frozenset({ProjectionSourceKind.RACI_MATRIX, ProjectionSourceKind.RACI})
+
+# Kinds the record rules apply to: a record names its workflow, a workflow names
+# the versions in force, a statement is real text.
+RECORD_RULE_SOURCE_KINDS = PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS
+
 # A record of one approved version. Each of these names the workflow node it
 # belongs to (RECORD_WORKFLOW_PROPERTY), and that workflow node says which
-# version of its map and of its SOP is in force (CURRENT_VERSION_PROPERTIES).
-# A record is in force exactly when its own version is one the workflow points
-# at, and only a record in force may feed retrieval. A workflow, a role and a
-# system are not versions of anything.
+# version of its map, of its SOP and of its responsibility chart is in force
+# (CURRENT_VERSION_PROPERTIES). A record is in force exactly when its own
+# version is one the workflow points at, and only a record in force may feed
+# retrieval. A workflow, a role and a system are not versions of anything.
 VERSIONED_RECORD_KINDS = frozenset(
     {
         ProjectionSourceKind.PROCESS_VERSION,
@@ -222,10 +231,10 @@ VERSIONED_RECORD_KINDS = frozenset(
         ProjectionSourceKind.SOP_SECTION,
         ProjectionSourceKind.SOP_EXCEPTION,
         ProjectionSourceKind.SOP_DEFINITION,
+        ProjectionSourceKind.RACI_MATRIX,
+        ProjectionSourceKind.RACI,
     }
 )
-
-P3_SOURCE_KINDS = frozenset({ProjectionSourceKind.RACI})
 
 
 class ProjectionRelation(str, Enum):
@@ -236,8 +245,10 @@ class ProjectionRelation(str, Enum):
     edges; the rest of the process-structure set joins an approved version to
     its steps, a step to the step that follows it, a step to the role that does
     it and the system it uses, an SOP to its sections, exceptions and
-    definitions, and an SOP step to the map step it details. The RACI edges and the ratified EVIDENCES
-    edge are refused by ProjectionEdgeOp.
+    definitions, and an SOP step to the map step it details. The RACI set joins
+    an approved chart to its workflow and to its rows, and a role to each row it
+    is Responsible for, Accountable for, Consulted on or Informed of. The
+    ratified OWNED_BY and EVIDENCES edges are refused by ProjectionEdgeOp.
     """
 
     DERIVED_FROM = "DERIVED_FROM"
@@ -252,7 +263,25 @@ class ProjectionRelation(str, Enum):
     HAS_EXCEPTION = "HAS_EXCEPTION"
     DEFINES = "DEFINES"
     DETAILS = "DETAILS"
+    CHART_OF = "CHART_OF"
+    HAS_ASSIGNMENT = "HAS_ASSIGNMENT"
+    RESPONSIBLE_FOR = "RESPONSIBLE_FOR"
+    ACCOUNTABLE_FOR = "ACCOUNTABLE_FOR"
+    CONSULTED = "CONSULTED"
+    INFORMED = "INFORMED"
 
+
+# The RACI lane's relations (PROJECTION_V2_ALLOW_RACI).
+RACI_RELATIONS = frozenset(
+    {
+        ProjectionRelation.CHART_OF,
+        ProjectionRelation.HAS_ASSIGNMENT,
+        ProjectionRelation.RESPONSIBLE_FOR,
+        ProjectionRelation.ACCOUNTABLE_FOR,
+        ProjectionRelation.CONSULTED,
+        ProjectionRelation.INFORMED,
+    }
+)
 
 PROCESS_STRUCTURE_RELATIONS = frozenset(
     {
@@ -297,6 +326,12 @@ RELATION_ENDPOINT_KINDS: dict[
     ProjectionRelation.DEFINES: frozenset({(_K.SOP, _K.SOP_DEFINITION)}),
     # An SOP step says how one step of the approved map is carried out.
     ProjectionRelation.DETAILS: frozenset({(_K.SOP_STEP, _K.PROCESS_STEP)}),
+    ProjectionRelation.CHART_OF: frozenset({(_K.RACI_MATRIX, _K.WORKFLOW)}),
+    ProjectionRelation.HAS_ASSIGNMENT: frozenset({(_K.RACI_MATRIX, _K.RACI)}),
+    ProjectionRelation.RESPONSIBLE_FOR: frozenset({(_K.ROLE, _K.RACI)}),
+    ProjectionRelation.ACCOUNTABLE_FOR: frozenset({(_K.ROLE, _K.RACI)}),
+    ProjectionRelation.CONSULTED: frozenset({(_K.ROLE, _K.RACI)}),
+    ProjectionRelation.INFORMED: frozenset({(_K.ROLE, _K.RACI)}),
 }
 
 
@@ -514,13 +549,7 @@ class ProjectionSource(BaseModel):
     def _validate_source(self) -> "ProjectionSource":
         _require_nfc("source.id", self.id)
         _require_nfc("source.immutable_version_id", self.immutable_version_id)
-        admitted = P2_PRIME_SOURCE_KINDS | PROCESS_STRUCTURE_SOURCE_KINDS
-        if self.kind in P3_SOURCE_KINDS:
-            raise ValueError(
-                f"source.kind {self.kind.value} is P3 backfill (published-to-date "
-                "RACI) and is refused in this phase; the projection admits "
-                f"{sorted(k.value for k in admitted)}"
-            )
+        admitted = P2_PRIME_SOURCE_KINDS | PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS
         if self.kind not in admitted:
             raise ValueError(
                 f"source.kind {self.kind.value} is outside the projection allowlist "
@@ -657,7 +686,11 @@ class FindingLifecycle(BaseModel):
 # The caller projects the new version's records first and the workflow node
 # last, so retrieval never points at records that are not there yet.
 RECORD_WORKFLOW_PROPERTY = "workflow_node_id"
-CURRENT_VERSION_PROPERTIES = ("current_map_version_id", "current_sop_version_id")
+CURRENT_VERSION_PROPERTIES = (
+    "current_map_version_id",
+    "current_sop_version_id",
+    "current_raci_version_id",
+)
 
 
 def _check_record_scope(kind: ProjectionSourceKind, properties: dict[str, Any]) -> None:
@@ -713,10 +746,10 @@ class ProjectionNodeOp(BaseModel):
     def _validate_node(self) -> "ProjectionNodeOp":
         _require_nfc("node_id", self.node_id)
         _check_property_map(self.properties)
-        # The process-structure rules apply to process-structure kinds only, so
+        # The record rules apply to process-structure and RACI kinds only, so
         # an envelope of the kinds admitted before them validates exactly as it
         # always did, and a resend of one still replays.
-        if self.source.kind in PROCESS_STRUCTURE_SOURCE_KINDS:
+        if self.source.kind in RECORD_RULE_SOURCE_KINDS:
             _check_record_scope(self.source.kind, self.properties)
             text = self.properties.get(RECORD_TEXT_PROPERTY)
             if text is not None and (not isinstance(text, str) or not text.strip()):
@@ -779,8 +812,8 @@ class ProjectionEdgeOp(BaseModel):
             )
         if self.relation in P3_EDGE_RELATIONS:
             raise ValueError(
-                f"relation '{self.relation}' belongs to the P3 backfill vocabulary "
-                "(published-to-date RACI) and is refused in this phase"
+                f"relation '{self.relation}' belongs to the P3 vocabulary that is "
+                "not projected yet and is refused in this phase"
             )
         if self.relation in P3_DEPENDENT_EDGE_RELATIONS:
             raise ValueError(
@@ -988,3 +1021,21 @@ class ProjectionEnvelopeV2(BaseModel):
             return True
         structure = {relation.value for relation in PROCESS_STRUCTURE_RELATIONS}
         return any(op.relation in structure for op in self.edge_ops)
+
+    def carries_raci(self) -> bool:
+        """True when any operation belongs to the RACI lane.
+
+        A responsibility chart hangs on the process structure (its rows name a
+        workflow node, and a workflow node points at the chart in force), so an
+        envelope that carries one is subject to both switches.
+        """
+        if any(op.source.kind in P3_SOURCE_KINDS for op in self.node_ops):
+            return True
+        if any(
+            op.source.kind is ProjectionSourceKind.WORKFLOW
+            and op.properties.get("current_raci_version_id") is not None
+            for op in self.node_ops
+        ):
+            return True
+        raci = {relation.value for relation in RACI_RELATIONS}
+        return any(op.relation in raci for op in self.edge_ops)
