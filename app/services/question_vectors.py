@@ -146,14 +146,14 @@ def decode(value: Any) -> list[float] | None:
 
 
 def _storable(vector: Any) -> bool:
-    """Only a whole vector of this model's size is kept; anything else is used once and dropped."""
-    if not isinstance(vector, list) or len(vector) != int(settings.embedding_dim):
-        return False
-    return all(
-        isinstance(number, (int, float))
-        and not isinstance(number, bool)
-        and math.isfinite(number)
-        and abs(number) < 3.0e38
+    """Whether a vector can be written as 32-bit numbers at all.
+
+    Its size and whether every number is finite are decode()'s to judge, on
+    the way back: what does not decode is used once and not kept. (A number
+    that is not finite fails the comparison here as well.)
+    """
+    return isinstance(vector, list) and all(
+        isinstance(number, (int, float)) and not isinstance(number, bool) and abs(number) < 3.0e38
         for number in vector
     )
 
