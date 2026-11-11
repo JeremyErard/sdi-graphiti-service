@@ -50,7 +50,7 @@ from app.models.projection import (
     RECORD_WORKFLOW_PROPERTY,
     ProjectionSourceKind,
 )
-from app.services import graphiti_client, question_vectors
+from app.services import graphiti_client, question_vectors, vector_turns
 
 logger = logging.getLogger("graphiti_service")
 
@@ -411,7 +411,7 @@ def _leg_heads(window: int) -> tuple[str, str]:
     keyword = (
         f"CALL db.idx.fulltext.queryNodes('{PROJECTION_NODE_LABEL}', $query) "
         "YIELD node AS n, score "
-        f"WITH n, score ORDER BY score DESC LIMIT {int(window)} "
+        f"WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT {int(window)} "
     )
     return vector, keyword
 
@@ -423,8 +423,10 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     force for the engagements asked about, ordered again after the join: the
     vector procedure scores by distance (nearest first), the keyword procedure
     by relevance (highest first). Two records with the same score are put in
-    order by their id, so which of them makes the cut never depends on the
-    order the engine happened to hand them over. The vector leg only trusts a vector made by
+    order by their id, in the final cut and in the keyword leg's window, so
+    which of them is kept does not depend on the order the engine happened to
+    hand them over. (Which candidates the vector index puts in its own window
+    is the index's to decide and is not something a statement can order.) The vector leg only trusts a vector made by
     the embedding model in use, so a change of model cannot silently compare
     vectors from two spaces.
     """
@@ -485,52 +487,22 @@ def _read(graph: Any, statement: str, params: dict[str, Any], timeout_ms: int) -
     return graph.ro_query(statement, params, timeout=timeout_ms)
 
 
-# One record vector read at a time, in this process.
-#
-# On a real engine (2026-11-11) two nearest-neighbour reads of the record index
-# running at the same moment came back wrong about 1 to 3 times in 100: the
-# nearest record repeated in every row. One at a time, never. It is the
-# engine's own lookup that does it (the bare procedure shows it with nothing
-# after it), so no wording of the statement avoids it. This service is the only
-# client of the database and runs as one process, so taking turns here closes
-# it. Keyword reads did not show it in 300 tries and do not wait; nor did the
-# fact search's lookup over relationships in 400.
-_vector_turns: dict[int, tuple[Any, asyncio.Lock]] = {}
+async def _leg_read(
+    graph: Any, leg: str, statement: str, params: dict[str, Any], timeout_ms: int, deadline: float
+) -> Any:
+    """One read of a leg. A vector read waits its turn (see vector_turns); a keyword read does not.
 
-
-def _vector_turn() -> asyncio.Lock:
-    """The turn for the event loop this is running on (one loop, one turn)."""
-    loop = asyncio.get_running_loop()
-    held = _vector_turns.get(id(loop))
-    if held is None or held[0] is not loop:
-        for key in [key for key, (other, _turn) in _vector_turns.items() if other.is_closed()]:
-            del _vector_turns[key]
-        held = _vector_turns[id(loop)] = (loop, asyncio.Lock())
-    return held[1]
-
-
-def _end_turn(turn: asyncio.Lock, reading: asyncio.Future) -> None:
-    turn.release()
-    if not reading.cancelled():
-        reading.exception()  # read here so a caller that stopped waiting leaves no unread error behind
-
-
-async def _leg_read(graph: Any, leg: str, statement: str, params: dict[str, Any], timeout_ms: int) -> Any:
-    """One read of a leg. A vector read waits its turn; a keyword read does not.
-
-    The wait is bounded by the leg's own time limit: a read that cannot get
-    its turn in that time fails like any other read that ran out of time. The
-    turn ends when the read does, not when the caller stops waiting, so a
-    request that is cancelled part-way never lets the next read start beside
-    one the engine is still running.
+    The wait for a turn comes out of the leg's own time: it is bounded by the
+    read's limit and by what is left before the leg's deadline, so a leg takes
+    no longer than it could before turns existed. A read that cannot get its
+    turn in that time fails like any other read that ran out of time.
     """
     if leg != "vector":
         return await asyncio.to_thread(_read, graph, statement, params, timeout_ms)
-    turn = _vector_turn()
-    await asyncio.wait_for(turn.acquire(), timeout_ms / 1000)
-    reading = asyncio.ensure_future(asyncio.to_thread(_read, graph, statement, params, timeout_ms))
-    reading.add_done_callback(lambda done: _end_turn(turn, done))
-    return await asyncio.shield(reading)
+    wait = min(timeout_ms / 1000, deadline - time.monotonic())
+    return await vector_turns.take_turn(
+        lambda: asyncio.to_thread(_read, graph, statement, params, timeout_ms), wait
+    )
 
 
 async def _leg(
@@ -552,14 +524,14 @@ async def _leg(
     while True:
         try:
             rows = (
-                await _leg_read(graph, leg, record_leg_queries(pool, window)[index], params, timeout_ms)
+                await _leg_read(graph, leg, record_leg_queries(pool, window)[index], params, timeout_ms, deadline)
             ).result_set or []
             if rows:
                 seen = int(rows[0][-1])
             else:
                 # Nothing survived: was the window full of records out of force, or is there nothing there?
                 counted = (
-                    await _leg_read(graph, leg, record_leg_counts(window)[index], params, timeout_ms)
+                    await _leg_read(graph, leg, record_leg_counts(window)[index], params, timeout_ms, deadline)
                 ).result_set
                 seen = int(counted[0][0]) if counted and counted[0] else 0
         except Exception:

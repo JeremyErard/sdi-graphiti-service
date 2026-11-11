@@ -53,6 +53,21 @@ STORE_SOCKET_SECONDS = 0.5
 STORE_WAIT_SECONDS = 1.0
 # After a failure the store is not tried again for this long.
 STORE_REST_SECONDS = 60.0
+# Connections the store may hold. A call that finds them all busy waits for one
+# (up to the socket limit) instead of failing: a burst of questions is not a
+# store in trouble, and must not send it to rest.
+STORE_CONNECTIONS = 8
+# Questions whose vector is never kept. A question asked only to find out
+# whether search works end to end has to reach the provider every time, or a
+# provider that has stopped answering would hide behind a kept vector. The
+# platform's health monitor asks exactly this.
+NEVER_KEPT = frozenset({"health probe"})
+# Removes a value only if it is still the one that was read: two asks that both
+# found the same unreadable value then race for the key like any two first
+# asks, and the first writer wins.
+_DROP_IF_UNCHANGED = (
+    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
+)
 
 _redis: Any = None
 _resting_until = 0.0
@@ -74,15 +89,18 @@ def _client() -> Any:
         from redis.retry import Retry  # noqa: PLC0415
 
         _redis = redis.Redis(
-            host=settings.falkordb_host,
-            port=settings.falkordb_port,
-            password=settings.falkordb_password or None,
-            socket_connect_timeout=STORE_SOCKET_SECONDS,
-            socket_timeout=STORE_SOCKET_SECONDS,
-            retry=Retry(NoBackoff(), 0),
-            retry_on_timeout=False,
-            decode_responses=True,
-            max_connections=8,
+            connection_pool=redis.BlockingConnectionPool(
+                max_connections=STORE_CONNECTIONS,
+                timeout=STORE_SOCKET_SECONDS,
+                host=settings.falkordb_host,
+                port=settings.falkordb_port,
+                password=settings.falkordb_password or None,
+                socket_connect_timeout=STORE_SOCKET_SECONDS,
+                socket_timeout=STORE_SOCKET_SECONDS,
+                retry=Retry(NoBackoff(), 0),
+                retry_on_timeout=False,
+                decode_responses=True,
+            )
         )
     return _redis
 
@@ -158,17 +176,28 @@ def _storable(vector: Any) -> bool:
     )
 
 
-def _write(store: Any, key: str, encoded: str, only_if_absent: bool) -> Any:
+def _write(store: Any, key: str, encoded: str, unreadable: Any) -> Any:
     """Keep a vector and return the value the key holds afterwards.
 
-    The first writer wins: an ask that finds another got there first takes that
-    one's vector, so two asks that raced end on the same vector. A value that
-    did not decode is written over instead. The index is what holds the store
-    to its cap: the newest goes in, and past the cap the oldest come out.
+    The first writer wins, always: an ask that finds another got there first
+    takes that one's vector, so two asks that raced end on the same vector. A
+    value that was there but did not decode (`unreadable`) is removed first,
+    and only if it is still the value that was read, so two asks that both
+    found it race for the key like any two first asks. The index is what holds
+    the store to its cap: the newest goes in, and past the cap the oldest come
+    out.
     """
-    stored = store.set(key, encoded, ex=KEEP_SECONDS, nx=only_if_absent)
-    if not stored:
-        return store.get(key)
+    if unreadable is not None:
+        store.eval(_DROP_IF_UNCHANGED, 1, key, unreadable)
+    for _attempt in range(2):
+        if store.set(key, encoded, ex=KEEP_SECONDS, nx=True):
+            break
+        held = store.get(key)
+        if held is not None:
+            return held
+        # Another ask's vector was there and is gone again (expired or trimmed) between the two calls: try once more.
+    else:
+        return None
     now = time.time()
     pipe = store.pipeline(transaction=False)
     pipe.zremrangebyscore(INDEX_KEY, 0, now - KEEP_SECONDS)
@@ -191,7 +220,7 @@ async def question_vector(embedder: Any, graph_name: str, query: str) -> list[fl
     hand the index the same numbers.
     """
     text = query.replace("\n", " ")
-    store = _store()
+    store = None if text.strip().lower() in NEVER_KEPT else _store()
     key = question_key(graph_name, text)
     found: Any = None
     if store is not None:
@@ -214,8 +243,7 @@ async def question_vector(embedder: Any, graph_name: str, query: str) -> list[fl
     if settled is None:
         return vector
     try:
-        # A value was there but did not decode: write over it. Otherwise only if absent.
-        held = await _within(_write, store, key, encoded, found is None)
+        held = await _within(_write, store, key, encoded, found)
     except Exception as error:
         _rest(error)
         return settled

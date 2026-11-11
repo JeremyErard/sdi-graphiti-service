@@ -97,6 +97,15 @@ class FakeStore:
         self.ttl[key] = ex
         return True
 
+    def eval(self, script, numkeys, key, value):
+        # The one script the store runs: remove a value only if it is still the one that was read.
+        assert script == question_vectors._DROP_IF_UNCHANGED and numkeys == 1
+        self.calls.append(("eval", key, value))
+        if self.values.get(key) == value:
+            del self.values[key]
+            return 1
+        return 0
+
     def pipeline(self, transaction=True):
         self.calls.append(("pipeline", transaction))
         return FakePipe(self)
@@ -302,7 +311,8 @@ def test_a_value_that_is_not_this_models_vector_is_passed_over_and_written_over(
     embedder = JitterEmbedder()
     answer = ask(embedder)
     assert len(embedder.asked) == 1, "the provider is asked"
-    assert ("set", key, question_vectors.KEEP_SECONDS, False) in kept.calls, "written over, not left in the way"
+    assert ("eval", key, held) in kept.calls, "removed, not left in the way, and only if it is still the value that was read"
+    assert [call for call in kept.calls if call[0] == "set"] == [("set", key, question_vectors.KEEP_SECONDS, True)], "then kept like any first ask"
     assert question_vectors.decode(kept.values[key]) == answer
     assert ask(embedder) == answer and len(embedder.asked) == 1
 
@@ -315,6 +325,7 @@ def test_a_value_that_is_not_this_models_vector_is_passed_over_and_written_over(
         [0.1, float("nan"), 0.3, 0.4],
         [0.1, float("inf"), 0.3, 0.4],
         [0.1, 1e39, 0.3, 0.4],  # does not fit a 32-bit number
+        [0.1, 10**400, 0.3, 0.4],  # a whole number too large for any float
         [0.1, "0.2", 0.3, None],
         [0.1, "0.2", 0.3, 0.4],  # a number written as text
         [0.1, True, 0.3, 0.4],
@@ -330,6 +341,72 @@ def test_only_a_whole_vector_of_this_models_size_is_kept(kept, made):
     answer = ask(Odd())
     assert answer is made or answer == made or (isinstance(made, list) and all(a is b or a == b or (isinstance(a, float) and math.isnan(a)) for a, b in zip(answer, made)))
     assert kept.values == {} and [call[0] for call in kept.calls] == ["get"]
+
+
+def test_two_asks_that_both_found_an_unreadable_value_end_on_the_same_vector(kept):
+    # Both read the same unreadable value. The second to write must not put its own vector over the first's.
+    key = question_vectors.question_key(GRAPH, QUESTION)
+    kept.values[key] = "not base64 !!"
+    first_ask = JitterEmbedder()
+    plain_eval = kept.eval
+    others = question_vectors.encode([0.9, 0.8, 0.7, 0.6])
+
+    def eval_after_the_other(script, numkeys, name, value):
+        # The other ask has already removed the unreadable value and kept its own vector.
+        kept.values[name] = others
+        return plain_eval(script, numkeys, name, value)
+
+    kept.eval = eval_after_the_other
+    assert ask(first_ask) == question_vectors.decode(others), "the first writer's vector is the question's"
+    assert kept.values[key] == others, "and it was not removed or written over"
+
+
+def test_a_vector_that_was_there_and_is_gone_again_is_kept_on_the_second_try(kept):
+    # Another ask's vector blocks the first write and has expired by the time it is read.
+    key = question_vectors.question_key(GRAPH, QUESTION)
+    plain_set = kept.set
+    tries = []
+
+    def set_(name, value, ex=None, nx=False):
+        tries.append(1)
+        if len(tries) == 1:
+            kept.calls.append(("set", name, ex, nx))
+            return None  # someone else's value is there...
+        return plain_set(name, value, ex=ex, nx=nx)  # ...and gone by the next call
+
+    kept.set = set_
+    embedder = JitterEmbedder()
+    answer = ask(embedder)
+    assert len(tries) == 2 and question_vectors.decode(kept.values[key]) == answer
+    assert ask(embedder) == answer and len(embedder.asked) == 1
+
+
+def test_a_vector_that_cannot_be_kept_after_two_tries_is_still_an_answer(kept):
+    kept.set = lambda name, value, ex=None, nx=False: None
+    embedder = JitterEmbedder()
+    assert ask(embedder) == as_stored([0.1 + 1e-3 + place * 0.01 for place in range(4)])
+    assert kept.values == {} and kept.index == {}
+
+
+@pytest.mark.parametrize("probe", ["health probe", "Health Probe", " health probe ", "health\nprobe"])
+def test_the_health_monitors_question_always_reaches_the_provider(kept, probe):
+    # A question asked only to find out whether search works end to end must not be answered from a kept vector:
+    # a provider that had stopped answering would hide behind it.
+    embedder = JitterEmbedder()
+    assert ask(embedder, question=probe) != ask(embedder, question=probe)
+    assert len(embedder.asked) == 2 and kept.calls == [] and kept.values == {}
+    assert question_vectors.NEVER_KEPT == frozenset({"health probe"})
+
+
+def test_only_text_written_by_the_store_decodes(kept):
+    good = question_vectors.encode([0.1, 0.2, 0.3, 0.4])
+    assert question_vectors.decode(good) == as_stored([0.1, 0.2, 0.3, 0.4])
+    # The same text with a line break, a space or other characters outside the alphabet is not the store's.
+    for odd in (good[:8] + "\n" + good[8:], good + " ", good[:8] + "!" + good[8:], " " + good):
+        assert question_vectors.decode(odd) is None, odd
+    assert question_vectors.decode(good.encode("ascii")) == as_stored([0.1, 0.2, 0.3, 0.4]), "bytes from a client that does not decode replies"
+    for other in (None, 7, 0.5, [good], {"value": good}):
+        assert question_vectors.decode(other) is None
 
 
 def test_the_providers_failure_is_the_callers_as_before_and_nothing_is_kept(kept):
@@ -398,12 +475,17 @@ def test_the_bounds_are_the_ones_the_design_was_sized_for():
 def test_the_stores_own_connection_gives_up_in_half_a_second_and_is_made_once(monkeypatch):
     import redis
 
-    built = []
+    pools, clients = [], []
+
+    def fake_pool(**kwargs):
+        pools.append(kwargs)
+        return SimpleNamespace(kind="pool", made=len(pools))
 
     def fake_redis(**kwargs):
-        built.append(kwargs)
+        clients.append(kwargs)
         return SimpleNamespace(kind="store")
 
+    monkeypatch.setattr(redis, "BlockingConnectionPool", fake_pool)
     monkeypatch.setattr(redis, "Redis", fake_redis)
     monkeypatch.setattr(question_vectors, "_client", REAL_CLIENT)
     monkeypatch.setattr(settings, "falkordb_host", "graph.internal", raising=False)
@@ -411,9 +493,15 @@ def test_the_stores_own_connection_gives_up_in_half_a_second_and_is_made_once(mo
     monkeypatch.setattr(settings, "falkordb_password", "", raising=False)
     question_vectors.reset()
     first, second = question_vectors._client(), question_vectors._client()
-    assert first is second and len(built) == 1
-    retry = built[0].pop("retry")
-    assert built[0] == {
+    assert first is second and len(pools) == 1 and len(clients) == 1
+    assert list(clients[0]) == ["connection_pool"] and clients[0]["connection_pool"].made == 1
+    retry = pools[0].pop("retry")
+    assert pools[0] == {
+        # A call that finds every connection busy waits for one, up to the socket limit. It does not fail:
+        # nine questions at once are not a store in trouble (with a pool that fails, the ninth sent a healthy
+        # store to rest for a minute).
+        "max_connections": 8,
+        "timeout": 0.5,
         "host": "graph.internal",
         "port": 6380,
         "password": None,
@@ -421,8 +509,8 @@ def test_the_stores_own_connection_gives_up_in_half_a_second_and_is_made_once(mo
         "socket_timeout": 0.5,
         "retry_on_timeout": False,
         "decode_responses": True,
-        "max_connections": 8,
     }
+    assert question_vectors.STORE_CONNECTIONS == 8
     # The library's own default retries a failed connection with growing waits
     # (4.7 s on a real engine where half a second was meant). Never a second try.
     tries = []
@@ -436,7 +524,18 @@ def test_the_stores_own_connection_gives_up_in_half_a_second_and_is_made_once(mo
     assert len(tries) == 1
     question_vectors.reset()
     question_vectors._client()
-    assert len(built) == 2, "reset() forgets the connection"
+    assert len(pools) == 2, "reset() forgets the connection"
+
+
+def test_the_real_pool_is_one_that_waits_for_a_free_connection(monkeypatch):
+    import redis
+
+    monkeypatch.setattr(question_vectors, "_client", REAL_CLIENT)
+    question_vectors.reset()
+    pool = question_vectors._client().connection_pool
+    assert isinstance(pool, redis.BlockingConnectionPool)
+    assert pool.max_connections == 8 and pool.timeout == 0.5
+    question_vectors.reset()
 
 
 # --------------------------------------------------------------------------

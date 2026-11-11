@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import settings
-from app.services import graphiti_client, projection_records
+from app.services import graphiti_client, indexed_falkor, projection_records, vector_turns
 
 ROW = ["r1", "a statement", "PROCESS_STEP", "src", "pv-1", "eng-1", "wf-1", "Receiving", 0.1, 1]
 
@@ -113,7 +113,7 @@ def test_a_vector_read_that_cannot_get_its_turn_in_time_is_skipped_and_the_keywo
     monkeypatch.setattr(settings, "search_vector_timeout_ms", 40, raising=False)
 
     async def held_out():
-        turn = projection_records._vector_turn()
+        turn = vector_turns.turn()
         await turn.acquire()  # another read has the turn and does not give it back
         try:
             began = time.monotonic()
@@ -126,7 +126,7 @@ def test_a_vector_read_that_cannot_get_its_turn_in_time_is_skipped_and_the_keywo
         found, waited = asyncio.run(held_out())
     assert [record["record_id"] for record in found] == ["r1"], "the keyword half answers"
     assert "vector" not in graph.reads, "no vector read ran beside the one holding the turn"
-    assert 0.03 <= waited < 1.0, f"waited {waited:.3f} s for a 40 ms limit"
+    assert 0.03 <= waited < 0.25, f"waited {waited:.3f} s for a 40 ms limit"
     (skipped,) = [r for r in caplog.records if "record vector leg skipped" in r.getMessage()]
     assert "error_type=TimeoutError" in skipped.getMessage()
 
@@ -170,7 +170,7 @@ def test_a_vector_read_that_fails_gives_the_turn_back(wired):
     async def twice():
         first = await search("first question")
         second = await search("second question")
-        return first, second, projection_records._vector_turn().locked()
+        return first, second, vector_turns.turn().locked()
 
     first, second, still_held = asyncio.run(twice())
     assert [record["record_id"] for record in first] == ["r1"], "the keyword half answered the first"
@@ -181,11 +181,194 @@ def test_a_vector_read_that_fails_gives_the_turn_back(wired):
 
 def test_each_event_loop_has_its_own_turn_and_a_closed_loop_is_forgotten():
     async def turn():
-        return projection_records._vector_turn(), projection_records._vector_turn()
+        return vector_turns.turn(), vector_turns.turn()
 
-    projection_records._vector_turns.clear()
+    vector_turns._turns.clear()
     one, again = asyncio.run(turn())
     assert one is again, "one loop, one turn"
     other, _ = asyncio.run(turn())
     assert other is not one, "a lock is never carried from one loop to another"
-    assert len(projection_records._vector_turns) == 1, "the closed loop's turn is gone"
+    assert len(vector_turns._turns) == 1, "the closed loop's turn is gone"
+
+
+def test_the_wait_for_a_turn_comes_out_of_the_legs_own_time(wired, monkeypatch):
+    # The leg has 2 x its read limit in all. A leg whose first read found nothing asks for its count
+    # read with what is left on that clock, never a fresh limit.
+    graph = wired(WatchedGraph(read_seconds=0.0, vector_rows=False))
+    monkeypatch.setattr(settings, "search_vector_timeout_ms", 60, raising=False)
+    waits: list[float] = []
+    plain = vector_turns.take_turn
+
+    async def watching(start, wait_seconds):
+        waits.append(wait_seconds)
+        return await plain(start, wait_seconds)
+
+    monkeypatch.setattr(vector_turns, "take_turn", watching)
+    asyncio.run(search())
+    assert len(waits) == 2, "the leg read and its count read"
+    assert all(0 < wait <= 0.06 for wait in waits), waits
+
+    # Nothing left on the clock and the turn held: the read gives up at once (not after its own
+    # 400 ms limit) and is never started.
+    async def with_the_turn_held():
+        turn = vector_turns.turn()
+        await turn.acquire()
+        try:
+            began = time.monotonic()
+            with pytest.raises(TimeoutError):
+                await projection_records._leg_read(graph, "vector", "CALL db.idx.vector.queryNodes()", {}, 400, time.monotonic() - 1)
+            return time.monotonic() - began
+        finally:
+            turn.release()
+
+    before = graph.reads.count("vector")
+    gave_up_after = asyncio.run(with_the_turn_held())
+    assert gave_up_after < 0.15, f"gave up after {gave_up_after:.3f} s with no time left"
+    assert graph.reads.count("vector") == before
+
+    # A little left on the clock: the wait is that little, not the read's whole limit.
+    async def a_little_left():
+        turn = vector_turns.turn()
+        await turn.acquire()
+        try:
+            began = time.monotonic()
+            with pytest.raises(TimeoutError):
+                await projection_records._leg_read(graph, "vector", "CALL db.idx.vector.queryNodes()", {}, 2000, time.monotonic() + 0.05)
+            return time.monotonic() - began
+        finally:
+            turn.release()
+
+    waited = asyncio.run(a_little_left())
+    assert 0.04 <= waited < 0.5, f"waited {waited:.3f} s with 50 ms left and a 2 s read limit"
+
+
+def test_a_read_that_fails_after_its_caller_stopped_waiting_leaves_no_unread_error(wired):
+    graph = wired(WatchedGraph(read_seconds=0.0))
+    graph.hold = threading.Event()
+    plain = graph.ro_query
+
+    def failing(statement, params=None, timeout=None):
+        if "db.idx.vector.queryNodes" in statement:
+            graph.started.set()
+            graph.hold.wait(timeout=5)
+            raise RuntimeError("the engine failed this read")
+        return plain(statement, params, timeout)
+
+    graph.ro_query = failing
+    unread: list[dict] = []
+
+    async def cancel_mid_read():
+        asyncio.get_running_loop().set_exception_handler(lambda loop, context: unread.append(context))
+        first = asyncio.ensure_future(search())
+        await asyncio.to_thread(graph.started.wait, 2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        graph.hold.set()
+        await asyncio.sleep(0.1)
+        import gc
+
+        gc.collect()
+        await asyncio.sleep(0)
+        return vector_turns.turn().locked()
+
+    assert asyncio.run(cancel_mid_read()) is False, "the turn was given back"
+    assert unread == [], unread
+
+
+def test_a_start_that_cannot_begin_gives_the_turn_back():
+    async def run():
+        def broken():
+            raise RuntimeError("could not start")
+
+        with pytest.raises(RuntimeError, match="could not start"):
+            await vector_turns.take_turn(broken, 1.0)
+        return vector_turns.turn().locked()
+
+    assert asyncio.run(run()) is False
+
+
+# --------------------------------------------------------------------------
+# The entity lookup used when facts are ingested reads a node index too
+# --------------------------------------------------------------------------
+
+
+class EntityExecutor:
+    """Stands in for the async driver: counts lookups running at the same moment."""
+
+    def __init__(self, seconds=0.02):
+        self.seconds, self.running, self.most, self.calls = seconds, 0, 0, []
+
+    async def execute_query(self, cypher, **params):
+        if "db.idx.vector.queryNodes" not in cypher:
+            return [], None, None
+        self.calls.append(cypher)
+        self.running += 1
+        self.most = max(self.most, self.running)
+        try:
+            await asyncio.sleep(self.seconds)
+            return [], None, None
+        finally:
+            self.running -= 1
+
+
+def entity_search(executor, monkeypatch):
+    async def ensured(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(indexed_falkor, "ensure_node_vector_index_via", ensured)
+    monkeypatch.setattr(indexed_falkor, "_has_filters", lambda search_filter: False)
+    monkeypatch.setattr(settings, "embedding_dim", 4, raising=False)
+    operations = indexed_falkor.IndexedFalkorSearchOperations()
+    return lambda: operations.node_similarity_search(executor, [0.1, 0.2, 0.3, 0.4], None, ["client_unit"], 5, 0.6)
+
+
+def test_entity_lookups_take_turns_with_each_other_and_with_record_reads(wired, monkeypatch):
+    graph = wired(WatchedGraph(read_seconds=0.02))
+    executor = EntityExecutor()
+    lookup = entity_search(executor, monkeypatch)
+    overlap = {"most": 0}
+    plain = graph.ro_query
+
+    def watched(statement, params=None, timeout=None):
+        if "db.idx.vector.queryNodes" in statement:
+            overlap["most"] = max(overlap["most"], executor.running + 1)
+        return plain(statement, params, timeout)
+
+    graph.ro_query = watched
+
+    async def together():
+        await asyncio.gather(*[lookup() for _ in range(4)], *[search(f"question {n}") for n in range(4)])
+
+    asyncio.run(together())
+    assert len(executor.calls) == 4 and graph.reads.count("vector") == 4
+    assert executor.most == 1, "one entity lookup at a time"
+    assert graph.most["vector"] == 1 and overlap["most"] == 1, "and never beside a record read"
+
+
+def test_an_entity_lookup_that_cannot_get_its_turn_falls_back_to_the_scan(monkeypatch):
+    executor = EntityExecutor()
+    lookup = entity_search(executor, monkeypatch)
+    monkeypatch.setattr(indexed_falkor, "NODE_VECTOR_TURN_WAIT_SECONDS", 0.03)
+    scanned = []
+
+    async def scan(self, *args, **kwargs):
+        scanned.append(1)
+        return []
+
+    monkeypatch.setattr(indexed_falkor.FalkorSearchOperations, "node_similarity_search", scan)
+
+    async def held_out():
+        turn = vector_turns.turn()
+        await turn.acquire()
+        try:
+            return await lookup()
+        finally:
+            turn.release()
+
+    assert asyncio.run(held_out()) == []
+    assert scanned == [1] and executor.calls == [], "the scan answered; the index was not read beside the read holding the turn"
+
+
+def test_an_entity_lookup_waits_two_seconds_for_its_turn_at_most():
+    assert indexed_falkor.NODE_VECTOR_TURN_WAIT_SECONDS == 2.0

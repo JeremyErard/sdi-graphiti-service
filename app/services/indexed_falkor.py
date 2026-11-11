@@ -39,6 +39,8 @@ from graphiti_core.graph_queries import get_vector_cosine_func_query
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
 from graphiti_core.nodes import EntityNode
 
+from app.services import vector_turns
+
 logger = logging.getLogger("graphiti_service")
 
 _node_vindex_ensured: set[str] = set()
@@ -169,6 +171,10 @@ def _log_fallback(kind: str, group_key: str, error: BaseException) -> None:
 # (group, min_score) apply. One graph holds one group, so a small factor keeps
 # recall; the index bounds the work either way.
 VECTOR_OVERFETCH = 4
+# How long an entity lookup waits for its turn at the node index before it
+# falls back to the scan. Lookups take milliseconds, so a wait this long means
+# something else is wrong, and the scan is slow but right.
+NODE_VECTOR_TURN_WAIT_SECONDS = 2.0
 
 
 # How many extra fulltext hits to pull before filtering. The bound is applied
@@ -309,12 +315,19 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
                 + get_entity_node_return_query(GraphProvider.FALKORDB)
                 + " ORDER BY score DESC LIMIT $limit"
             )
-            records, _, _ = await executor.execute_query(
-                cypher,
-                search_vector=search_vector,
-                min_score=min_score,
-                limit=int(limit),
-                **({"group_ids": group_ids} if group_ids else {}),
+            # A nearest-neighbour read of a node index takes its turn: two at the
+            # same moment came back wrong on a real engine (see vector_turns).
+            # A read that cannot get its turn in time falls back to the scan
+            # below, like any other failure of the index path.
+            records, _, _ = await vector_turns.take_turn(
+                lambda: executor.execute_query(
+                    cypher,
+                    search_vector=search_vector,
+                    min_score=min_score,
+                    limit=int(limit),
+                    **({"group_ids": group_ids} if group_ids else {}),
+                ),
+                NODE_VECTOR_TURN_WAIT_SECONDS,
             )
         except Exception as e:  # noqa: BLE001 - no index / no vector support
             _log_fallback("node", group_ids[0] if group_ids else "*", e)
