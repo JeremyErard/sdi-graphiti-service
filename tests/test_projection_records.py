@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import settings
-from app.models.projection import CURRENT_VERSION_PROPERTIES, PROJECTION_NODE_LABEL
+from app.models.projection import CURRENT_VERSION_PROPERTIES, POINTER_RECORD_KINDS, PROJECTION_NODE_LABEL
 from app.services import graphiti_client, projection_records
 
 
@@ -39,6 +39,7 @@ class FakeGraph:
         self.fail_from_window = 0
         self.queries: list[tuple[str, dict]] = []
         self.reads: list[tuple[str, dict]] = []
+        self.read_timeouts: list[tuple[str, int | None]] = []
         self.written: list[dict] = []
         self.refused: list[dict] = []
         self.index_errors: dict[str, Exception] = {}
@@ -67,6 +68,7 @@ class FakeGraph:
     def ro_query(self, statement, params=None, timeout=None):
         params = params or {}
         self.reads.append((statement, params))
+        self.read_timeouts.append((statement, timeout))
         if statement == projection_records._HOLDS_RECORDS:
             if "presence" in self.fail:
                 raise RuntimeError("the presence read timed out")
@@ -381,15 +383,32 @@ def test_engagements_that_hold_no_record_in_force_are_answered_at_once(wired, ca
 
 def test_the_presence_check_asks_for_a_workflow_that_points_at_a_version_in_this_tenant_and_these_engagements():
     q = projection_records._HOLDS_RECORDS
-    assert f"MATCH (w:{PROJECTION_NODE_LABEL})" in q
-    assert "w.engagement_id IN $engagement_ids" in q and "w.group_id = $group_id" in q
-    assert "w.projection_source_kind = 'WORKFLOW'" in q
-    # Every pointer the model knows, so a new kind of record cannot be left out of the check.
+    # Word for word: every condition is joined by AND, the pointers by OR among
+    # themselves. A condition loosened to OR would still say "yes" for every
+    # tenant with any workflow, and the check would quietly stop doing its job.
+    assert q == (
+        "MATCH (w:ProjectionNode) "
+        "WHERE w.engagement_id IN $engagement_ids AND w.group_id = $group_id "
+        "AND w.projection_source_kind = 'WORKFLOW' "
+        "AND (w.current_map_version_id IS NOT NULL OR w.current_raci_version_id IS NOT NULL OR w.current_sop_version_id IS NOT NULL) "
+        "RETURN w.uuid LIMIT 1"
+    )
+    # Every pointer the model knows, from both of its tables, so a new kind of record cannot be left out of the check.
+    assert set(POINTER_RECORD_KINDS) == set(CURRENT_VERSION_PROPERTIES)
     for pointer in CURRENT_VERSION_PROPERTIES:
         assert f"w.{pointer} IS NOT NULL" in q
-    assert q.endswith("RETURN w.uuid LIMIT 1")
     # Nothing from a caller is written into the statement.
     assert "$" in q and "'" not in q.replace("'WORKFLOW'", "")
+
+
+def test_the_presence_check_has_a_short_time_limit_of_its_own_and_the_legs_keep_theirs(wired):
+    graph = wired(FakeGraph(vector_rows=[row("a")], keyword_rows=[row("a")], total=1), FakeEmbedder())
+    asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], "seal number", 3))
+    assert projection_records.PRESENCE_TIMEOUT_MS == 400
+    assert [timeout for statement, timeout in graph.read_timeouts if statement == projection_records._HOLDS_RECORDS] == [400]
+    assert sorted(timeout for statement, timeout in graph.read_timeouts if statement != projection_records._HOLDS_RECORDS) == sorted(
+        [settings.search_vector_timeout_ms, settings.search_bm25_timeout_ms]
+    )
 
 
 def test_a_presence_check_that_fails_says_nothing_and_the_search_goes_on(wired, caplog):
