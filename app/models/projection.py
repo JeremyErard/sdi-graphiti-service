@@ -144,6 +144,15 @@ class ProjectionSourceKind(str, Enum):
     says who is Responsible, Accountable, Consulted and Informed for that row's
     activity. This module admits the shape; the route refuses it unless its own
     lane is switched on.
+
+    A summary is a statement counted, by code, from approved records that are
+    already here: how many SOPs one department has approved, which month had
+    the most approvals, how many maps name one system. It is not an approved
+    record itself and never says more than the records it was counted from.
+    RECORD_SET_SUMMARY is one such statement about the whole body of an
+    engagement's approved records, and RECORD_SET is the one node per
+    engagement that says which set of them is in force. This module admits the
+    shape; the route refuses it unless its own lane is switched on.
     """
 
     FINDING = "FINDING"
@@ -161,6 +170,8 @@ class ProjectionSourceKind(str, Enum):
     SYSTEM = "SYSTEM"
     RACI_MATRIX = "RACI_MATRIX"
     RACI = "RACI"
+    RECORD_SET = "RECORD_SET"
+    RECORD_SET_SUMMARY = "RECORD_SET_SUMMARY"
 
 
 # The node type label written for each admitted kind. A caller never supplies a
@@ -182,6 +193,8 @@ SOURCE_KIND_NODE_LABEL: dict[ProjectionSourceKind, str] = {
     ProjectionSourceKind.SYSTEM: "System",
     ProjectionSourceKind.RACI_MATRIX: "RaciMatrix",
     ProjectionSourceKind.RACI: "RaciAssignment",
+    ProjectionSourceKind.RECORD_SET: "RecordSet",
+    ProjectionSourceKind.RECORD_SET_SUMMARY: "RecordSetSummary",
 }
 
 P2_PRIME_SOURCE_KINDS = frozenset(
@@ -212,9 +225,17 @@ PROCESS_STRUCTURE_SOURCE_KINDS = frozenset(
 # by the model, gated by the route (PROJECTION_V2_ALLOW_RACI).
 P3_SOURCE_KINDS = frozenset({ProjectionSourceKind.RACI_MATRIX, ProjectionSourceKind.RACI})
 
+# Summaries: statements counted by code from an engagement's approved records
+# already projected, and the one node per engagement that says which set of
+# them is in force. Admitted by the model, gated by the route
+# (PROJECTION_V2_ALLOW_SUMMARIES).
+SUMMARY_SOURCE_KINDS = frozenset(
+    {ProjectionSourceKind.RECORD_SET, ProjectionSourceKind.RECORD_SET_SUMMARY}
+)
+
 # Kinds the record rules apply to: a record names its workflow, a workflow names
 # the versions in force, a statement is real text.
-RECORD_RULE_SOURCE_KINDS = PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS
+RECORD_RULE_SOURCE_KINDS = PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS | SUMMARY_SOURCE_KINDS
 
 # A record of one approved version. Each of these names the workflow node it
 # belongs to (RECORD_WORKFLOW_PROPERTY), and that workflow node says which
@@ -233,6 +254,7 @@ VERSIONED_RECORD_KINDS = frozenset(
         ProjectionSourceKind.SOP_DEFINITION,
         ProjectionSourceKind.RACI_MATRIX,
         ProjectionSourceKind.RACI,
+        ProjectionSourceKind.RECORD_SET_SUMMARY,
     }
 )
 
@@ -247,8 +269,10 @@ class ProjectionRelation(str, Enum):
     it and the system it uses, an SOP to its sections, exceptions and
     definitions, and an SOP step to the map step it details. The RACI set joins
     an approved chart to its workflow and to its rows, and a role to each row it
-    is Responsible for, Accountable for, Consulted on or Informed of. The
-    ratified OWNED_BY and EVIDENCES edges are refused by ProjectionEdgeOp.
+    is Responsible for, Accountable for, Consulted on or Informed of.
+    SUMMARIZES joins a summary to the engagement's record set it was counted
+    from. The ratified OWNED_BY and EVIDENCES edges are refused by
+    ProjectionEdgeOp.
     """
 
     DERIVED_FROM = "DERIVED_FROM"
@@ -269,7 +293,11 @@ class ProjectionRelation(str, Enum):
     ACCOUNTABLE_FOR = "ACCOUNTABLE_FOR"
     CONSULTED = "CONSULTED"
     INFORMED = "INFORMED"
+    SUMMARIZES = "SUMMARIZES"
 
+
+# The summary lane's relation (PROJECTION_V2_ALLOW_SUMMARIES).
+SUMMARY_RELATIONS = frozenset({ProjectionRelation.SUMMARIZES})
 
 # The RACI lane's relations (PROJECTION_V2_ALLOW_RACI).
 RACI_RELATIONS = frozenset(
@@ -332,6 +360,8 @@ RELATION_ENDPOINT_KINDS: dict[
     ProjectionRelation.ACCOUNTABLE_FOR: frozenset({(_K.ROLE, _K.RACI)}),
     ProjectionRelation.CONSULTED: frozenset({(_K.ROLE, _K.RACI)}),
     ProjectionRelation.INFORMED: frozenset({(_K.ROLE, _K.RACI)}),
+    # A summary is of an engagement's record set, and of nothing else.
+    ProjectionRelation.SUMMARIZES: frozenset({(_K.RECORD_SET_SUMMARY, _K.RECORD_SET)}),
 }
 
 
@@ -549,7 +579,12 @@ class ProjectionSource(BaseModel):
     def _validate_source(self) -> "ProjectionSource":
         _require_nfc("source.id", self.id)
         _require_nfc("source.immutable_version_id", self.immutable_version_id)
-        admitted = P2_PRIME_SOURCE_KINDS | PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS
+        admitted = (
+            P2_PRIME_SOURCE_KINDS
+            | PROCESS_STRUCTURE_SOURCE_KINDS
+            | P3_SOURCE_KINDS
+            | SUMMARY_SOURCE_KINDS
+        )
         if self.kind not in admitted:
             raise ValueError(
                 f"source.kind {self.kind.value} is outside the projection allowlist "
@@ -690,11 +725,13 @@ CURRENT_VERSION_PROPERTIES = (
     "current_map_version_id",
     "current_sop_version_id",
     "current_raci_version_id",
+    "current_summary_version_id",
 )
 
 # Which records each pointer puts in force. A pointer serves records of its own
 # kinds only: a process step is in force because the workflow names its map
 # version, never because some other pointer happens to hold the same text.
+# A summary is in force because the engagement's record set names its version.
 POINTER_RECORD_KINDS: dict[str, frozenset[ProjectionSourceKind]] = {
     "current_map_version_id": frozenset(
         {ProjectionSourceKind.PROCESS_VERSION, ProjectionSourceKind.PROCESS_STEP}
@@ -711,6 +748,23 @@ POINTER_RECORD_KINDS: dict[str, frozenset[ProjectionSourceKind]] = {
     "current_raci_version_id": frozenset(
         {ProjectionSourceKind.RACI_MATRIX, ProjectionSourceKind.RACI}
     ),
+    "current_summary_version_id": frozenset({ProjectionSourceKind.RECORD_SET_SUMMARY}),
+}
+
+# When a record set's summaries were counted, in whole seconds since 1970 UTC.
+# A record set that points at summaries must say it: a count is served only
+# while it is being kept current, and this is how retrieval tells.
+RECORD_SET_COUNTED_AT = "counted_at"
+
+# The kind of node that carries each pointer, and so the kind a record's
+# '{RECORD_WORKFLOW_PROPERTY}' must lead to for that pointer to put it in
+# force. A workflow says which map, SOP and chart are in force; a record set
+# says which summaries are. Neither can stand in for the other.
+POINTER_ANCHOR_KIND: dict[str, ProjectionSourceKind] = {
+    "current_map_version_id": ProjectionSourceKind.WORKFLOW,
+    "current_sop_version_id": ProjectionSourceKind.WORKFLOW,
+    "current_raci_version_id": ProjectionSourceKind.WORKFLOW,
+    "current_summary_version_id": ProjectionSourceKind.RECORD_SET,
 }
 
 
@@ -733,13 +787,22 @@ def _check_record_scope(kind: ProjectionSourceKind, properties: dict[str, Any]) 
         value = properties.get(pointer)
         if value is None:
             continue
-        if kind is not ProjectionSourceKind.WORKFLOW:
+        anchor = POINTER_ANCHOR_KIND[pointer]
+        if kind is not anchor:
             raise ValueError(
                 f"'{pointer}' says which version is in force and is only carried by a "
-                f"WORKFLOW node, not by a {kind.value} node"
+                f"{anchor.value} node, not by a {kind.value} node"
             )
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"'{pointer}' must be a non-empty version id when present")
+    if kind is ProjectionSourceKind.RECORD_SET and properties.get("current_summary_version_id") is not None:
+        counted_at = properties.get(RECORD_SET_COUNTED_AT)
+        if isinstance(counted_at, bool) or not isinstance(counted_at, int) or counted_at <= 0:
+            raise ValueError(
+                f"a RECORD_SET node that points at summaries must say when they were counted in "
+                f"'{RECORD_SET_COUNTED_AT}' (whole seconds since 1970 UTC); without it retrieval "
+                "cannot tell a count that is kept current from one that was left behind"
+            )
 
 
 class ProjectionNodeOp(BaseModel):
@@ -1042,6 +1105,18 @@ class ProjectionEnvelopeV2(BaseModel):
             return True
         structure = {relation.value for relation in PROCESS_STRUCTURE_RELATIONS}
         return any(op.relation in structure for op in self.edge_ops)
+
+    def carries_summaries(self) -> bool:
+        """True when any operation belongs to the summary lane.
+
+        A summary hangs on the process structure (it is counted from approved
+        maps and SOPs), so an envelope that carries one is subject to both
+        switches.
+        """
+        if any(op.source.kind in SUMMARY_SOURCE_KINDS for op in self.node_ops):
+            return True
+        summary = {relation.value for relation in SUMMARY_RELATIONS}
+        return any(op.relation in summary for op in self.edge_ops)
 
     def carries_raci(self) -> bool:
         """True when any operation belongs to the RACI lane.
