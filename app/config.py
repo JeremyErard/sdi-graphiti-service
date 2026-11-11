@@ -163,7 +163,9 @@ class Settings(BaseSettings):
     # the process structure it hangs on. Its own switch, off by default: an
     # envelope that carries a chart, one of its rows, one of its edges or a
     # workflow pointer to a chart is refused until this is set, and needs the
-    # process-structure switch as well.
+    # process-structure switch as well. The switch governs WRITING. A chart
+    # already written stays searchable with it off; what takes a chart out of
+    # retrieval is its workflow no longer pointing at it.
     projection_v2_allow_raci: bool = False
 
     class Config:

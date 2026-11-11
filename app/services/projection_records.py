@@ -44,9 +44,11 @@ from typing import Any
 
 from app.config import settings
 from app.models.projection import (
+    POINTER_RECORD_KINDS,
     PROJECTION_NODE_LABEL,
     RECORD_TEXT_PROPERTY,
     RECORD_WORKFLOW_PROPERTY,
+    ProjectionSourceKind,
 )
 from app.services import graphiti_client
 
@@ -357,13 +359,24 @@ _CANDIDATES = (
     "UNWIND candidates AS candidate "
     "WITH candidate.n AS n, candidate.score AS score, seen "
 )
+# A record is in force when the node it names as its workflow IS a workflow, in
+# the same tenant and engagement, and that workflow's pointer for the record's
+# own kind holds the record's version. The kinds are written into the query
+# from the model's own table (they are enum values, never caller text): without
+# them any row carrying a pointer-shaped property could stand in for a
+# workflow, and one pointer could put another kind's records in force.
+_POINTER_BRANCHES = " OR ".join(
+    "(n.projection_source_kind IN ["
+    + ", ".join(f"'{kind.value}'" for kind in sorted(kinds, key=lambda kind: kind.value))
+    + f"] AND n.projection_source_version_id = w.{pointer})"
+    for pointer, kinds in POINTER_RECORD_KINDS.items()
+)
 _IN_FORCE = (
     "n.group_id = $group_id AND n.engagement_id IN $engagement_ids "
     f"MATCH (w:{PROJECTION_NODE_LABEL} {{uuid: n.{RECORD_WORKFLOW_PROPERTY}}}) "
     "WHERE w.group_id = $group_id AND w.engagement_id = n.engagement_id "
-    "AND (n.projection_source_version_id = w.current_map_version_id "
-    "OR n.projection_source_version_id = w.current_sop_version_id "
-    "OR n.projection_source_version_id = w.current_raci_version_id) "
+    f"AND w.projection_source_kind = '{ProjectionSourceKind.WORKFLOW.value}' "
+    f"AND ({_POINTER_BRANCHES}) "
     f"RETURN n.uuid AS uuid, n.{RECORD_TEXT_PROPERTY} AS text, "
     "n.projection_source_kind AS kind, n.projection_source_id AS source_id, "
     "n.projection_source_version_id AS version_id, n.engagement_id AS engagement_id, "

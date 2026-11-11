@@ -288,10 +288,14 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
         # From the record to its workflow node, in the same tenant and engagement...
         assert f"MATCH (w:{PROJECTION_NODE_LABEL} {{uuid: n.workflow_node_id}})" in leg
         assert "w.group_id = $group_id AND w.engagement_id = n.engagement_id" in leg
-        # ...and in force only when its own version is one the workflow names.
-        assert "n.projection_source_version_id = w.current_map_version_id" in leg
-        assert "n.projection_source_version_id = w.current_sop_version_id" in leg
-        assert "n.projection_source_version_id = w.current_raci_version_id" in leg
+        # ...which must itself be a workflow, not any row that carries a pointer-shaped property...
+        assert "w.projection_source_kind = 'WORKFLOW'" in leg
+        # ...and in force only when the pointer for the record's own kind names its version.
+        assert "(n.projection_source_kind IN ['PROCESS_STEP', 'PROCESS_VERSION'] AND n.projection_source_version_id = w.current_map_version_id)" in leg
+        assert "(n.projection_source_kind IN ['SOP', 'SOP_DEFINITION', 'SOP_EXCEPTION', 'SOP_SECTION', 'SOP_STEP'] AND n.projection_source_version_id = w.current_sop_version_id)" in leg
+        assert "(n.projection_source_kind IN ['RACI', 'RACI_MATRIX'] AND n.projection_source_version_id = w.current_raci_version_id)" in leg
+        # A version is compared with a pointer nowhere outside those three branches.
+        assert leg.count("n.projection_source_version_id = w.") == 3
         # Every pointer the model lets a workflow carry is one the search reads, and no other.
         named = sorted(set(re.findall(r"w\.(current_[a-z]+_version_id)", leg)))
         assert named == sorted(CURRENT_VERSION_PROPERTIES)

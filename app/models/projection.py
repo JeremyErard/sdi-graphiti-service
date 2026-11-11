@@ -692,6 +692,27 @@ CURRENT_VERSION_PROPERTIES = (
     "current_raci_version_id",
 )
 
+# Which records each pointer puts in force. A pointer serves records of its own
+# kinds only: a process step is in force because the workflow names its map
+# version, never because some other pointer happens to hold the same text.
+POINTER_RECORD_KINDS: dict[str, frozenset[ProjectionSourceKind]] = {
+    "current_map_version_id": frozenset(
+        {ProjectionSourceKind.PROCESS_VERSION, ProjectionSourceKind.PROCESS_STEP}
+    ),
+    "current_sop_version_id": frozenset(
+        {
+            ProjectionSourceKind.SOP,
+            ProjectionSourceKind.SOP_STEP,
+            ProjectionSourceKind.SOP_SECTION,
+            ProjectionSourceKind.SOP_EXCEPTION,
+            ProjectionSourceKind.SOP_DEFINITION,
+        }
+    ),
+    "current_raci_version_id": frozenset(
+        {ProjectionSourceKind.RACI_MATRIX, ProjectionSourceKind.RACI}
+    ),
+}
+
 
 def _check_record_scope(kind: ProjectionSourceKind, properties: dict[str, Any]) -> None:
     """A record of an approved version names its workflow node; only a workflow names versions in force."""

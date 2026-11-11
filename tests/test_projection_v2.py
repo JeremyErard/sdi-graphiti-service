@@ -2039,6 +2039,9 @@ def test_no_client_identity_or_planning_snapshot_is_hardcoded():
 # ==========================================================================
 
 PV_HASH = "e6" * 32
+# The canonical hash of the fixed envelope in the golden test below, computed on the code as it stood before the
+# responsibility-chart vocabulary was added.
+GOLDEN_STRUCTURE_HASH = "14c8116697124c437451a033edaf6b374b408ac830b20ae83c8c92971f0b1d49"
 
 
 def structure_source(kind, source_id, version="pv-3"):
@@ -2347,6 +2350,38 @@ def test_the_chart_lane_needs_the_structure_lane_too(store, client, raci_on):
     response = apply(client, raci_envelope())
     assert response.status_code == 422
     assert store.mutating_queries() == []
+    # Rows alone carry no process-structure kind, so only the chart lane's own check can stop them:
+    # with the chart switch on and the structure switch off they must still be refused.
+    rows_only = envelope(node_ops=[structure_op("chart-1:r1", "RACI", version="rv-1", properties={"text": "Who does it."})])
+    response = apply(client, rows_only)
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE" in json.dumps(response.json()) and "PROJECTION_V2_ALLOW_RACI" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+def test_every_pointer_serves_its_own_kinds_and_every_record_kind_has_a_pointer():
+    assert tuple(pm.POINTER_RECORD_KINDS) == pm.CURRENT_VERSION_PROPERTIES
+    served = [kind for kinds in pm.POINTER_RECORD_KINDS.values() for kind in kinds]
+    assert len(served) == len(set(served)) and set(served) == pm.VERSIONED_RECORD_KINDS
+    assert pm.POINTER_RECORD_KINDS["current_raci_version_id"] == pm.P3_SOURCE_KINDS
+
+
+def test_an_envelope_admitted_before_the_chart_lane_hashes_as_it_always_did():
+    """A fixed envelope and the hash it had before this vocabulary existed. A change to what an older
+    envelope hashes to would make every stored receipt a conflict."""
+    fixed = {
+        "schema_version": "projection.v2", "client_slug": "north-dock", "namespace": "client_north_dock", "engagement_id": "eng-1",
+        "origin": "DIRECT_IMPORT", "cursor": {"import_manifest_hash": "ab" * 32, "batch_ordinal": 0, "event_id": None},
+        "operation_id": "process-records:map:" + "ab" * 16 + ":0", "cutoff": {"cutoff_id": "approved:" + "ab" * 16, "cutoff_at": None},
+        "node_ops": [
+            {"op": "MERGE_NODE", "node_id": "wf-1", "source": {"kind": "WORKFLOW", "id": "wf-1", "immutable_version_id": "wf-1@a", "content_hash": "e6" * 32},
+             "properties": {"name": "Receiving", "current_map_version_id": "pv-3"}, "lifecycle": None},
+            {"op": "MERGE_NODE", "node_id": "pv-3:s1", "source": {"kind": "PROCESS_STEP", "id": "s1", "immutable_version_id": "pv-3", "content_hash": "e6" * 32},
+             "properties": {"workflow_node_id": "wf-1", "text": "Step 1 is a task."}, "lifecycle": None},
+        ],
+        "edge_ops": [],
+    }
+    assert pm.ProjectionEnvelopeV2.model_validate(fixed).canonical_hash() == GOLDEN_STRUCTURE_HASH
 
 
 def test_a_workflow_that_only_points_at_a_chart_is_a_chart_write(store, client, lane_on):
