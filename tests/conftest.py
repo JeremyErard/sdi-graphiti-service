@@ -12,7 +12,7 @@ rest of the session and later tests silently exercise the wrong object.
 import pytest
 
 from app.routers import projection
-from app.services import graphiti_client
+from app.services import graphiti_client, question_vectors
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +22,20 @@ def _reset_shared_falkordb():
     yield
     graphiti_client.reset_falkor_db()
     projection._reset_falkor_db()
+
+
+@pytest.fixture(autouse=True)
+def _no_question_vector_store(monkeypatch):
+    """No test reaches a real database for a kept question vector.
+
+    The store has its own connection, built from the service's settings, so
+    without this every search test would try to open one. A test of the store
+    itself swaps in its own (see tests/test_question_vectors.py).
+    """
+    question_vectors.reset()
+    monkeypatch.setattr(question_vectors, "_client", lambda: None)
+    yield
+    question_vectors.reset()
 
 
 # --- Cypher WITH-scope checker, shared by the dedup and search tests ---------

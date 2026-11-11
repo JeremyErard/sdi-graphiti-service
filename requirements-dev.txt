@@ -1,2 +1,5 @@
 -r requirements.txt
 pytest>=8.3,<10
+# A Redis that runs in the test process, with a real Lua interpreter: the one script the question-vector
+# store sends is run for real in tests, not stood in for.
+fakeredis[lua]>=2.26,<3

@@ -50,7 +50,7 @@ from app.models.projection import (
     RECORD_WORKFLOW_PROPERTY,
     ProjectionSourceKind,
 )
-from app.services import graphiti_client
+from app.services import graphiti_client, question_vectors, vector_turns
 
 logger = logging.getLogger("graphiti_service")
 
@@ -411,7 +411,7 @@ def _leg_heads(window: int) -> tuple[str, str]:
     keyword = (
         f"CALL db.idx.fulltext.queryNodes('{PROJECTION_NODE_LABEL}', $query) "
         "YIELD node AS n, score "
-        f"WITH n, score ORDER BY score DESC LIMIT {int(window)} "
+        f"WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT {int(window)} "
     )
     return vector, keyword
 
@@ -422,7 +422,11 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     Each leg takes `window` candidates from its index, then keeps the ones in
     force for the engagements asked about, ordered again after the join: the
     vector procedure scores by distance (nearest first), the keyword procedure
-    by relevance (highest first). The vector leg only trusts a vector made by
+    by relevance (highest first). Two records with the same score are put in
+    order by their id, in the final cut and in the keyword leg's window, so
+    which of them is kept does not depend on the order the engine happened to
+    hand them over. (Which candidates the vector index puts in its own window
+    is the index's to decide and is not something a statement can order.) The vector leg only trusts a vector made by
     the embedding model in use, so a change of model cannot silently compare
     vectors from two spaces.
     """
@@ -431,9 +435,9 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     vector_head, keyword_head = _leg_heads(window)
     vector = (
         f"{vector_head}{_CANDIDATES}WHERE n.text_emb_model = $marker AND {_IN_FORCE} "
-        f"ORDER BY score ASC LIMIT {pool}"
+        f"ORDER BY score ASC, uuid ASC LIMIT {pool}"
     )
-    keyword = f"{keyword_head}{_CANDIDATES}WHERE {_IN_FORCE} ORDER BY score DESC LIMIT {pool}"
+    keyword = f"{keyword_head}{_CANDIDATES}WHERE {_IN_FORCE} ORDER BY score DESC, uuid ASC LIMIT {pool}"
     return vector, keyword
 
 
@@ -483,6 +487,24 @@ def _read(graph: Any, statement: str, params: dict[str, Any], timeout_ms: int) -
     return graph.ro_query(statement, params, timeout=timeout_ms)
 
 
+async def _leg_read(
+    graph: Any, leg: str, statement: str, params: dict[str, Any], timeout_ms: int, deadline: float
+) -> Any:
+    """One read of a leg. A vector read waits its turn (see vector_turns); a keyword read does not.
+
+    The wait for a turn comes out of the leg's own time: it is bounded by the
+    read's limit and by what is left before the leg's deadline, so a leg takes
+    no longer than it could before turns existed. A read that cannot get its
+    turn in that time fails like any other read that ran out of time.
+    """
+    if leg != "vector":
+        return await asyncio.to_thread(_read, graph, statement, params, timeout_ms)
+    wait = min(timeout_ms / 1000, deadline - time.monotonic())
+    return await vector_turns.take_turn(
+        vector_turns.RECORDS, lambda: asyncio.to_thread(_read, graph, statement, params, timeout_ms), wait
+    )
+
+
 async def _leg(
     graph: Any,
     name: str,
@@ -502,14 +524,14 @@ async def _leg(
     while True:
         try:
             rows = (
-                await asyncio.to_thread(_read, graph, record_leg_queries(pool, window)[index], params, timeout_ms)
+                await _leg_read(graph, leg, record_leg_queries(pool, window)[index], params, timeout_ms, deadline)
             ).result_set or []
             if rows:
                 seen = int(rows[0][-1])
             else:
                 # Nothing survived: was the window full of records out of force, or is there nothing there?
                 counted = (
-                    await asyncio.to_thread(_read, graph, record_leg_counts(window)[index], params, timeout_ms)
+                    await _leg_read(graph, leg, record_leg_counts(window)[index], params, timeout_ms, deadline)
                 ).result_set
                 seen = int(counted[0][0]) if counted and counted[0] else 0
         except Exception:
@@ -602,7 +624,9 @@ async def search_records(
             embedder = graphiti_client._create_embedder()
             if embedder is None:
                 return []
-            qvec = await embedder.create(input_data=[query.replace("\n", " ")])
+            # The question's vector is made once and kept: the provider does not
+            # give the same vector for the same text twice (see question_vectors).
+            qvec = await question_vectors.question_vector(embedder, name, query)
             return collect(
                 await _leg(
                     graph,

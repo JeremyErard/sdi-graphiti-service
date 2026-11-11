@@ -78,7 +78,7 @@ class FakeGraph:
             window = int(statement.split("'text_embedding', ")[1].split(",")[0])
         elif "db.idx.fulltext.queryNodes" in statement:
             leg, rows = "keyword", self.keyword_rows
-            window = int(statement.split("ORDER BY score DESC LIMIT ")[1].split(" ")[0])
+            window = int(statement.split("ORDER BY score DESC, n.uuid ASC LIMIT ")[1].split(" ")[0])
         else:
             raise AssertionError(f"unexpected read: {statement}")
         if leg in self.fail or (self.fail_from_window and window >= self.fail_from_window):
@@ -311,8 +311,11 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
     assert keyword.index("LIMIT 30") < keyword.index("MATCH (w:")
     assert "'text_embedding', 30," in vector
     assert "'text_embedding', 480," in projection_records.record_leg_queries(6, 480)[0]
-    assert vector.rstrip().endswith("ORDER BY score ASC LIMIT 6")
-    assert keyword.rstrip().endswith("ORDER BY score DESC LIMIT 6")
+    # Equal scores are put in order by record id, so the cut is the same on every ask: in the keyword
+    # leg's window (before the join) and in each leg's final cut.
+    assert "WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT 30 " in keyword
+    assert vector.rstrip().endswith("ORDER BY score ASC, uuid ASC LIMIT 6")
+    assert keyword.rstrip().endswith("ORDER BY score DESC, uuid ASC LIMIT 6")
     # A vector made by another embedding model is not compared with this one's.
     assert "n.text_emb_model = $marker" in vector
 

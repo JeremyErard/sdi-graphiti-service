@@ -1099,8 +1099,13 @@ async def _search_fast(client_slug: str, query: str, max_results: int) -> list[A
     if embedder is None:
         raise RuntimeError("fast search requires an explicit (Voyage) embedder")
     # This is a query-embedding call only. Probe mode never constructs Graphiti
-    # or an extraction/generative client.
-    qvec = await embedder.create(input_data=[query.replace("\n", " ")])
+    # or an extraction/generative client. Outside probe mode the question's
+    # vector is made once and kept, because the provider does not give the same
+    # vector for the same text twice (see question_vectors); a probe process
+    # keeps nothing and asks the provider every time.
+    from app.services import question_vectors  # noqa: PLC0415
+
+    qvec = await question_vectors.question_vector(embedder, graph_name, query)
 
     # Pull a candidate pool 2x the requested size from each method, then fuse.
     pool = max(int(max_results) * 2, int(max_results))
