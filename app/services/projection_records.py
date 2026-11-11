@@ -50,7 +50,7 @@ from app.models.projection import (
     RECORD_WORKFLOW_PROPERTY,
     ProjectionSourceKind,
 )
-from app.services import graphiti_client
+from app.services import graphiti_client, question_vectors
 
 logger = logging.getLogger("graphiti_service")
 
@@ -422,7 +422,9 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     Each leg takes `window` candidates from its index, then keeps the ones in
     force for the engagements asked about, ordered again after the join: the
     vector procedure scores by distance (nearest first), the keyword procedure
-    by relevance (highest first). The vector leg only trusts a vector made by
+    by relevance (highest first). Two records with the same score are put in
+    order by their id, so which of them makes the cut never depends on the
+    order the engine happened to hand them over. The vector leg only trusts a vector made by
     the embedding model in use, so a change of model cannot silently compare
     vectors from two spaces.
     """
@@ -431,9 +433,9 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     vector_head, keyword_head = _leg_heads(window)
     vector = (
         f"{vector_head}{_CANDIDATES}WHERE n.text_emb_model = $marker AND {_IN_FORCE} "
-        f"ORDER BY score ASC LIMIT {pool}"
+        f"ORDER BY score ASC, uuid ASC LIMIT {pool}"
     )
-    keyword = f"{keyword_head}{_CANDIDATES}WHERE {_IN_FORCE} ORDER BY score DESC LIMIT {pool}"
+    keyword = f"{keyword_head}{_CANDIDATES}WHERE {_IN_FORCE} ORDER BY score DESC, uuid ASC LIMIT {pool}"
     return vector, keyword
 
 
@@ -602,7 +604,9 @@ async def search_records(
             embedder = graphiti_client._create_embedder()
             if embedder is None:
                 return []
-            qvec = await embedder.create(input_data=[query.replace("\n", " ")])
+            # The question's vector is made once and kept: the provider does not
+            # give the same vector for the same text twice (see question_vectors).
+            qvec = await question_vectors.question_vector(embedder, name, query)
             return collect(
                 await _leg(
                     graph,

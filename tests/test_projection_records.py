@@ -311,8 +311,9 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
     assert keyword.index("LIMIT 30") < keyword.index("MATCH (w:")
     assert "'text_embedding', 30," in vector
     assert "'text_embedding', 480," in projection_records.record_leg_queries(6, 480)[0]
-    assert vector.rstrip().endswith("ORDER BY score ASC LIMIT 6")
-    assert keyword.rstrip().endswith("ORDER BY score DESC LIMIT 6")
+    # Equal scores are put in order by record id, so the cut is the same on every ask.
+    assert vector.rstrip().endswith("ORDER BY score ASC, uuid ASC LIMIT 6")
+    assert keyword.rstrip().endswith("ORDER BY score DESC, uuid ASC LIMIT 6")
     # A vector made by another embedding model is not compared with this one's.
     assert "n.text_emb_model = $marker" in vector
 
