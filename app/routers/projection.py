@@ -957,6 +957,18 @@ async def apply_projection_v2(
             "the lane is switched on",
         )
 
+    if envelope.carries_raci() and not (
+        settings.projection_v2_allow_raci and settings.projection_v2_allow_process_structure
+    ):
+        raise _fail(
+            422,
+            "responsibility-chart projection (an approved RACI chart, its rows, the "
+            "roles each row names and the workflow's pointer to the chart in force) "
+            "is not authorized on this deployment in this phase; set "
+            "PROJECTION_V2_ALLOW_RACI, with PROJECTION_V2_ALLOW_PROCESS_STRUCTURE, "
+            "once the lane is switched on",
+        )
+
     envelope_hash = envelope.canonical_hash()
     scope = {"group_id": graph_name, "engagement_id": envelope.engagement_id}
     receipt_key = {**scope, "operation_id": envelope.operation_id}

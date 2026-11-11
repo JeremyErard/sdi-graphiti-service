@@ -158,6 +158,15 @@ class Settings(BaseSettings):
     # the approved records with no model in the path. Default false keeps the
     # lane refused until it is switched on for this deployment.
     projection_v2_allow_process_structure: bool = False
+    # The approved responsibility chart (who is Responsible, Accountable,
+    # Consulted and Informed for each activity) projected exactly, on top of
+    # the process structure it hangs on. Its own switch, off by default: an
+    # envelope that carries a chart, one of its rows, one of its edges or a
+    # workflow pointer to a chart is refused until this is set, and needs the
+    # process-structure switch as well. The switch governs WRITING. A chart
+    # already written stays searchable with it off; what takes a chart out of
+    # retrieval is its workflow no longer pointing at it.
+    projection_v2_allow_raci: bool = False
 
     class Config:
         env_file = ".env"
