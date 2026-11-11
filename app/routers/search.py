@@ -15,6 +15,9 @@ from app.models.search import (
     LegacySearchContextResponse,
     ProvenanceShadow,
     ProvenanceSummary,
+    RecordResult,
+    RecordSearchRequest,
+    RecordSearchResponse,
     SearchContextRequest,
     SearchContextResponse,
     ShadowSearchContextResponse,
@@ -28,7 +31,7 @@ from app.provenance_contract import (
     V2_ANCHOR_MODES,
     V2_PRODUCER_CONTRACT_VERSIONS,
 )
-from app.services import graphiti_client
+from app.services import graphiti_client, projection_records
 
 logger = logging.getLogger("graphiti_service")
 
@@ -470,3 +473,53 @@ async def search_context(req: SearchContextRequest):
             type(error).__name__,
         )
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+@router.post("/records", response_model=RecordSearchResponse)
+async def search_records(req: RecordSearchRequest):
+    """The approved process records in force that match a question.
+
+    Rows projected exactly from approved records (/ingest/projection/v2), never
+    facts a model extracted, and only the records in force for the engagements
+    the caller names. It answers an empty list, and reads nothing, unless the
+    process-structure lane is on AND the signed perimeter is closed: in any
+    other auth posture the tenant in the body is not bound to an authenticated
+    caller, and this lane does not inherit a staged-rollout leniency.
+
+    A failure answers empty too, whatever fails. The caller asks for records in
+    addition to its fact search, and an addition must not be able to fail the
+    request.
+    """
+    started = time.time()
+    records: list[RecordResult] = []
+    graph_name = ""
+    try:
+        graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+        if (
+            settings.projection_v2_allow_process_structure
+            and settings.graphiti_auth_mode == "required"
+        ):
+            engagement_ids = list(dict.fromkeys([req.engagement_id, *req.readable_engagement_ids]))
+            found = await projection_records.search_records(
+                client_slug=req.client_slug,
+                engagement_ids=engagement_ids,
+                query=req.query,
+                max_results=req.max_results,
+            )
+            records = [RecordResult(**record) for record in found]
+    except Exception as error:
+        logger.warning(
+            "[graphiti] record search failed on %s error_type=%s; answering empty",
+            graph_name or "(no graph)",
+            type(error).__name__,
+        )
+        records = []
+    elapsed_ms = (time.time() - started) * 1000
+    logger.info(
+        "[graphiti] record search on %s: %d records (%.0fms)", graph_name, len(records), elapsed_ms
+    )
+    return RecordSearchResponse(
+        records=records,
+        graph_name=graph_name,
+        search_time_ms=round(elapsed_ms, 1),
+    )

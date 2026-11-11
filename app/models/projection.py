@@ -101,16 +101,15 @@ PROJECTION_NODE_LABEL = "ProjectionNode"
 # write it, because callers do not supply labels at all.
 PROJECTION_RECEIPT_LABEL = "ProjectionReceipt"
 
-# P3 vocabulary, quoted from the ratified ontology lock. These are refused today
-# with an error that names P3, so a caller who sends them learns the phase rule
-# rather than a generic validation message.
-P3_NODE_LABELS = frozenset(
-    {"Workflow", "ProcessVersion", "SOP", "RaciMatrix", "RaciAssignment"}
-)
+# P3 vocabulary, quoted from the ratified ontology lock. The process-structure
+# part of it (":Workflow", ":ProcessVersion", ":SOP"; GOVERNS, VERSION_OF) is
+# admitted by this module and gated by the route behind
+# PROJECTION_V2_ALLOW_PROCESS_STRUCTURE (see PROCESS_STRUCTURE_SOURCE_KINDS).
+# The RACI part is still refused here with an error that names P3, so a caller
+# who sends it learns the phase rule rather than a generic validation message.
+P3_NODE_LABELS = frozenset({"RaciMatrix", "RaciAssignment"})
 P3_EDGE_RELATIONS = frozenset(
     {
-        "GOVERNS",
-        "VERSION_OF",
         "ACCOUNTABLE_FOR",
         "RESPONSIBLE_FOR",
         "CONSULTED",
@@ -134,10 +133,18 @@ class ProjectionOrigin(str, Enum):
 class ProjectionSourceKind(str, Enum):
     """Source kinds the envelope is shaped to carry.
 
-    P2-prime admits exact-ID/hash Finding import only, plus a Finding's direct
-    driver and its receipts. The workflow, process-version, SOP, and RACI kinds
-    are P3 backfill: the envelope carries them so the shape does not change
-    later, and this phase refuses them.
+    P2-prime admits exact-ID/hash Finding import: a Finding, its direct driver
+    and its receipts.
+
+    Process structure is the approved operating record projected exactly, with
+    no model in the path: a workflow, its approved process version and that
+    version's steps, the approved SOP with its steps, sections (its prose,
+    verbatim), exceptions and definitions, and the roles and systems those
+    steps name. This module admits
+    the shape; the route refuses it unless the lane is switched on.
+
+    RACI is P3 backfill that this module still refuses: the envelope carries
+    the kind so the shape does not change later.
     """
 
     FINDING = "FINDING"
@@ -145,20 +152,34 @@ class ProjectionSourceKind(str, Enum):
     FINDING_RECEIPT = "FINDING_RECEIPT"
     WORKFLOW = "WORKFLOW"
     PROCESS_VERSION = "PROCESS_VERSION"
+    PROCESS_STEP = "PROCESS_STEP"
     SOP = "SOP"
+    SOP_STEP = "SOP_STEP"
+    SOP_SECTION = "SOP_SECTION"
+    SOP_EXCEPTION = "SOP_EXCEPTION"
+    SOP_DEFINITION = "SOP_DEFINITION"
+    ROLE = "ROLE"
+    SYSTEM = "SYSTEM"
     RACI = "RACI"
 
 
 # The node type label written for each admitted kind. A caller never supplies a
-# label, so a P3 label cannot be smuggled in past a phase gate that only reads
-# the declared kind.
+# label, so a label cannot be smuggled in past a phase gate that only reads the
+# declared kind.
 SOURCE_KIND_NODE_LABEL: dict[ProjectionSourceKind, str] = {
     ProjectionSourceKind.FINDING: "Finding",
     ProjectionSourceKind.FINDING_DRIVER: "FindingDriver",
     ProjectionSourceKind.FINDING_RECEIPT: "FindingReceipt",
     ProjectionSourceKind.WORKFLOW: "Workflow",
     ProjectionSourceKind.PROCESS_VERSION: "ProcessVersion",
+    ProjectionSourceKind.PROCESS_STEP: "ProcessStep",
     ProjectionSourceKind.SOP: "SOP",
+    ProjectionSourceKind.SOP_STEP: "SopStep",
+    ProjectionSourceKind.SOP_SECTION: "SopSection",
+    ProjectionSourceKind.SOP_EXCEPTION: "SopException",
+    ProjectionSourceKind.SOP_DEFINITION: "SopDefinition",
+    ProjectionSourceKind.ROLE: "Role",
+    ProjectionSourceKind.SYSTEM: "System",
     ProjectionSourceKind.RACI: "RaciAssignment",
 }
 
@@ -170,41 +191,144 @@ P2_PRIME_SOURCE_KINDS = frozenset(
     }
 )
 
-P3_SOURCE_KINDS = frozenset(
+# Admitted by the model, gated by the route (PROJECTION_V2_ALLOW_PROCESS_STRUCTURE).
+PROCESS_STRUCTURE_SOURCE_KINDS = frozenset(
     {
         ProjectionSourceKind.WORKFLOW,
         ProjectionSourceKind.PROCESS_VERSION,
+        ProjectionSourceKind.PROCESS_STEP,
         ProjectionSourceKind.SOP,
-        ProjectionSourceKind.RACI,
+        ProjectionSourceKind.SOP_STEP,
+        ProjectionSourceKind.SOP_SECTION,
+        ProjectionSourceKind.SOP_EXCEPTION,
+        ProjectionSourceKind.SOP_DEFINITION,
+        ProjectionSourceKind.ROLE,
+        ProjectionSourceKind.SYSTEM,
     }
 )
 
+# A record of one approved version. Each of these names the workflow node it
+# belongs to (RECORD_WORKFLOW_PROPERTY), and that workflow node says which
+# version of its map and of its SOP is in force (CURRENT_VERSION_PROPERTIES).
+# A record is in force exactly when its own version is one the workflow points
+# at, and only a record in force may feed retrieval. A workflow, a role and a
+# system are not versions of anything.
+VERSIONED_RECORD_KINDS = frozenset(
+    {
+        ProjectionSourceKind.PROCESS_VERSION,
+        ProjectionSourceKind.PROCESS_STEP,
+        ProjectionSourceKind.SOP,
+        ProjectionSourceKind.SOP_STEP,
+        ProjectionSourceKind.SOP_SECTION,
+        ProjectionSourceKind.SOP_EXCEPTION,
+        ProjectionSourceKind.SOP_DEFINITION,
+    }
+)
+
+P3_SOURCE_KINDS = frozenset({ProjectionSourceKind.RACI})
+
 
 class ProjectionRelation(str, Enum):
-    """The relationship types P2-prime may project.
+    """The relationship types the projection may write.
 
     DERIVED_FROM is the ratified provenance edge. ATTESTED_BY carries a Finding
-    to one of its receipts. Everything else, including the ratified EVIDENCES
-    edge, points at P3 node types and is refused by ProjectionEdgeOp.
+    to one of its receipts. VERSION_OF and GOVERNS are the ratified process
+    edges; the rest of the process-structure set joins an approved version to
+    its steps, a step to the step that follows it, a step to the role that does
+    it and the system it uses, an SOP to its sections, exceptions and
+    definitions, and an SOP step to the map step it details. The RACI edges and the ratified EVIDENCES
+    edge are refused by ProjectionEdgeOp.
     """
 
     DERIVED_FROM = "DERIVED_FROM"
     ATTESTED_BY = "ATTESTED_BY"
+    VERSION_OF = "VERSION_OF"
+    GOVERNS = "GOVERNS"
+    HAS_STEP = "HAS_STEP"
+    NEXT = "NEXT"
+    PERFORMED_BY = "PERFORMED_BY"
+    USES_SYSTEM = "USES_SYSTEM"
+    HAS_SECTION = "HAS_SECTION"
+    HAS_EXCEPTION = "HAS_EXCEPTION"
+    DEFINES = "DEFINES"
+    DETAILS = "DETAILS"
 
 
-# Which endpoint kinds each relation may join. An edge whose endpoints do not
-# match is refused, so a Finding cannot be recorded as attested by another
-# Finding, and a driver cannot be given a provenance edge it does not have.
-RELATION_ENDPOINT_KINDS: dict[ProjectionRelation, tuple[ProjectionSourceKind, ProjectionSourceKind]] = {
-    ProjectionRelation.DERIVED_FROM: (
-        ProjectionSourceKind.FINDING,
-        ProjectionSourceKind.FINDING_DRIVER,
+PROCESS_STRUCTURE_RELATIONS = frozenset(
+    {
+        ProjectionRelation.VERSION_OF,
+        ProjectionRelation.GOVERNS,
+        ProjectionRelation.HAS_STEP,
+        ProjectionRelation.NEXT,
+        ProjectionRelation.PERFORMED_BY,
+        ProjectionRelation.USES_SYSTEM,
+        ProjectionRelation.HAS_SECTION,
+        ProjectionRelation.HAS_EXCEPTION,
+        ProjectionRelation.DEFINES,
+        ProjectionRelation.DETAILS,
+    }
+)
+
+_K = ProjectionSourceKind
+
+# Which endpoint kinds each relation may join, as the allowed (from, to) pairs.
+# An edge whose endpoints do not match is refused, so a Finding cannot be
+# recorded as attested by another Finding, a driver cannot be given a provenance
+# edge it does not have, and a step cannot be said to follow an SOP.
+RELATION_ENDPOINT_KINDS: dict[
+    ProjectionRelation, frozenset[tuple[ProjectionSourceKind, ProjectionSourceKind]]
+] = {
+    ProjectionRelation.DERIVED_FROM: frozenset({(_K.FINDING, _K.FINDING_DRIVER)}),
+    ProjectionRelation.ATTESTED_BY: frozenset({(_K.FINDING, _K.FINDING_RECEIPT)}),
+    ProjectionRelation.VERSION_OF: frozenset({(_K.PROCESS_VERSION, _K.WORKFLOW)}),
+    ProjectionRelation.GOVERNS: frozenset({(_K.SOP, _K.WORKFLOW)}),
+    ProjectionRelation.HAS_STEP: frozenset(
+        {(_K.PROCESS_VERSION, _K.PROCESS_STEP), (_K.SOP, _K.SOP_STEP)}
     ),
-    ProjectionRelation.ATTESTED_BY: (
-        ProjectionSourceKind.FINDING,
-        ProjectionSourceKind.FINDING_RECEIPT,
+    ProjectionRelation.NEXT: frozenset({(_K.PROCESS_STEP, _K.PROCESS_STEP)}),
+    ProjectionRelation.PERFORMED_BY: frozenset(
+        {(_K.PROCESS_STEP, _K.ROLE), (_K.SOP_STEP, _K.ROLE)}
     ),
+    ProjectionRelation.USES_SYSTEM: frozenset(
+        {(_K.PROCESS_STEP, _K.SYSTEM), (_K.SOP_STEP, _K.SYSTEM)}
+    ),
+    ProjectionRelation.HAS_SECTION: frozenset({(_K.SOP, _K.SOP_SECTION)}),
+    ProjectionRelation.HAS_EXCEPTION: frozenset({(_K.SOP, _K.SOP_EXCEPTION)}),
+    ProjectionRelation.DEFINES: frozenset({(_K.SOP, _K.SOP_DEFINITION)}),
+    # An SOP step says how one step of the approved map is carried out.
+    ProjectionRelation.DETAILS: frozenset({(_K.SOP_STEP, _K.PROCESS_STEP)}),
 }
+
+
+def relation_endpoint_error(
+    relation: ProjectionRelation, from_kind: str | None, to_kind: str | None
+) -> str | None:
+    """Why these endpoint kinds cannot be joined by this relation, or None.
+
+    A kind that is not known yet (None) is not judged: the route resolves it
+    from the graph before it calls this.
+    """
+    pairs = RELATION_ENDPOINT_KINDS[relation]
+    starts = sorted({pair[0].value for pair in pairs})
+    ends = sorted({pair[1].value for pair in pairs})
+    if from_kind and from_kind not in starts:
+        return (
+            f"relation {relation.value} starts at a {from_kind} node; it must "
+            f"start at a {' or '.join(starts)} node"
+        )
+    if to_kind and to_kind not in ends:
+        return (
+            f"relation {relation.value} ends at a {to_kind} node; it must end at "
+            f"a {' or '.join(ends)} node"
+        )
+    if from_kind and to_kind and not any(
+        pair[0].value == from_kind and pair[1].value == to_kind for pair in pairs
+    ):
+        return (
+            f"relation {relation.value} cannot join a {from_kind} node to a "
+            f"{to_kind} node"
+        )
+    return None
 
 
 class FindingLifecycleState(str, Enum):
@@ -262,9 +386,18 @@ SERVICE_OWNED_PROPERTIES = frozenset(
         # embedding path from text, never carried in a projection.
         "name_embedding",
         "fact_embedding",
+        "text_embedding",
+        "text_emb_model",
+        "text_emb_failed",
+        "text_emb_failed_at",
         "emb_model",
     }
 )
+
+# The one property a retrieval surface reads from a projected record: a plain
+# statement of what the record says, written by the caller from the source
+# record itself. This service embeds it and never rewrites it.
+RECORD_TEXT_PROPERTY = "text"
 
 
 def _check_scalar(key: str, value: Any) -> None:
@@ -381,17 +514,17 @@ class ProjectionSource(BaseModel):
     def _validate_source(self) -> "ProjectionSource":
         _require_nfc("source.id", self.id)
         _require_nfc("source.immutable_version_id", self.immutable_version_id)
+        admitted = P2_PRIME_SOURCE_KINDS | PROCESS_STRUCTURE_SOURCE_KINDS
         if self.kind in P3_SOURCE_KINDS:
             raise ValueError(
-                f"source.kind {self.kind.value} is P3 backfill (exact workflow, "
-                "ProcessVersion, SOP, and published-to-date RACI) and is refused "
-                "in this phase; P2-prime admits "
-                f"{sorted(k.value for k in P2_PRIME_SOURCE_KINDS)}"
+                f"source.kind {self.kind.value} is P3 backfill (published-to-date "
+                "RACI) and is refused in this phase; the projection admits "
+                f"{sorted(k.value for k in admitted)}"
             )
-        if self.kind not in P2_PRIME_SOURCE_KINDS:
+        if self.kind not in admitted:
             raise ValueError(
-                f"source.kind {self.kind.value} is outside the P2-prime allowlist "
-                f"{sorted(k.value for k in P2_PRIME_SOURCE_KINDS)}"
+                f"source.kind {self.kind.value} is outside the projection allowlist "
+                f"{sorted(k.value for k in admitted)}"
             )
         return self
 
@@ -515,6 +648,46 @@ class FindingLifecycle(BaseModel):
         return self
 
 
+# Currency is a pointer, not a flag on every row. The workflow node carries the
+# version of its map and of its SOP that is in force; a record carries the
+# workflow node it belongs to. Replacing a version is then ONE write (the
+# workflow node, restated with the new pointers), every record of the old
+# version stops feeding retrieval at that instant, and nothing has to restate
+# old rows, which a caller could not rebuild once the source had been edited.
+# The caller projects the new version's records first and the workflow node
+# last, so retrieval never points at records that are not there yet.
+RECORD_WORKFLOW_PROPERTY = "workflow_node_id"
+CURRENT_VERSION_PROPERTIES = ("current_map_version_id", "current_sop_version_id")
+
+
+def _check_record_scope(kind: ProjectionSourceKind, properties: dict[str, Any]) -> None:
+    """A record of an approved version names its workflow node; only a workflow names versions in force."""
+    workflow_node = properties.get(RECORD_WORKFLOW_PROPERTY)
+    if kind in VERSIONED_RECORD_KINDS:
+        if not isinstance(workflow_node, str) or not workflow_node.strip():
+            raise ValueError(
+                f"a {kind.value} node is a record of one approved version and must "
+                f"name its workflow node in '{RECORD_WORKFLOW_PROPERTY}'; without it "
+                "retrieval cannot tell whether the record is in force"
+            )
+    elif workflow_node is not None:
+        raise ValueError(
+            f"'{RECORD_WORKFLOW_PROPERTY}' is only carried by records of an approved "
+            f"version, not by a {kind.value} node"
+        )
+    for pointer in CURRENT_VERSION_PROPERTIES:
+        value = properties.get(pointer)
+        if value is None:
+            continue
+        if kind is not ProjectionSourceKind.WORKFLOW:
+            raise ValueError(
+                f"'{pointer}' says which version is in force and is only carried by a "
+                f"WORKFLOW node, not by a {kind.value} node"
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"'{pointer}' must be a non-empty version id when present")
+
+
 class ProjectionNodeOp(BaseModel):
     """One exact-ID node upsert. node_id is the caller's deterministic identity.
 
@@ -540,6 +713,21 @@ class ProjectionNodeOp(BaseModel):
     def _validate_node(self) -> "ProjectionNodeOp":
         _require_nfc("node_id", self.node_id)
         _check_property_map(self.properties)
+        # The process-structure rules apply to process-structure kinds only, so
+        # an envelope of the kinds admitted before them validates exactly as it
+        # always did, and a resend of one still replays.
+        if self.source.kind in PROCESS_STRUCTURE_SOURCE_KINDS:
+            _check_record_scope(self.source.kind, self.properties)
+            text = self.properties.get(RECORD_TEXT_PROPERTY)
+            if text is not None and (not isinstance(text, str) or not text.strip()):
+                raise ValueError(
+                    f"property '{RECORD_TEXT_PROPERTY}' is the record's retrievable "
+                    "statement and must be a non-empty string when present"
+                )
+            for name in ("workflow_id", "workflow_name"):
+                value = self.properties.get(name)
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"property '{name}' must be a string when present")
         is_finding = self.source.kind is ProjectionSourceKind.FINDING
         if is_finding and self.lifecycle is None:
             raise ValueError(
@@ -592,8 +780,7 @@ class ProjectionEdgeOp(BaseModel):
         if self.relation in P3_EDGE_RELATIONS:
             raise ValueError(
                 f"relation '{self.relation}' belongs to the P3 backfill vocabulary "
-                "(exact workflow, ProcessVersion, SOP, and published-to-date RACI) "
-                "and is refused in this phase"
+                "(published-to-date RACI) and is refused in this phase"
             )
         if self.relation in P3_DEPENDENT_EDGE_RELATIONS:
             raise ValueError(
@@ -603,7 +790,7 @@ class ProjectionEdgeOp(BaseModel):
             )
         if self.relation not in {r.value for r in ProjectionRelation}:
             raise ValueError(
-                f"relation '{self.relation}' is outside the P2-prime allowlist "
+                f"relation '{self.relation}' is outside the projection allowlist "
                 f"{sorted(r.value for r in ProjectionRelation)}"
             )
         if self.from_node_id == self.to_node_id:
@@ -790,3 +977,14 @@ class ProjectionEnvelopeV2(BaseModel):
     def node_kinds(self) -> dict[str, ProjectionSourceKind]:
         """Declared kind for every node this envelope creates or restates."""
         return {op.node_id: op.source.kind for op in self.node_ops}
+
+    def carries_process_structure(self) -> bool:
+        """True when any operation belongs to the process-structure lane.
+
+        The route reads this to apply the lane's own switch, so the shape can be
+        admitted here without being authorized to write.
+        """
+        if any(op.source.kind in PROCESS_STRUCTURE_SOURCE_KINDS for op in self.node_ops):
+            return True
+        structure = {relation.value for relation in PROCESS_STRUCTURE_RELATIONS}
+        return any(op.relation in structure for op in self.edge_ops)

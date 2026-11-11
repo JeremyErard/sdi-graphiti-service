@@ -251,17 +251,18 @@ class FakeGraph:
         return FakeResult(rows)
 
     def _resolve_edges(self, q: str, params: dict):
-        endpoints = _LABEL_KEY.findall(q)
-        assert endpoints, q
-        scope = {
-            k: _resolve(v, params, None)
-            for k, v in _parse_map(endpoints[0][2]).items()
-            if k != "uuid"
-        }
+        # The identity check is one typed, index-answered lookup per relation,
+        # with the endpoints read off the edge and held to the projection label
+        # space and the tenant scope in the WHERE clause.
+        typed = re.search(r"MATCH \(\)-\[e:(\w+) \{uuid: wanted\}\]->\(\)", q)
+        assert typed, q
+        assert f"a:{pm.PROJECTION_NODE_LABEL} AND b:{pm.PROJECTION_NODE_LABEL}" in q, q
+        scope = {key: params[name] for key, name in re.findall(r"\ba\.(\w+) = \$(\w+)", q)}
+        assert scope and scope == {key: params[name] for key, name in re.findall(r"\bb\.(\w+) = \$(\w+)", q)}, q
         rows = []
         for wanted in params["edge_ids"]:
             for (_, edge_id, from_id, to_id), edge in self.store.edges.items():
-                if edge_id != wanted:
+                if edge_id != wanted or edge["relation"] != typed.group(1):
                     continue
                 if not all(edge["props"].get(k) == v for k, v in scope.items()):
                     continue
@@ -353,8 +354,13 @@ class FakeGraph:
         checks_hash = "projection_op_hash = row.op_hash" in q
         verified = set()
         for row in params["rows"]:
-            for (_, edge_id, _f, _t), edge in self.store.edges.items():
+            for (_, edge_id, from_id, to_id), edge in self.store.edges.items():
                 if edge_id != row["edge_id"]:
+                    continue
+                # Anchored on the endpoints the operation declares.
+                if "uuid: row.from_node_id" in q and from_id != row["from_node_id"]:
+                    continue
+                if "uuid: row.to_node_id" in q and to_id != row["to_node_id"]:
                     continue
                 if not all(edge["props"].get(k) == v for k, v in scope.items()):
                     continue
@@ -397,6 +403,7 @@ def store(monkeypatch):
     monkeypatch.setattr(settings, "graphiti_search_secret", SEARCH_SECRET, raising=False)
     monkeypatch.setattr(settings, "graphiti_admin_secret", ADMIN_SECRET, raising=False)
     monkeypatch.setattr(settings, "projection_v2_allow_outcome_event", False, raising=False)
+    monkeypatch.setattr(settings, "projection_v2_allow_process_structure", False, raising=False)
 
     consumed: set[str] = set()
 
@@ -962,12 +969,21 @@ def test_the_cursor_is_recorded_on_the_receipt_in_a_readable_form(store, client)
 # ==========================================================================
 
 
-@pytest.mark.parametrize("kind", ["WORKFLOW", "PROCESS_VERSION", "SOP", "RACI"])
-def test_p3_source_kinds_are_refused_today(kind, store, client):
-    body = envelope(node_ops=[node_op(source={**finding_source(), "kind": kind}, lifecycle=None)])
+def test_p3_source_kinds_are_refused_today(store, client):
+    body = envelope(node_ops=[node_op(source={**finding_source(), "kind": "RACI"}, lifecycle=None)])
     response = apply(client, body)
     assert response.status_code == 422
     assert "P3" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+@pytest.mark.parametrize("kind", ["WORKFLOW", "ROLE", "SYSTEM"])
+def test_process_structure_is_refused_until_its_lane_is_switched_on(kind, store, client):
+    """The model admits the shape; the deployment has to authorize the write."""
+    body = envelope(node_ops=[node_op(source={**finding_source(), "kind": kind}, lifecycle=None)])
+    response = apply(client, body)
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE" in json.dumps(response.json())
     assert store.mutating_queries() == []
 
 
@@ -1017,7 +1033,7 @@ def test_a_relation_outside_the_allowlist_is_refused_even_when_it_is_not_a_p3_re
                 edge_ops=[edge_op(relation="INVENTED_BY_A_CALLER")],
             )
         )
-    assert "P2-prime allowlist" in str(excinfo.value)
+    assert "projection allowlist" in str(excinfo.value)
 
 
 def test_graphiti_owned_labels_cannot_be_written_because_labels_are_not_caller_supplied(store, client):
@@ -1034,10 +1050,14 @@ def test_graphiti_owned_labels_cannot_be_written_because_labels_are_not_caller_s
 
 def test_every_declared_source_kind_is_classified_into_exactly_one_phase():
     kinds = set(pm.ProjectionSourceKind)
-    assert pm.P2_PRIME_SOURCE_KINDS | pm.P3_SOURCE_KINDS == kinds
-    assert not (pm.P2_PRIME_SOURCE_KINDS & pm.P3_SOURCE_KINDS)
+    phases = [pm.P2_PRIME_SOURCE_KINDS, pm.PROCESS_STRUCTURE_SOURCE_KINDS, pm.P3_SOURCE_KINDS]
+    assert frozenset().union(*phases) == kinds
+    assert sum(len(phase) for phase in phases) == len(kinds)
     assert set(pm.SOURCE_KIND_NODE_LABEL) == kinds
+    assert len(set(pm.SOURCE_KIND_NODE_LABEL.values())) == len(kinds)
     assert {pm.SOURCE_KIND_NODE_LABEL[k] for k in pm.P3_SOURCE_KINDS} <= pm.P3_NODE_LABELS
+    assert pm.VERSIONED_RECORD_KINDS < pm.PROCESS_STRUCTURE_SOURCE_KINDS
+    assert set(pm.RELATION_ENDPOINT_KINDS) == set(pm.ProjectionRelation)
 
 
 def test_an_edge_must_join_the_endpoint_kinds_its_relation_declares(store, client):
@@ -1066,9 +1086,9 @@ def test_the_p2_prime_allowlist_refuses_a_kind_that_no_phase_has_classified(monk
     monkeypatch.setattr(pm, "P3_SOURCE_KINDS", frozenset())
     with pytest.raises(Exception) as excinfo:
         ProjectionEnvelopeV2.model_validate(
-            envelope(node_ops=[node_op(source={**finding_source(), "kind": "SOP"}, lifecycle=None)])
+            envelope(node_ops=[node_op(source={**finding_source(), "kind": "RACI"}, lifecycle=None)])
         )
-    assert "P2-prime allowlist" in str(excinfo.value)
+    assert "projection allowlist" in str(excinfo.value)
 
 
 def test_the_admitted_p2_prime_shape_applies(store, client):
@@ -1578,7 +1598,12 @@ def test_the_edge_lane_cannot_bind_a_node_outside_the_projection_label_space(sto
     apply(client, envelope(node_ops=[node_op(), driver_op()], edge_ops=[edge_op()]))
     for statement, _ in store.queries:
         if "]->" in statement and "MATCH" in statement:
-            assert f":{pm.PROJECTION_NODE_LABEL} {{" in statement
+            # Either both endpoints are matched as projected nodes, or (the
+            # identity check, which starts from the edge index) both are read
+            # off the edge and then held to the projection label.
+            labelled = f":{pm.PROJECTION_NODE_LABEL} {{" in statement
+            held = f"a:{pm.PROJECTION_NODE_LABEL} AND b:{pm.PROJECTION_NODE_LABEL}" in statement
+            assert labelled or held, statement
     for statement in [q for q, _ in store.queries if q.startswith("UNWIND $node_ids")]:
         assert f"MATCH (n:{pm.PROJECTION_NODE_LABEL} {{uuid: wanted" in statement
 
@@ -1985,3 +2010,246 @@ def test_no_client_identity_or_planning_snapshot_is_hardcoded():
         assert "22361" not in text
         for slug in ["pbgc", "pokagon", "michigan"]:
             assert slug not in text.lower()
+
+
+# ==========================================================================
+# Process structure: the approved operating record, behind its own switch
+# ==========================================================================
+
+PV_HASH = "e6" * 32
+
+
+def structure_source(kind, source_id, version="pv-3"):
+    return {"kind": kind, "id": source_id, "immutable_version_id": version, "content_hash": PV_HASH}
+
+
+def structure_op(node_id, kind, *, version="pv-3", workflow="wf-1", properties=None, **extra):
+    props = dict(properties or {})
+    if workflow is not None:
+        props.setdefault("workflow_node_id", workflow)
+    props.update(extra)
+    return {"node_id": node_id, "source": structure_source(kind, node_id, version), "properties": props}
+
+
+def structure_envelope(**overrides):
+    node_ops = overrides.pop(
+        "node_ops",
+        [
+            structure_op(
+                "wf-1", "WORKFLOW", version="wf-1@a", workflow=None,
+                properties={"name": "Receiving", "current_map_version_id": "pv-3"},
+            ),
+            structure_op("pv-3", "PROCESS_VERSION", properties={"text": "Version 3 was approved."}),
+            structure_op("pv-3:s1", "PROCESS_STEP", properties={"text": "Step 1 is a task.", "lane_label": "Clerk"}),
+            structure_op("pv-3:s2", "PROCESS_STEP", properties={"text": "Step 2 is a decision."}),
+            structure_op("role:clerk", "ROLE", version="clerk@a", workflow=None, properties={"name": "Clerk"}),
+        ],
+    )
+    edge_ops = overrides.pop(
+        "edge_ops",
+        [
+            edge_op("e-version", relation="VERSION_OF", from_id="pv-3", to_id="wf-1"),
+            edge_op("e-has-1", relation="HAS_STEP", from_id="pv-3", to_id="pv-3:s1"),
+            edge_op("e-has-2", relation="HAS_STEP", from_id="pv-3", to_id="pv-3:s2"),
+            edge_op("e-next", relation="NEXT", from_id="pv-3:s1", to_id="pv-3:s2", properties={"condition": "the count matches"}),
+            edge_op("e-who", relation="PERFORMED_BY", from_id="pv-3:s1", to_id="role:clerk"),
+        ],
+    )
+    return envelope(node_ops=node_ops, edge_ops=edge_ops, **overrides)
+
+
+@pytest.fixture
+def lane_on(monkeypatch):
+    monkeypatch.setattr(settings, "projection_v2_allow_process_structure", True, raising=False)
+
+
+def test_the_process_structure_shape_applies_when_its_lane_is_on(store, client, lane_on):
+    response = apply(client, structure_envelope())
+    assert response.status_code == 200, response.text
+    assert response.json()["nodes_applied"] == 5
+    assert response.json()["edges_applied"] == 5
+    labels = sorted(tuple(sorted(node["labels"])) for node in store.nodes.values())
+    assert labels == [
+        ("ProcessStep", pm.PROJECTION_NODE_LABEL),
+        ("ProcessStep", pm.PROJECTION_NODE_LABEL),
+        ("ProcessVersion", pm.PROJECTION_NODE_LABEL),
+        (pm.PROJECTION_NODE_LABEL, "Role"),
+        (pm.PROJECTION_NODE_LABEL, "Workflow"),
+    ]
+
+
+def test_which_version_is_in_force_is_a_pointer_on_the_workflow_not_a_flag_on_every_row(store, client, lane_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    by_id = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert by_id["wf-1"]["current_map_version_id"] == "pv-3"
+    assert {uuid: props.get("workflow_node_id") for uuid, props in by_id.items()} == {
+        "wf-1": None, "pv-3": "wf-1", "pv-3:s1": "wf-1", "pv-3:s2": "wf-1", "role:clerk": None,
+    }
+    # The version a record belongs to is the service's own stamp from its source.
+    assert {by_id[uuid]["projection_source_version_id"] for uuid in ("pv-3", "pv-3:s1", "pv-3:s2")} == {"pv-3"}
+    assert not [props for props in by_id.values() if "record_current" in props or "record_state" in props]
+
+
+def test_replacing_a_version_is_one_write_to_the_workflow_node(store, client, lane_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    rows_before = {key: copy.deepcopy(node) for key, node in store.nodes.items() if node["props"]["uuid"] != "wf-1"}
+    flip = structure_envelope(
+        operation_id="op-2",
+        ordinal=1,
+        node_ops=[
+            structure_op(
+                "wf-1", "WORKFLOW", version="wf-1@b", workflow=None,
+                properties={"name": "Receiving", "current_map_version_id": "pv-4"},
+            )
+        ],
+        edge_ops=[],
+    )
+    assert apply(client, flip).status_code == 200
+    by_id = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert by_id["wf-1"]["current_map_version_id"] == "pv-4"
+    # Not one row of the old version was touched to take it out of force.
+    assert {key: node for key, node in store.nodes.items() if node["props"]["uuid"] != "wf-1"} == rows_before
+
+
+@pytest.mark.parametrize(
+    "op, fragment",
+    [
+        (structure_op("pv-3:s1", "PROCESS_STEP", workflow=None), "must name its workflow node"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", workflow="   "), "must name its workflow node"),
+        (structure_op("role:clerk", "ROLE", version="clerk@a", workflow="wf-1"), "only carried by records of an approved version"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", current_map_version_id="pv-3"), "only carried by a WORKFLOW node"),
+        (
+            structure_op("wf-1", "WORKFLOW", version="wf-1@a", workflow=None, current_sop_version_id=" "),
+            "must be a non-empty version id",
+        ),
+        (structure_op("pv-3:s1", "PROCESS_STEP", properties={"text": "   "}), "must be a non-empty string"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", properties={"workflow_name": 12345}), "'workflow_name' must be a string"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", properties={"text_embedding": [0.1]}), "written by the projection service"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", properties={"text_emb_failed": "m:4"}), "written by the projection service"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", properties={"text_emb_failed_at": 5}), "written by the projection service"),
+        (structure_op("pv-3:s1", "PROCESS_STEP", properties={"projection_source_version_id": "pv-9"}), "written by the projection service"),
+    ],
+)
+def test_a_record_that_misstates_where_it_belongs_or_what_it_says_is_refused(op, fragment):
+    with pytest.raises(Exception) as excinfo:
+        ProjectionEnvelopeV2.model_validate(structure_envelope(node_ops=[op], edge_ops=[]))
+    assert fragment in str(excinfo.value)
+
+
+def test_the_new_vocabulary_adds_no_envelope_field_so_older_envelopes_hash_as_they_always_did():
+    """A new envelope field would change the canonical form of every envelope
+    already applied, and a resend of one would then conflict instead of replay.
+    What a record needs to say rides in its property map."""
+    assert "currency" not in pm.ProjectionNodeOp.model_fields
+    assert set(pm.ProjectionNodeOp.model_fields) == {"op", "node_id", "source", "properties", "lifecycle"}
+
+
+def test_a_structure_edge_must_join_the_kinds_its_relation_declares(store, client, lane_on):
+    wrong = structure_envelope(
+        edge_ops=[edge_op("e-bad", relation="NEXT", from_id="pv-3:s1", to_id="role:clerk")]
+    )
+    response = apply(client, wrong)
+    assert response.status_code == 422
+    assert "relation NEXT ends at a ROLE node; it must end at a PROCESS_STEP node" in response.json()["detail"]
+    assert store.nodes == {}
+
+    crossed = structure_envelope(
+        node_ops=[
+            structure_op("sop-1", "SOP", version="sop-1"),
+            structure_op("pv-3", "PROCESS_VERSION"),
+            structure_op("pv-3:s1", "PROCESS_STEP"),
+        ],
+        edge_ops=[edge_op("e-cross", relation="HAS_STEP", from_id="sop-1", to_id="pv-3:s1")],
+    )
+    second = apply(client, crossed)
+    assert second.status_code == 422
+    assert "relation HAS_STEP cannot join a SOP node to a PROCESS_STEP node" in second.json()["detail"]
+    assert store.nodes == {}
+
+
+def test_a_structure_edge_alone_is_refused_while_the_lane_is_off(store, client):
+    """The switch reads edges too, so structure cannot be drawn between nodes
+    that happen to exist."""
+    assert ProjectionEnvelopeV2.model_validate(structure_envelope()).carries_process_structure()
+    assert not ProjectionEnvelopeV2.model_validate(envelope()).carries_process_structure()
+    response = apply(client, structure_envelope())
+    assert response.status_code == 422
+    assert store.mutating_queries() == []
+
+
+def test_reprojecting_the_same_approved_version_converges(store, client, lane_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    before = store.snapshot()
+    again = apply(client, structure_envelope(operation_id="op-2", ordinal=1))
+    assert again.status_code == 200
+    nodes_before, edges_before, _ = before
+    nodes_after, edges_after, _ = store.snapshot()
+    assert nodes_after == nodes_before
+    assert edges_after == edges_before
+
+
+def test_raci_stays_refused_with_the_lane_on(store, client, lane_on):
+    body = envelope(node_ops=[node_op(source={**finding_source(), "kind": "RACI"}, lifecycle=None)])
+    response = apply(client, body)
+    assert response.status_code == 422
+    assert "P3" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+def test_the_edge_identity_check_is_answered_from_an_index_not_a_walk_of_every_edge(store, client, lane_on):
+    """Matching an untyped edge by uuid walked every edge of the projection for
+    each wanted id. Each relation has its own uuid index and the check asks
+    them, one typed lookup per relation."""
+    assert apply(client, structure_envelope()).status_code == 200
+    lookups = [q for q, _ in store.queries if q.startswith("UNWIND $edge_ids")]
+    assert {re.search(r"-\[e:(\w+) ", q).group(1) for q in lookups} == {r.value for r in pm.ProjectionRelation}
+    assert all("-[e {uuid: wanted}]" not in q for q in lookups)
+    for relation in pm.ProjectionRelation:
+        assert f"CREATE INDEX FOR ()-[e:{relation.value}]-() ON (e.uuid)" in store.indices
+
+
+def test_an_edge_id_already_bound_under_another_relation_is_still_found(store, client, lane_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    moved = structure_envelope(
+        operation_id="op-2",
+        ordinal=1,
+        edge_ops=[edge_op("e-next", relation="HAS_STEP", from_id="pv-3", to_id="pv-3:s2")],
+    )
+    response = apply(client, moved)
+    assert response.status_code == 422
+    assert "already exists" in response.json()["detail"]
+
+
+def test_an_edge_is_verified_where_the_operation_put_it(store, client, lane_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    (statement,) = {q for q, _ in store.queries if q.startswith("UNWIND $rows") and "]->" in q and "MERGE" not in q}
+    assert "uuid: row.from_node_id" in statement and "uuid: row.to_node_id" in statement
+
+
+
+def test_an_envelope_of_structure_edges_alone_is_refused_while_the_lane_is_off(store, client, lane_on, monkeypatch):
+    """With the switch flipped back off, structure must not be redrawn between
+    process nodes that are already stored."""
+    assert apply(client, structure_envelope()).status_code == 200
+    monkeypatch.setattr(settings, "projection_v2_allow_process_structure", False, raising=False)
+    before = store.snapshot()
+    edges_only = envelope(
+        operation_id="op-edges",
+        ordinal=1,
+        node_ops=[],
+        edge_ops=[edge_op("e-extra", relation="NEXT", from_id="pv-3:s2", to_id="pv-3:s1")],
+    )
+    assert ProjectionEnvelopeV2.model_validate(edges_only).carries_process_structure()
+    response = apply(client, edges_only)
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE" in json.dumps(response.json())
+    assert store.snapshot() == before
+
+
+def test_the_new_property_rules_do_not_reach_the_kinds_admitted_before_them(store, client):
+    """An envelope of Finding kinds validates exactly as it always did, whatever
+    it carries under names the process-structure rules now give a meaning."""
+    body = envelope(
+        node_ops=[node_op(properties={"text": "   ", "workflow_node_id": "wf-1", "workflow_name": 7})]
+    )
+    assert apply(client, body).status_code == 200

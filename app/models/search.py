@@ -2,11 +2,11 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
 
 import re
 
-from pydantic import BaseModel, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from app.provenance_contract import (
     PROVENANCE_SUMMARY_CONTRACT_VERSION,
@@ -185,3 +185,51 @@ class ProvenanceShadow(BaseModel):
 
 class ShadowSearchContextResponse(LegacySearchContextResponse):
     provenance_shadow: ProvenanceShadow
+
+
+# ---------------------------------------------------------------------------
+# Record search: the approved operating record, exactly as projected
+# ---------------------------------------------------------------------------
+
+RECORD_SEARCH_CONTRACT_VERSION = "graphiti_record_search_v1"
+
+
+class RecordSearchRequest(BaseModel):
+    """Ask for the current process records that match a question.
+
+    Separate from /search/context on purpose: that route returns facts a model
+    extracted, under its own provenance contracts; this one returns rows
+    projected exactly from approved records. A caller that wants both asks
+    both, and neither answer depends on the other.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    client_slug: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{0,127}$")
+    engagement_id: str = Field(..., min_length=1, max_length=256)
+    readable_engagement_ids: list[Annotated[str, Field(min_length=1, max_length=256)]] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Other engagements of this client the caller may read",
+    )
+    query: str = Field(..., min_length=1, max_length=4000)
+    max_results: int = Field(default=6, ge=1, le=20)
+
+
+class RecordResult(BaseModel):
+    record_id: str = Field(description="Exact projected node id")
+    kind: str = Field(description="Source kind, e.g. PROCESS_STEP or SOP_STEP")
+    text: str = Field(description="The record's statement, as written by the projector")
+    source_id: str
+    source_version_id: str
+    engagement_id: str
+    workflow_id: str = ""
+    workflow_name: str = ""
+
+
+class RecordSearchResponse(BaseModel):
+    contract_version: Literal[RECORD_SEARCH_CONTRACT_VERSION] = RECORD_SEARCH_CONTRACT_VERSION
+    records: list[RecordResult] = Field(default_factory=list)
+    graph_name: str = ""
+    search_time_ms: float = 0.0
+

@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI
 
 from app.auth import require_scope, validate_auth_configuration
 from app.config import settings
-from app.routers import admin, graph, health, ingest, projection, search, structured
+from app.routers import admin, graph, health, ingest, projection, projection_embed, search, structured
 from app.services import graphiti_client, graphiti_patches
 
 # Install runtime patches over graphiti-core BEFORE any router import paths
@@ -72,6 +72,13 @@ app.include_router(
     # The same dependency object the projection handlers depend on, so the
     # perimeter check runs once per request rather than twice (a second
     # verify_request would consume the request nonce again and 409).
+    dependencies=[Depends(projection.INGEST_PRINCIPAL)],
+)
+app.include_router(
+    projection_embed.router,
+    prefix="/ingest",
+    tags=["ingestion"],
+    # Same shared dependency object as the projection routes, for the same reason.
     dependencies=[Depends(projection.INGEST_PRINCIPAL)],
 )
 app.include_router(
