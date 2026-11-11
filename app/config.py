@@ -152,6 +152,13 @@ class Settings(BaseSettings):
     # Default false keeps the Outcome projector lane refused until it is ratified.
     projection_v2_allow_outcome_event: bool = False
 
+    # Process structure through the same lane: a workflow, its approved process
+    # version and steps, the approved SOP with its steps, sections, exceptions
+    # and definitions, and the roles and systems they name, written exactly from
+    # the approved records with no model in the path. Default false keeps the
+    # lane refused until it is switched on for this deployment.
+    projection_v2_allow_process_structure: bool = False
+
     class Config:
         env_file = ".env"
         case_sensitive = False

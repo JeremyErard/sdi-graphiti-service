@@ -58,9 +58,9 @@ from app.models.projection import (
     ProjectionNodeOp,
     ProjectionOrigin,
     ProjectionRelation,
-    RELATION_ENDPOINT_KINDS,
     canonical_json,
     operation_hash,
+    relation_endpoint_error,
 )
 
 logger = logging.getLogger("graphiti_service")
@@ -142,13 +142,33 @@ RESOLVE_NODES_QUERY = (
     "RETURN wanted AS id, n.projection_source_kind AS kind"
 )
 
-RESOLVE_EDGES_QUERY = (
-    "UNWIND $edge_ids AS wanted "
-    f"MATCH (a:{PROJECTION_NODE_LABEL} {{group_id: $group_id, "
-    "engagement_id: $engagement_id})-[e {uuid: wanted}]->"
-    f"(b:{PROJECTION_NODE_LABEL} {{group_id: $group_id, engagement_id: $engagement_id}}) "
-    "RETURN wanted AS id, type(e) AS relation, a.uuid AS from_id, b.uuid AS to_id"
-)
+def _resolve_edges_query(relation: str) -> str:
+    """Find edges of one relation by identity, wherever their endpoints are.
+
+    The identity check has to find an edge id that is already bound to OTHER
+    endpoints, so it cannot start from the endpoints this envelope declares.
+    Matching `(a)-[e {uuid: wanted}]->(b)` with no type made the database walk
+    every edge out of every projected node for each wanted id: quadratic in the
+    size of the tenant's projection, and a process map carries more edges than
+    nodes (measured 2026-11-10: the 110th of 128 workflows took 20 s to apply
+    on a graph of 20,000 edges). A typed pattern is answered from the edge
+    index on uuid (see INDEX_STATEMENTS), and the endpoints are read off the
+    edge, so each lookup is an index probe. The relation is inlined because
+    Cypher cannot parameterize a type; it is never caller text, it is a member
+    of ProjectionRelation.
+
+    Scope is unchanged: both endpoints must be projected nodes of this tenant
+    and engagement, so an edge of graphiti's own can never be bound.
+    """
+    return (
+        "UNWIND $edge_ids AS wanted "
+        f"MATCH ()-[e:{relation} {{uuid: wanted}}]->() "
+        "WITH wanted, e, startNode(e) AS a, endNode(e) AS b "
+        f"WHERE a:{PROJECTION_NODE_LABEL} AND b:{PROJECTION_NODE_LABEL} "
+        "AND a.group_id = $group_id AND a.engagement_id = $engagement_id "
+        "AND b.group_id = $group_id AND b.engagement_id = $engagement_id "
+        "RETURN wanted AS id, type(e) AS relation, a.uuid AS from_id, b.uuid AS to_id"
+    )
 
 VERIFY_NODES_QUERY = (
     "UNWIND $rows AS row "
@@ -158,11 +178,15 @@ VERIFY_NODES_QUERY = (
     "RETURN count(DISTINCT n.uuid) AS verified"
 )
 
+# Anchored on the endpoints the operation declares, which the node index on
+# uuid answers, instead of walking every edge of the projection per row. It
+# also verifies more: the edge has to be where the operation put it.
 VERIFY_EDGES_QUERY = (
     "UNWIND $rows AS row "
-    f"MATCH (:{PROJECTION_NODE_LABEL} {{group_id: $group_id, "
+    f"MATCH (:{PROJECTION_NODE_LABEL} {{uuid: row.from_node_id, group_id: $group_id, "
     "engagement_id: $engagement_id})-[e {uuid: row.edge_id}]->"
-    f"(:{PROJECTION_NODE_LABEL} {{group_id: $group_id, engagement_id: $engagement_id}}) "
+    f"(:{PROJECTION_NODE_LABEL} {{uuid: row.to_node_id, group_id: $group_id, "
+    "engagement_id: $engagement_id}) "
     "WHERE e.projection_op_hash = row.op_hash "
     "RETURN count(DISTINCT e.uuid) AS verified"
 )
@@ -177,6 +201,9 @@ INDEX_STATEMENTS = (
     f"CREATE INDEX FOR (r:{PROJECTION_RECEIPT_LABEL}) ON (r.operation_id)",
     f"CREATE INDEX FOR (r:{PROJECTION_RECEIPT_LABEL}) ON (r.cursor_key)",
     f"CREATE INDEX FOR (r:{PROJECTION_RECEIPT_LABEL}) ON (r.import_manifest_hash)",
+    # One per relation the projection may write: the identity check finds an
+    # edge by its uuid through these (_resolve_edges_query).
+    *(f"CREATE INDEX FOR ()-[e:{relation.value}]-() ON (e.uuid)" for relation in ProjectionRelation),
 )
 
 # Graphs whose projection indices this process has already attempted.
@@ -784,21 +811,13 @@ async def _preflight(
     for node_id, kind in stored_kinds.items():
         all_kinds.setdefault(node_id, kind)
     for op in envelope.edge_ops:
-        expected = RELATION_ENDPOINT_KINDS[ProjectionRelation(op.relation)]
-        from_kind = all_kinds.get(op.from_node_id)
-        to_kind = all_kinds.get(op.to_node_id)
-        if from_kind and from_kind != expected[0].value:
-            raise _fail(
-                422,
-                f"edge '{op.edge_id}' relation {op.relation} starts at a "
-                f"{from_kind} node; it must start at a {expected[0].value} node",
-            )
-        if to_kind and to_kind != expected[1].value:
-            raise _fail(
-                422,
-                f"edge '{op.edge_id}' relation {op.relation} ends at a {to_kind} "
-                f"node; it must end at a {expected[1].value} node",
-            )
+        mismatch = relation_endpoint_error(
+            ProjectionRelation(op.relation),
+            all_kinds.get(op.from_node_id),
+            all_kinds.get(op.to_node_id),
+        )
+        if mismatch:
+            raise _fail(422, f"edge '{op.edge_id}' {mismatch}")
 
     # An edge ID already bound to different endpoints or a different relation
     # would leave the old edge in place next to the new one, so the graph would
@@ -806,13 +825,19 @@ async def _preflight(
     if envelope.edge_ops:
         wanted_by_id = {op.edge_id: op for op in envelope.edge_ops}
         for chunk in _chunks([{"id": edge_id} for edge_id in sorted(wanted_by_id)], APPLY_CHUNK_ROWS):
-            rows = _rows_of(
-                await _query(
-                    graph,
-                    RESOLVE_EDGES_QUERY,
-                    params={**scope, "edge_ids": [row["id"] for row in chunk]},
+            # Every relation, not only the ones this envelope uses: the point is
+            # to find an id that is already bound under a different relation.
+            rows = []
+            for relation in ProjectionRelation:
+                rows.extend(
+                    _rows_of(
+                        await _query(
+                            graph,
+                            _resolve_edges_query(relation.value),
+                            params={**scope, "edge_ids": [row["id"] for row in chunk]},
+                        )
+                    )
                 )
-            )
             for row in rows:
                 if not row or len(row) < 4:
                     continue
@@ -918,6 +943,18 @@ async def apply_projection_v2(
             "envelope carries the origin so the Outcome projector emits the same "
             "shape later; set PROJECTION_V2_ALLOW_OUTCOME_EVENT once that lane is "
             "ratified",
+        )
+
+    if (
+        envelope.carries_process_structure()
+        and not settings.projection_v2_allow_process_structure
+    ):
+        raise _fail(
+            422,
+            "process-structure projection (workflow, process version, SOP, their "
+            "steps, and the roles and systems they name) is not authorized on this "
+            "deployment in this phase; set PROJECTION_V2_ALLOW_PROCESS_STRUCTURE once "
+            "the lane is switched on",
         )
 
     envelope_hash = envelope.canonical_hash()
@@ -1096,7 +1133,15 @@ async def apply_projection_v2(
 
         edges_applied = 0
         for chunk in _chunks(edge_rows_all, APPLY_CHUNK_ROWS):
-            verify_rows = [{"edge_id": r["edge_id"], "op_hash": r["op_hash"]} for r in chunk]
+            verify_rows = [
+                {
+                    "edge_id": r["edge_id"],
+                    "op_hash": r["op_hash"],
+                    "from_node_id": r["from_node_id"],
+                    "to_node_id": r["to_node_id"],
+                }
+                for r in chunk
+            ]
             edges_applied += _first_scalar(
                 await _query(graph, VERIFY_EDGES_QUERY, params={**scope, "rows": verify_rows}),
                 default=0,
