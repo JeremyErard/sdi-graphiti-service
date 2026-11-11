@@ -429,3 +429,38 @@ def test_an_entity_lookup_that_cannot_get_its_turn_falls_back_to_the_scan(monkey
 
 def test_an_entity_lookup_waits_two_seconds_for_its_turn_at_most():
     assert indexed_falkor.NODE_VECTOR_TURN_WAIT_SECONDS == 2.0
+
+
+def test_a_free_turn_with_a_waiter_ahead_is_given_up_on_within_a_millisecond():
+    # The turn has just been released and a waiter ahead has been woken but not yet run: the lock reads as
+    # free. A caller with no time left takes its place in the queue for one millisecond and no longer.
+    assert vector_turns._FREE_TURN_SECONDS == 0.001
+
+    async def run():
+        turn = vector_turns.turn(vector_turns.RECORDS)
+        await turn.acquire()
+        started = asyncio.Event()
+
+        async def waiter():
+            started.set()
+            await turn.acquire()
+            await asyncio.sleep(0.2)  # the waiter's read
+            turn.release()
+
+        ahead = asyncio.ensure_future(waiter())
+        await started.wait()
+        await asyncio.sleep(0)
+        turn.release()  # the waiter is woken; until it runs the lock is unlocked
+        assert turn.locked() is False
+
+        async def read():
+            return "rows"
+
+        began = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await vector_turns.take_turn(vector_turns.RECORDS, read, 0)
+        waited = time.monotonic() - began
+        await ahead
+        return waited
+
+    assert asyncio.run(run()) < 0.1
