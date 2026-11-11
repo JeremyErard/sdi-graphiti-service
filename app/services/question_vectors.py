@@ -43,8 +43,14 @@ MAX_STORED = 20_000
 # A backstop, not the bound: a vector whose index entry was lost still goes.
 KEEP_SECONDS = 365 * 24 * 3600
 # The store has its own connection so that it never waits on the graph
-# handle's long socket limit: a read or write here gives up in half a second.
+# handle's long socket limit: a read or write here gives up in half a second,
+# and is never tried a second time (the client library retries a failed
+# connection with growing waits unless told not to: on a real engine that
+# turned half a second into 4.7 s).
 STORE_SOCKET_SECONDS = 0.5
+# However the client library behaves, a search waits no longer than this for
+# the store, once for the read and once for the write.
+STORE_WAIT_SECONDS = 1.0
 # After a failure the store is not tried again for this long.
 STORE_REST_SECONDS = 60.0
 
@@ -64,6 +70,8 @@ def _client() -> Any:
     global _redis
     if _redis is None:
         import redis  # noqa: PLC0415
+        from redis.backoff import NoBackoff  # noqa: PLC0415
+        from redis.retry import Retry  # noqa: PLC0415
 
         _redis = redis.Redis(
             host=settings.falkordb_host,
@@ -71,6 +79,8 @@ def _client() -> Any:
             password=settings.falkordb_password or None,
             socket_connect_timeout=STORE_SOCKET_SECONDS,
             socket_timeout=STORE_SOCKET_SECONDS,
+            retry=Retry(NoBackoff(), 0),
+            retry_on_timeout=False,
             decode_responses=True,
             max_connections=8,
         )
@@ -99,6 +109,11 @@ def _rest(error: BaseException) -> None:
         type(error).__name__,
         int(STORE_REST_SECONDS),
     )
+
+
+async def _within(call: Any, *args: Any) -> Any:
+    """One store call off the event loop, given up on after STORE_WAIT_SECONDS."""
+    return await asyncio.wait_for(asyncio.to_thread(call, *args), STORE_WAIT_SECONDS)
 
 
 def question_key(graph_name: str, text: str) -> str:
@@ -181,7 +196,7 @@ async def question_vector(embedder: Any, graph_name: str, query: str) -> list[fl
     found: Any = None
     if store is not None:
         try:
-            found = await asyncio.to_thread(store.get, key)
+            found = await _within(store.get, key)
         except Exception as error:
             _rest(error)
             store = None
@@ -200,7 +215,7 @@ async def question_vector(embedder: Any, graph_name: str, query: str) -> list[fl
         return vector
     try:
         # A value was there but did not decode: write over it. Otherwise only if absent.
-        held = await asyncio.to_thread(_write, store, key, encoded, found is None)
+        held = await _within(_write, store, key, encoded, found is None)
     except Exception as error:
         _rest(error)
         return settled

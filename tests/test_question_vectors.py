@@ -251,6 +251,37 @@ def test_a_store_that_cannot_be_read_asks_the_provider_and_is_left_alone_for_a_m
     assert ask(embedder) == third and len(embedder.asked) == 3
 
 
+@pytest.mark.parametrize("slow", ["get", "set"])
+def test_a_store_that_does_not_answer_is_given_up_on_and_the_search_goes_on(kept, monkeypatch, caplog, slow):
+    import time as clock
+
+    monkeypatch.setattr(question_vectors, "STORE_WAIT_SECONDS", 0.05)
+    plain = getattr(kept, slow)
+
+    def stuck(*args, **kwargs):
+        clock.sleep(0.6)
+        return plain(*args, **kwargs)
+
+    setattr(kept, slow, stuck)
+    embedder = JitterEmbedder()
+    began = clock.time()
+    with caplog.at_level(logging.WARNING):
+        answer = ask(embedder)
+    waited = clock.time() - began
+    # asyncio.run waits for the worker thread when it closes, so the bound is measured on the answer's log time.
+    (warning,) = [r for r in caplog.records if "question vector store failed" in r.getMessage()]
+    assert "error_type=TimeoutError" in warning.getMessage()
+    assert warning.created - began < 0.4, f"gave up at {warning.created - began:.2f} s, the store took 0.6 s"
+    assert len(answer) == 4 and len(embedder.asked) == 1 and waited < 2.0
+    before = len(kept.calls)
+    ask(embedder)
+    assert len(kept.calls) == before, "resting"
+
+
+def test_the_wait_for_the_store_is_one_second():
+    assert question_vectors.STORE_WAIT_SECONDS == 1.0
+
+
 @pytest.mark.parametrize("broken", ["set", "pipeline"])
 def test_a_store_that_cannot_be_written_still_answers_and_rests(kept, caplog, broken):
     kept.fail.add(broken)
@@ -381,15 +412,28 @@ def test_the_stores_own_connection_gives_up_in_half_a_second_and_is_made_once(mo
     question_vectors.reset()
     first, second = question_vectors._client(), question_vectors._client()
     assert first is second and len(built) == 1
+    retry = built[0].pop("retry")
     assert built[0] == {
         "host": "graph.internal",
         "port": 6380,
         "password": None,
         "socket_connect_timeout": 0.5,
         "socket_timeout": 0.5,
+        "retry_on_timeout": False,
         "decode_responses": True,
         "max_connections": 8,
     }
+    # The library's own default retries a failed connection with growing waits
+    # (4.7 s on a real engine where half a second was meant). Never a second try.
+    tries = []
+
+    def failing():
+        tries.append(1)
+        raise redis.exceptions.ConnectionError("refused")
+
+    with pytest.raises(redis.exceptions.ConnectionError):
+        retry.call_with_retry(failing, lambda error: None)
+    assert len(tries) == 1
     question_vectors.reset()
     question_vectors._client()
     assert len(built) == 2, "reset() forgets the connection"
