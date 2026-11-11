@@ -1,10 +1,10 @@
-graphiti-core[falkordb,voyageai]==0.28.2
+graphiti-core[falkordb,voyageai]==0.31.2
 redis>=5,<9
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 # Upper bound is load-bearing. anthropic 1.0 removed `temperature` from
-# AsyncMessages.create(), and graphiti-core 0.28.2 passes it unconditionally
-# (graphiti_core/llm_client/anthropic_client.py:291). With no ceiling, any
+# AsyncMessages.create(), and graphiti-core 0.31.2 still passes it unconditionally
+# (graphiti_core/llm_client/anthropic_client.py:295). With no ceiling, any
 # image rebuild floats to 1.x and every ingestion fails with
 # "AsyncMessages.create() got an unexpected keyword argument 'temperature'"
 # -> TypeError -> HTTP 500. Observed 2026-08-27: a rebuild did exactly that,

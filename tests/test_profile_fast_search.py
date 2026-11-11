@@ -139,7 +139,9 @@ def test_the_bm25_leg_sends_graphiti_s_query_form(monkeypatch):
     _install(monkeypatch, graph)
     asyncio.run(graphiti_client._search_fast("pokagon", "Who approved the Table Fill Inspection process map, and when?", 10))
     (bm25_params,) = [p for q, p in [(q, p) for q, p in zip(graph.queried, graph.query_params)] if "fulltext" in q]
-    assert bm25_params["query"].startswith('(@group_id:"client_pokagon") (')
+    # graphiti-core 0.31 escapes the underscore in the group name. Both spellings return the same facts in
+    # the same order, and another group's name returns none (checked on a local graph, 2026-11-10).
+    assert bm25_params["query"].replace("\\_", "_").startswith('(@group_id:"client_pokagon") (')
     assert " | " in bm25_params["query"]
     assert bm25_params["query"] == graphiti_client.fulltext_query_for("Who approved the Table Fill Inspection process map, and when?", "client_pokagon")
     out = asyncio.run(graphiti_client.profile_fast_search("pokagon", "Who approved the Table Fill Inspection process map, and when?", 10))

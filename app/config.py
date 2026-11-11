@@ -67,7 +67,7 @@ class Settings(BaseSettings):
 
     # LLM for entity extraction. The model string MUST be one graphiti-core's
     # token map recognizes, or it silently falls back to a 16384-token output
-    # cap. graphiti-core 0.28.2 recognizes the Claude 4.5 generation
+    # cap. graphiti-core 0.31.2 recognizes the Claude 4.5 generation
     # (claude-sonnet-4-5-latest, claude-haiku-4-5-latest -> 65536) but NOT any
     # Opus 4.x — the prior "claude-opus-4-7" was unrecognized and capped.
     # Sonnet 4.5 is the quality choice; set GRAPHITI_LLM_MODEL=claude-haiku-4-5-latest
