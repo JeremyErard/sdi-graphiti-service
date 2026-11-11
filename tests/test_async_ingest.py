@@ -142,6 +142,15 @@ def test_finished_jobs_are_pruned_after_their_ttl(monkeypatch):
     assert ingest_jobs.get(job.job_id, "pokagon") is None
 
 
+def test_a_finished_job_outlasts_an_extraction_so_a_restarted_caller_can_still_ask():
+    """A caller restarted mid-poll asks about its job before sending the episode
+    again, possibly after another extraction has run first. The window must
+    outlast the longest a job may run, or that question gets a 404 and the
+    episode is extracted twice."""
+    assert ingest_jobs.FINISHED_TTL_SECONDS > ingest_jobs.RUNNING_MAX_AGE_SECONDS
+    assert ingest_jobs.FINISHED_TTL_SECONDS >= 2 * 60 * 60
+
+
 def test_sync_endpoint_still_hides_the_cause(monkeypatch):
     # Unchanged contract: pinned by test_provenance_ingest_contract.
     async def boom(req):
