@@ -317,9 +317,15 @@ class IndexedFalkorSearchOperations(_BoundedFulltextMixin, FalkorSearchOperation
             )
             # A nearest-neighbour read of a node index takes its turn: two at the
             # same moment came back wrong on a real engine (see vector_turns).
-            # A read that cannot get its turn in time falls back to the scan
-            # below, like any other failure of the index path.
+            # The turn is the entity index's own, so these lookups and record
+            # searches never wait on each other. A lookup that cannot get its
+            # turn in time falls back to the scan below, like any other failure
+            # of the index path. Known cost: this query has no server-side time
+            # limit, so one that hangs holds the turn until its socket gives up,
+            # and the lookups behind it each wait out the bound and then scan.
+            # Slower, and right.
             records, _, _ = await vector_turns.take_turn(
+                vector_turns.ENTITIES,
                 lambda: executor.execute_query(
                     cypher,
                     search_vector=search_vector,

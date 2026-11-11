@@ -501,7 +501,7 @@ async def _leg_read(
         return await asyncio.to_thread(_read, graph, statement, params, timeout_ms)
     wait = min(timeout_ms / 1000, deadline - time.monotonic())
     return await vector_turns.take_turn(
-        lambda: asyncio.to_thread(_read, graph, statement, params, timeout_ms), wait
+        vector_turns.RECORDS, lambda: asyncio.to_thread(_read, graph, statement, params, timeout_ms), wait
     )
 
 

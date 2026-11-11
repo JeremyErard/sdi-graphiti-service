@@ -99,7 +99,9 @@ def _client() -> Any:
                 socket_timeout=STORE_SOCKET_SECONDS,
                 retry=Retry(NoBackoff(), 0),
                 retry_on_timeout=False,
-                decode_responses=True,
+                # Replies are left as bytes. A client that decodes them raises on a value that is not
+                # text before anyone can look at it, and such a value could then never be repaired.
+                decode_responses=False,
             )
         )
     return _redis
@@ -188,7 +190,13 @@ def _write(store: Any, key: str, encoded: str, unreadable: Any) -> Any:
     out.
     """
     if unreadable is not None:
-        store.eval(_DROP_IF_UNCHANGED, 1, key, unreadable)
+        try:
+            store.eval(_DROP_IF_UNCHANGED, 1, key, unreadable)
+        except Exception:
+            # A server that will not run a script: the value is removed all the same, or it would sit in the
+            # way of this question for good. What that leaves open is two asks finding the same unreadable
+            # value at the same moment, where the second could remove the first one's vector.
+            store.delete(key)
     for _attempt in range(2):
         if store.set(key, encoded, ex=KEEP_SECONDS, nx=True):
             break
@@ -205,7 +213,7 @@ def _write(store: Any, key: str, encoded: str, unreadable: Any) -> Any:
     pipe.zcard(INDEX_KEY)
     over = int(pipe.execute()[-1]) - MAX_STORED
     if over > 0:
-        oldest = [name for name, _score in store.zpopmin(INDEX_KEY, over)]
+        oldest = [name for name, _score in store.zpopmin(INDEX_KEY, over)]  # names as the client gives them, bytes or text
         if oldest:
             store.delete(*oldest)
     return encoded

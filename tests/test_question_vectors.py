@@ -382,10 +382,104 @@ def test_a_vector_that_was_there_and_is_gone_again_is_kept_on_the_second_try(kep
 
 
 def test_a_vector_that_cannot_be_kept_after_two_tries_is_still_an_answer(kept):
-    kept.set = lambda name, value, ex=None, nx=False: None
+    tries = []
+    kept.set = lambda name, value, ex=None, nx=False: tries.append(nx)
     embedder = JitterEmbedder()
     assert ask(embedder) == as_stored([0.1 + 1e-3 + place * 0.01 for place in range(4)])
+    assert tries == [True, True], "two tries, each only if absent, and no more"
     assert kept.values == {} and kept.index == {}
+
+
+# --------------------------------------------------------------------------
+# Against a Redis that runs the store's script for real
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def real(monkeypatch):
+    """A Redis in the test process with a real Lua interpreter, giving bytes as the service's client does."""
+    import fakeredis
+
+    monkeypatch.setattr(settings, "embedding_dim", 4, raising=False)
+    monkeypatch.setattr(settings, "embedding_model", "unit-embedder", raising=False)
+    monkeypatch.setattr(settings, "graphiti_acceptance_probe_mode", False, raising=False)
+    store = fakeredis.FakeRedis(decode_responses=False)
+    monkeypatch.setattr(question_vectors, "_client", lambda: store)
+    return store
+
+
+def test_the_script_removes_a_value_only_if_it_is_still_the_one_that_was_read(real):
+    script = question_vectors._DROP_IF_UNCHANGED
+    real.set("k", b"as read")
+    assert real.eval(script, 1, "k", b"something else") == 0 and real.get("k") == b"as read", "changed since it was read: left alone"
+    assert real.eval(script, 1, "k", b"as read") == 1 and real.get("k") is None, "unchanged: removed"
+    assert real.eval(script, 1, "k", b"as read") == 0, "nothing there: nothing done"
+    assert real.eval(script, 1, "k", b"") == 0
+
+
+def test_the_whole_exchange_on_a_real_store(real):
+    embedder = JitterEmbedder()
+    first = ask(embedder)
+    key = question_vectors.question_key(GRAPH, QUESTION)
+    assert ask(embedder) == first and len(embedder.asked) == 1
+    assert question_vectors.decode(real.get(key)) == first
+    assert 0 < real.ttl(key) <= question_vectors.KEEP_SECONDS
+    assert real.zcard(question_vectors.INDEX_KEY) == 1 and real.zscore(question_vectors.INDEX_KEY, key) is not None
+
+
+@pytest.mark.parametrize("unreadable", [b"not base64 !!", b"\xff\xfe\x00", b"", b"AAAA"])
+def test_an_unreadable_value_of_any_bytes_is_repaired_on_a_real_store(real, unreadable, caplog):
+    key = question_vectors.question_key(GRAPH, QUESTION)
+    real.set(key, unreadable)
+    embedder = JitterEmbedder()
+    with caplog.at_level(logging.WARNING):
+        answer = ask(embedder)
+    assert question_vectors.decode(real.get(key)) == answer, "the value that could not be read is gone and the vector is kept"
+    assert ask(embedder) == answer and len(embedder.asked) == 1
+    assert not [r for r in caplog.records if "question vector store failed" in r.getMessage()], "and the store was not sent to rest over it"
+
+
+def test_two_asks_that_both_read_an_unreadable_value_end_on_the_same_vector_on_a_real_store(real):
+    # The second ask's removal runs after the first ask has already kept its vector. The script must leave it.
+    key = question_vectors.question_key(GRAPH, QUESTION)
+    real.set(key, b"not base64 !!")
+    winner = question_vectors.encode([0.9, 0.8, 0.7, 0.6])
+    plain_eval = real.eval
+
+    def eval_after_the_other(script, numkeys, name, value):
+        real.set(name, winner)  # the other ask removed the unreadable value and kept its own vector
+        return plain_eval(script, numkeys, name, value)
+
+    real.eval = eval_after_the_other
+    assert ask(JitterEmbedder()) == question_vectors.decode(winner)
+    assert real.get(key) == winner.encode("ascii")
+
+
+def test_a_server_that_will_not_run_the_script_still_gets_the_unreadable_value_out_of_the_way(real):
+    key = question_vectors.question_key(GRAPH, QUESTION)
+    real.set(key, b"not base64 !!")
+
+    def refused(*_args):
+        raise RuntimeError("scripting is disabled on this server")
+
+    real.eval = refused
+    embedder = JitterEmbedder()
+    answer = ask(embedder)
+    assert question_vectors.decode(real.get(key)) == answer
+    assert ask(embedder) == answer and len(embedder.asked) == 1
+
+
+def test_the_cap_holds_on_a_real_store(real, monkeypatch):
+    monkeypatch.setattr(question_vectors, "MAX_STORED", 3)
+    clock = SimpleNamespace(now=5_000_000.0)
+    monkeypatch.setattr(question_vectors.time, "time", lambda: clock.now)
+    embedder = JitterEmbedder()
+    for number in range(6):
+        clock.now += 1
+        ask(embedder, question=f"question {number}")
+    kept_keys = {key.decode() for key in real.keys(question_vectors.KEY_PREFIX + "*")} - {question_vectors.INDEX_KEY}
+    assert kept_keys == {question_vectors.question_key(GRAPH, f"question {number}") for number in (3, 4, 5)}
+    assert real.zcard(question_vectors.INDEX_KEY) == 3
 
 
 @pytest.mark.parametrize("probe", ["health probe", "Health Probe", " health probe ", "health\nprobe"])
@@ -508,7 +602,9 @@ def test_the_stores_own_connection_gives_up_in_half_a_second_and_is_made_once(mo
         "socket_connect_timeout": 0.5,
         "socket_timeout": 0.5,
         "retry_on_timeout": False,
-        "decode_responses": True,
+        # Bytes, not text: a client that decodes replies raises on a value that is not text before anyone
+        # can look at it, and such a value could then never be repaired.
+        "decode_responses": False,
     }
     assert question_vectors.STORE_CONNECTIONS == 8
     # The library's own default retries a failed connection with growing waits
