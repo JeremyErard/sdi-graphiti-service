@@ -50,6 +50,7 @@ from app.models.projection import (
     PROJECTION_NODE_LABEL,
     RECORD_TEXT_PROPERTY,
     RECORD_WORKFLOW_PROPERTY,
+    SOURCE_KIND_NODE_LABEL,
     ProjectionSourceKind,
 )
 from app.services import graphiti_client, question_vectors, vector_turns
@@ -416,6 +417,20 @@ _IN_FORCE = (
 # them on the question's own subject, and every counting question still got
 # its count first. The kinds are the ones a record set puts in force, read
 # from the model's own tables.
+#
+# A summary also never takes a place from an approved record, at any stage.
+# Neither leg keeps one: the keyword leg leaves them out before its window is
+# cut, the vector leg after its window is read (so the window is judged full or
+# not by what the index handed over, as before). They are read on their own
+# (_SUMMARY_READ), and placed among the records at the rank they would have had
+# in the vector leg. So the approved records a question gets are the ones it got
+# before there were summaries, and a summary comes beside them (see the end of
+# search_records). Measured on a rehearsal with real records (2026-11-12, one
+# engine state): with summaries kept by the vector leg and cut with the records,
+# a summary took a place from an approved record on 13 of 196 questions at five
+# results and 14 at ten; read on their own, on none. Kept out of the vector
+# leg's pool as well, a summary also cannot push a record out of the pool the
+# two legs are fused from.
 MEANING_ONLY_KINDS = tuple(
     sorted(
         kind.value
@@ -425,6 +440,23 @@ MEANING_ONLY_KINDS = tuple(
     )
 )
 _NOT_BY_KEYWORD = "NOT n.projection_source_kind IN [" + ", ".join(f"'{kind}'" for kind in MEANING_ONLY_KINDS) + "]"
+# The most summaries a search returns beside the records asked for (see the
+# end of search_records).
+SUMMARIES_BESIDE_RECORDS = 3
+if len(MEANING_ONLY_KINDS) != 1:  # pragma: no cover - a guard on the model, not a runtime path
+    raise RuntimeError("_SUMMARY_READ reads one node label; a second summary kind needs a read of its own")
+# The summaries in force, nearest first, scored exactly. There are a few dozen
+# to an engagement, so they are compared with the question one by one instead
+# of through the vector index: the score is the same (the index's score is this
+# cosine distance), the read needs no turn at the index (see vector_turns), and
+# no summary can take a place in an index window. The node label is the fixed
+# label the model maps the kind to, never caller text.
+_SUMMARY_READ = (
+    f"MATCH (n:{SOURCE_KIND_NODE_LABEL[ProjectionSourceKind(MEANING_ONLY_KINDS[0])]}) "
+    "WHERE n.text_emb_model = $marker AND n.text_embedding IS NOT NULL "
+    "WITH n, vec.cosineDistance(n.text_embedding, vecf32($q)) AS score, 0 AS seen "
+    "WHERE "
+)
 
 
 # Is anything in force at all for the engagements asked about? Only a workflow
@@ -475,8 +507,8 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     force for the engagements asked about, ordered again after the join: the
     vector procedure scores by distance (nearest first), the keyword procedure
     by relevance (highest first). A summary of a whole engagement is kept by
-    the vector leg only (see MEANING_ONLY_KINDS): it is found by what it means,
-    not by the words it shares. Two records with the same score are put in
+    neither leg: it is found by what it means, not by the words it shares, and
+    read on its own (summary_read_query, MEANING_ONLY_KINDS). Two records with the same score are put in
     order by their id, in the final cut and in the keyword leg's window, so
     which of them is kept does not depend on the order the engine happened to
     hand them over. (Which candidates the vector index puts in its own window
@@ -488,11 +520,16 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     window = int(window if window is not None else pool * _OVERFETCH)
     vector_head, keyword_head = _leg_heads(window)
     vector = (
-        f"{vector_head}{_CANDIDATES}WHERE n.text_emb_model = $marker AND {_IN_FORCE} "
+        f"{vector_head}{_CANDIDATES}WHERE n.text_emb_model = $marker AND {_NOT_BY_KEYWORD} AND {_IN_FORCE} "
         f"ORDER BY score ASC, uuid ASC LIMIT {pool}"
     )
     keyword = f"{keyword_head}{_CANDIDATES}WHERE {_IN_FORCE} ORDER BY score DESC, uuid ASC LIMIT {pool}"
     return vector, keyword
+
+
+def summary_read_query() -> str:
+    """The Cypher of the summaries' own read: those in force, nearest first, no more than are ever returned."""
+    return f"{_SUMMARY_READ}{_IN_FORCE} ORDER BY score ASC, uuid ASC LIMIT {SUMMARIES_BESIDE_RECORDS}"
 
 
 def record_leg_counts(window: int) -> tuple[str, str]:
@@ -668,16 +705,45 @@ async def search_records(
         return []
 
     by_id: dict[str, dict[str, Any]] = {}
+    # How near each vector-leg record and each summary is to the question (cosine distance, lower is nearer).
+    distance: dict[str, float] = {}
 
-    def collect(rows: list[list[Any]]) -> list[str]:
+    def collect(rows: list[list[Any]], keep_distance: bool = False) -> list[str]:
         order: list[str] = []
         for row in rows:
             if not row or not row[0]:
                 continue
             record_id = _text(row[0])
             by_id.setdefault(record_id, _row_to_record(row))
+            if keep_distance:
+                try:
+                    distance[record_id] = float(row[-2])
+                except (TypeError, ValueError):
+                    distance[record_id] = float("inf")
             order.append(record_id)
         return order
+
+    async def summary_read(qvec: list[float]) -> list[str]:
+        """The summaries in force nearest the question. Never fails the search: a failure means no summaries."""
+        began = time.monotonic()
+        try:
+            rows = (
+                await asyncio.to_thread(
+                    _read, graph, summary_read_query(), {**scope, "q": qvec, "marker": _marker()},
+                    settings.search_vector_timeout_ms,
+                )
+            ).result_set or []
+            return collect(rows, keep_distance=True)
+        except Exception as error:
+            logger.warning(
+                "[graphiti] record summary read skipped on %s error_type=%s after %d ms",
+                name,
+                type(error).__name__,
+                int((time.monotonic() - began) * 1000),
+            )
+            return []
+
+    summary_order: list[str] = []
 
     async def vector_leg() -> list[str]:
         began = time.monotonic()
@@ -688,16 +754,19 @@ async def search_records(
             # The question's vector is made once and kept: the provider does not
             # give the same vector for the same text twice (see question_vectors).
             qvec = await question_vectors.question_vector(embedder, name, query)
-            return collect(
-                await _leg(
+            rows, summaries = await asyncio.gather(
+                _leg(
                     graph,
                     name,
                     "vector",
                     {**scope, "q": qvec, "marker": _marker()},
                     pool,
                     settings.search_vector_timeout_ms,
-                )
+                ),
+                summary_read(qvec),
             )
+            summary_order.extend(summaries)
+            return collect(rows, keep_distance=True)
         except Exception as error:
             logger.warning(
                 "[graphiti] record vector leg skipped on %s error_type=%s after %d ms",
@@ -738,5 +807,34 @@ async def search_records(
     for ordered in (vector_order, keyword_order):
         for rank, record_id in enumerate(ordered):
             scores[record_id] = scores.get(record_id, 0.0) + 1.0 / (rank + _RRF_K)
+    # A summary goes where it would have stood in the vector leg: just ahead of
+    # the first record farther from the question than it, after any record as
+    # near or nearer, and after the summaries nearer than it. The records' own
+    # ranks are not moved by it, so a record's place in the answer is what it
+    # was without summaries. (Half a rank ahead of that record; a thousandth of
+    # a rank apart from one summary to the next, and there are never more than
+    # SUMMARIES_BESIDE_RECORDS.)
+    for place, summary_id in enumerate(summary_order):
+        nearer = sum(1 for record_id in vector_order if distance.get(record_id, float("inf")) <= distance[summary_id])
+        scores[summary_id] = 1.0 / (nearer - 0.5 + place / 1000 + _RRF_K)
     ranked = sorted(scores, key=lambda record_id: scores[record_id], reverse=True)
-    return [by_id[record_id] for record_id in ranked[: int(max_results)]]
+    # A summary never takes a place from an approved record. The places asked for
+    # go to the best records that are not summaries. A summary is returned as
+    # well, at its own rank, only where it ranked ahead of the last of those, and
+    # no more than SUMMARIES_BESIDE_RECORDS of them: so a question a count
+    # answers gets the count, and every other question gets the records it got
+    # before there were counts.
+    chosen: list[dict[str, Any]] = []
+    records = summaries = 0
+    for record_id in ranked:
+        found = by_id[record_id]
+        if found["kind"] in MEANING_ONLY_KINDS:
+            if summaries < SUMMARIES_BESIDE_RECORDS:
+                chosen.append(found)
+                summaries += 1
+            continue
+        chosen.append(found)
+        records += 1
+        if records >= int(max_results):
+            break
+    return chosen

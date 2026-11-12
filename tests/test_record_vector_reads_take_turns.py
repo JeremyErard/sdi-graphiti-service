@@ -28,8 +28,8 @@ class WatchedGraph:
         self.read_seconds = read_seconds
         self.vector_rows = vector_rows
         self.lock = threading.Lock()
-        self.running = {"vector": 0, "keyword": 0}
-        self.most = {"vector": 0, "keyword": 0}
+        self.running = {"vector": 0, "keyword": 0, "summary": 0}
+        self.most = {"vector": 0, "keyword": 0, "summary": 0}
         self.reads: list[str] = []
         self.hold: threading.Event | None = None
         self.started = threading.Event()
@@ -40,7 +40,11 @@ class WatchedGraph:
     def ro_query(self, statement, params=None, timeout=None):
         if "RETURN w.uuid LIMIT 1" in statement:
             return SimpleNamespace(result_set=[["wf-1"]])
-        leg = "vector" if "db.idx.vector.queryNodes" in statement else "keyword"
+        leg = (
+            "vector" if "db.idx.vector.queryNodes" in statement
+            else "summary" if statement == projection_records.summary_read_query()
+            else "keyword"
+        )
         count = "count(n) AS seen" in statement
         with self.lock:
             self.running[leg] += 1
@@ -54,7 +58,7 @@ class WatchedGraph:
             time.sleep(self.read_seconds)
             if count:
                 return SimpleNamespace(result_set=[[0]])
-            if leg == "vector" and not self.vector_rows:
+            if (leg == "vector" and not self.vector_rows) or leg == "summary":
                 return SimpleNamespace(result_set=[])
             return SimpleNamespace(result_set=[ROW])
         finally:
@@ -93,6 +97,9 @@ def test_searches_at_once_never_run_two_vector_reads_together_and_keyword_reads_
     assert all([record["record_id"] for record in found] == ["r1"] for found in answers)
     assert graph.reads.count("vector") == 6 and graph.reads.count("keyword") == 6
     assert graph.most["vector"] == 1, "one record vector read at a time"
+    # The summaries' own read uses no index, so it takes no turn: they run side by side, like keyword reads.
+    assert graph.reads.count("summary") == 6
+    assert graph.most["summary"] >= 2, "summary reads do not wait for a turn"
     assert graph.most["keyword"] >= 2, "keyword reads run side by side as before"
 
 

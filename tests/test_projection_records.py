@@ -25,12 +25,14 @@ class FakeGraph:
     the leg finds them (below it the window is full of history and nothing
     survives); `total` is how many candidates the index holds at all."""
 
-    def __init__(self, pending=None, vector_rows=None, keyword_rows=None, fail=(), need_window=0, total=10_000, refuse_text=None, holds=True):
+    def __init__(self, pending=None, vector_rows=None, keyword_rows=None, fail=(), need_window=0, total=10_000, refuse_text=None, holds=True, summary_rows=None):
         self.pending = list(pending or [])
         # Whether the engagements asked about have a workflow that points at a version: the search asks this first.
         self.holds = holds
         self.vector_rows = vector_rows or []
         self.keyword_rows = keyword_rows or []
+        # The summaries in force, nearest first, as their own read keeps them.
+        self.summary_rows = summary_rows or []
         self.fail = set(fail)
         self.need_window = need_window
         self.total = total
@@ -73,6 +75,11 @@ class FakeGraph:
             if "presence" in self.fail:
                 raise RuntimeError("the presence read timed out")
             return SimpleNamespace(result_set=[["wf-1"]] if self.holds else [])
+        if statement == projection_records.summary_read_query():
+            if "summary" in self.fail:
+                raise RuntimeError("the summary read timed out")
+            limit = int(statement.rsplit("LIMIT ", 1)[1])
+            return SimpleNamespace(result_set=[[*row[:8], row[8], 0] for row in self.summary_rows[:limit]])
         if "db.idx.vector.queryNodes" in statement:
             leg, rows = "vector", self.vector_rows
             window = int(statement.split("'text_embedding', ")[1].split(",")[0])
@@ -329,9 +336,28 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
         "WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT 30 "
         "WITH collect({n: n, score: score}) AS candidates "
     )
-    assert keyword.count("NOT n.projection_source_kind IN") == 1 and "NOT n.projection_source_kind IN" not in vector
+    assert keyword.count("NOT n.projection_source_kind IN") == 1
     assert "seen WHERE n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in keyword
-    assert "seen WHERE n.text_emb_model = $marker AND n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in vector
+    # The vector leg leaves them out too, but AFTER its window is read: the index's window can only be read whole,
+    # and whether it was full (so worth widening) is judged by what the index handed over, as before.
+    assert vector.count("NOT n.projection_source_kind IN") == 1
+    assert vector.index("NOT n.projection_source_kind IN") > vector.index("size(candidates) AS seen")
+    assert (
+        "seen WHERE n.text_emb_model = $marker AND NOT n.projection_source_kind IN ['RECORD_SET_SUMMARY'] "
+        "AND n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in vector
+    )
+    # They are read on their own instead: those in force, scored exactly against the question with the distance
+    # the vector index itself uses, nearest first, no more than are ever returned, and with no index read at all.
+    summary = projection_records.summary_read_query()
+    assert summary.startswith(
+        "MATCH (n:RecordSetSummary) WHERE n.text_emb_model = $marker AND n.text_embedding IS NOT NULL "
+        "WITH n, vec.cosineDistance(n.text_embedding, vecf32($q)) AS score, 0 AS seen "
+        "WHERE n.group_id = $group_id AND n.engagement_id IN $engagement_ids MATCH (w:ProjectionNode"
+    )
+    assert summary.endswith("RETURN n.uuid AS uuid, n.text AS text, n.projection_source_kind AS kind, n.projection_source_id AS source_id, n.projection_source_version_id AS version_id, n.engagement_id AS engagement_id, n.workflow_id AS workflow_id, n.workflow_name AS workflow_name, score, seen ORDER BY score ASC, uuid ASC LIMIT 3")
+    # The same in-force rule as the legs, freshness of the counting run included.
+    assert projection_records._IN_FORCE in summary and "w.counted_at >= $counted_after" in summary
+    assert "queryNodes" not in summary
     assert projection_records.MEANING_ONLY_KINDS == ("RECORD_SET_SUMMARY",)
     # The count asked when nothing survives is of the same window, cut the same way.
     assert projection_records.record_leg_counts(30)[1].startswith(keyword[: keyword.index("WITH collect(")])
@@ -361,6 +387,131 @@ def test_a_record_both_legs_agree_on_ranks_first(wired):
         "workflow_id": "wf-1",
         "workflow_name": "Receiving",
     }
+
+
+def _near(record_id, distance, kind="PROCESS_STEP"):
+    return row(record_id, kind=kind, score=distance)
+
+
+def _summary(record_id, distance):
+    return _near(record_id, distance, kind="RECORD_SET_SUMMARY")
+
+
+def _ask(graph, max_results, question="who checks the seal"):
+    return [record["record_id"] for record in asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], question, max_results))]
+
+
+def test_a_summary_never_takes_a_place_from_an_approved_record(wired):
+    records = [_near("a", 0.1), _near("b", 0.3), _near("c", 0.4), _near("d", 0.5)]
+    # Nearer than b: in the vector leg it would have been second, and with three places asked for it took b's or c's.
+    wired(FakeGraph(vector_rows=records, summary_rows=[_summary("S1", 0.2)], total=4), FakeEmbedder())
+    out = _ask(None, 3)
+    # The three places go to the three best approved records; the summary comes as well, at the rank it would have had.
+    assert out == ["a", "S1", "b", "c"]
+
+
+def test_a_summary_ranked_after_the_last_place_is_not_returned(wired):
+    records = [_near("a", 0.1), _near("b", 0.2), _near("c", 0.3), _near("d", 0.5)]
+    wired(FakeGraph(vector_rows=records, summary_rows=[_summary("S1", 0.4)], total=4), FakeEmbedder())
+    assert _ask(None, 3) == ["a", "b", "c"]
+
+
+def test_a_summary_level_with_a_record_comes_after_it(wired):
+    # The same distance as the nearest record: the record keeps its place, and the summary comes next.
+    wired(FakeGraph(vector_rows=[_near("a", 0.1), _near("b", 0.2)], summary_rows=[_summary("S1", 0.1)], total=2), FakeEmbedder())
+    assert _ask(None, 2) == ["a", "S1", "b"]
+    # With one place asked for, the summary stands after the last record returned, so it is not returned.
+    assert _ask(None, 1) == ["a"]
+
+
+def test_no_more_than_three_summaries_come_beside_the_records(wired):
+    assert projection_records.SUMMARIES_BESIDE_RECORDS == 3
+    # A question the counts answer: four of them are nearer than every approved record. The read keeps three.
+    summaries = [_summary(f"S{i}", i / 100) for i in range(1, 5)]
+    graph = wired(FakeGraph(vector_rows=[_near("a", 0.5), _near("b", 0.6)], summary_rows=summaries, total=2), FakeEmbedder())
+    out = _ask(graph, 2, "how many are approved")
+    # Nearer than any record, so first, in their own order; and still both approved records asked for.
+    assert out == ["S1", "S2", "S3", "a", "b"]
+    assert sum(1 for statement, _ in graph.reads if statement == projection_records.summary_read_query()) == 1
+
+
+def test_the_answer_holds_three_summaries_at_most_even_if_the_read_hands_over_more(wired, monkeypatch):
+    real = projection_records.summary_read_query
+    monkeypatch.setattr(projection_records, "summary_read_query", lambda: real().replace("LIMIT 3", "LIMIT 10"))
+    summaries = [_summary(f"S{i}", i / 100) for i in range(1, 7)]
+    wired(FakeGraph(vector_rows=[_near("a", 0.5)], summary_rows=summaries, total=1), FakeEmbedder())
+    assert _ask(None, 1, "how many are approved") == ["S1", "S2", "S3", "a"]
+
+
+def test_the_approved_records_a_question_gets_are_the_ones_it_got_before_there_were_summaries(wired):
+    import random
+
+    for seed in range(200):
+        rng = random.Random(seed)
+        distances = sorted(rng.random() for _ in range(12))
+        vector = [_near(f"r{i}", d) for i, d in enumerate(distances)]
+        keyword = [_near(f"r{i}", 1.0) for i in rng.sample(range(16), rng.randint(0, 8))]
+        summaries = sorted((_summary(f"S{i}", rng.random()) for i in range(rng.randint(0, 6))), key=lambda r: r[8])
+        k = rng.randint(1, 6)
+        wired(FakeGraph(vector_rows=vector, keyword_rows=keyword, total=12), FakeEmbedder())
+        without = _ask(None, k)
+        wired(FakeGraph(vector_rows=vector, keyword_rows=keyword, summary_rows=summaries, total=12), FakeEmbedder())
+        with_them = _ask(None, k)
+        assert [r for r in with_them if not r.startswith("S")] == without, seed
+        assert sum(1 for r in with_them if r.startswith("S")) <= 3, seed
+
+
+def test_with_few_approved_records_the_summaries_that_rank_are_still_returned(wired):
+    wired(FakeGraph(vector_rows=[_near("a", 0.2)], summary_rows=[_summary("S1", 0.1), _summary("S2", 0.3)], total=1), FakeEmbedder())
+    assert _ask(None, 5, "how many are approved") == ["S1", "a", "S2"]
+
+
+def test_a_summary_read_that_fails_leaves_the_records_as_they_are(wired, caplog):
+    records = [_near("a", 0.1), _near("b", 0.2)]
+    wired(FakeGraph(vector_rows=records, summary_rows=[_summary("S1", 0.05)], fail={"summary"}, total=2), FakeEmbedder())
+    with caplog.at_level("WARNING"):
+        assert _ask(None, 2) == ["a", "b"]
+    assert "record summary read skipped" in caplog.text and "RuntimeError" in caplog.text
+
+
+def test_the_summary_read_takes_no_turn_at_the_vector_index_and_has_the_vector_legs_time(wired, monkeypatch):
+    from app.services import vector_turns
+
+    # Two limits that differ, so the read's own can be told apart.
+    monkeypatch.setattr(settings, "search_vector_timeout_ms", 1234, raising=False)
+    monkeypatch.setattr(settings, "search_bm25_timeout_ms", 777, raising=False)
+
+    turns = []
+    real = vector_turns.take_turn
+
+    async def counting(index, start, wait_seconds):
+        turns.append(index)
+        return await real(index, start, wait_seconds)
+
+    monkeypatch.setattr(vector_turns, "take_turn", counting)
+    graph = wired(FakeGraph(vector_rows=[_near("a", 0.1)], summary_rows=[_summary("S1", 0.2)], total=1), FakeEmbedder())
+    _ask(graph, 1)
+    index_reads = sum(1 for statement, _ in graph.reads if "db.idx.vector.queryNodes" in statement)
+    assert index_reads >= 1 and turns == [vector_turns.RECORDS] * index_reads
+    assert [timeout for statement, timeout in graph.read_timeouts if statement == projection_records.summary_read_query()] == [1234]
+    # Asked with the search's own scope (the engagements, the freshness window) and the question's vector.
+    params = next(params for statement, params in graph.reads if statement == projection_records.summary_read_query())
+    assert params["engagement_ids"] == ["eng-1"] and params["q"] == [0.5] * 4 and params["marker"] == "unit-embedder:4"
+    assert params["counted_before"] - params["counted_after"] == settings.summaries_served_for_seconds + projection_records.COUNTED_AT_AHEAD_SECONDS
+
+
+def test_a_summary_comes_after_a_record_the_keyword_leg_also_ranks(wired):
+    # b is a little farther than the summary by meaning, but the words found it too: it stays ahead.
+    records = [_near("a", 0.1), _near("b", 0.3)]
+    wired(FakeGraph(vector_rows=records, keyword_rows=[_near("b", 1.0)], summary_rows=[_summary("S1", 0.2)], total=2), FakeEmbedder())
+    assert _ask(None, 3) == ["b", "a", "S1"]
+    # Both records asked for: the summary stands after the last of them, so it is not returned.
+    assert _ask(None, 2) == ["b", "a"]
+
+
+def test_without_summaries_the_answer_is_the_best_ranked_records_and_no_more(wired):
+    wired(FakeGraph(vector_rows=[row("a"), row("b"), row("c"), row("d")], keyword_rows=[row("d"), row("e")], total=4), FakeEmbedder())
+    assert _ask(None, 3) == ["d", "a", "b"]
 
 
 def test_a_window_full_of_history_is_widened_until_the_records_in_force_are_found(wired):
@@ -436,8 +587,9 @@ def test_the_presence_check_has_a_short_time_limit_of_its_own_and_the_legs_keep_
     asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], "seal number", 3))
     assert projection_records.PRESENCE_TIMEOUT_MS == 400
     assert [timeout for statement, timeout in graph.read_timeouts if statement == projection_records._HOLDS_RECORDS] == [400]
+    # Each leg's read, and the summaries' own read beside the vector leg, with the vector leg's limit.
     assert sorted(timeout for statement, timeout in graph.read_timeouts if statement != projection_records._HOLDS_RECORDS) == sorted(
-        [settings.search_vector_timeout_ms, settings.search_bm25_timeout_ms]
+        [settings.search_vector_timeout_ms, settings.search_bm25_timeout_ms, settings.search_vector_timeout_ms]
     )
 
 
@@ -469,8 +621,9 @@ def test_a_search_reads_and_never_writes_or_creates(wired):
     graph = wired(FakeGraph(vector_rows=[row("a")], keyword_rows=[row("a")], total=1), FakeEmbedder())
     asyncio.run(projection_records.search_records("unit-tenant", ["eng-1"], "seal number", 3))
     assert graph.queries == []
-    # The presence check, then one read per leg.
-    assert [q == projection_records._HOLDS_RECORDS for q, _ in graph.reads] == [True, False, False]
+    # The presence check, then one read per leg, and the summaries' own read.
+    assert [q == projection_records._HOLDS_RECORDS for q, _ in graph.reads] == [True, False, False, False]
+    assert sum(1 for q, _ in graph.reads if q == projection_records.summary_read_query()) == 1
 
 
 def test_a_property_written_as_a_number_comes_back_as_text_instead_of_failing_the_answer(wired):
