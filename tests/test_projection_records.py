@@ -509,6 +509,20 @@ def test_a_summary_comes_after_a_record_the_keyword_leg_also_ranks(wired):
     assert _ask(None, 2) == ["b", "a"]
 
 
+def test_a_record_both_legs_found_counts_once_when_a_summary_is_placed(wired):
+    # a is nearer than the summary and the keyword leg found it too; b is farther. The summary goes between them.
+    records = [_near("a", 0.1), _near("b", 0.3)]
+    wired(FakeGraph(vector_rows=records, keyword_rows=[_near("a", 1.0)], summary_rows=[_summary("S1", 0.2)], total=2), FakeEmbedder())
+    assert _ask(None, 3) == ["a", "S1", "b"]
+
+
+def test_a_record_whose_distance_cannot_be_read_counts_as_farther_than_any_summary(wired):
+    # Placement only: the record keeps the place the legs gave it, and is not counted as nearer than a summary.
+    records = [_near("a", None), _near("b", 0.3)]
+    wired(FakeGraph(vector_rows=records, summary_rows=[_summary("S1", 0.2)], total=2), FakeEmbedder())
+    assert _ask(None, 3) == ["S1", "a", "b"]
+
+
 def test_without_summaries_the_answer_is_the_best_ranked_records_and_no_more(wired):
     wired(FakeGraph(vector_rows=[row("a"), row("b"), row("c"), row("d")], keyword_rows=[row("d"), row("e")], total=4), FakeEmbedder())
     assert _ask(None, 3) == ["d", "a", "b"]
