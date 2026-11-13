@@ -1063,17 +1063,20 @@ def test_graphiti_owned_labels_cannot_be_written_because_labels_are_not_caller_s
 
 def test_every_declared_source_kind_is_classified_into_exactly_one_phase():
     kinds = set(pm.ProjectionSourceKind)
-    phases = [pm.P2_PRIME_SOURCE_KINDS, pm.PROCESS_STRUCTURE_SOURCE_KINDS, pm.P3_SOURCE_KINDS, pm.SUMMARY_SOURCE_KINDS]
+    phases = [pm.P2_PRIME_SOURCE_KINDS, pm.PROCESS_STRUCTURE_SOURCE_KINDS, pm.P3_SOURCE_KINDS, pm.SUMMARY_SOURCE_KINDS, pm.LAW_SOURCE_KINDS]
     assert frozenset().union(*phases) == kinds
     assert sum(len(phase) for phase in phases) == len(kinds)
     assert set(pm.SOURCE_KIND_NODE_LABEL) == kinds
     assert len(set(pm.SOURCE_KIND_NODE_LABEL.values())) == len(kinds)
     assert {pm.SOURCE_KIND_NODE_LABEL[k] for k in pm.P3_SOURCE_KINDS} <= pm.P3_NODE_LABELS
-    assert pm.RECORD_RULE_SOURCE_KINDS == pm.PROCESS_STRUCTURE_SOURCE_KINDS | pm.P3_SOURCE_KINDS | pm.SUMMARY_SOURCE_KINDS
+    assert pm.RECORD_RULE_SOURCE_KINDS == pm.PROCESS_STRUCTURE_SOURCE_KINDS | pm.P3_SOURCE_KINDS | pm.SUMMARY_SOURCE_KINDS | pm.LAW_SOURCE_KINDS
     assert pm.VERSIONED_RECORD_KINDS < pm.RECORD_RULE_SOURCE_KINDS
     assert pm.P3_SOURCE_KINDS < pm.VERSIONED_RECORD_KINDS
     # Every summary is a record of a version; the record set that points at them is not.
     assert pm.SUMMARY_SOURCE_KINDS - pm.VERSIONED_RECORD_KINDS == {pm.ProjectionSourceKind.RECORD_SET}
+    # Every section of a law is a record of a version of that law; the law that points at them is not.
+    assert pm.LAW_SOURCE_KINDS - pm.VERSIONED_RECORD_KINDS == {pm.ProjectionSourceKind.LAW_SOURCE}
+    assert pm.POINTER_ANCHOR_KIND["current_law_version_id"] is pm.ProjectionSourceKind.LAW_SOURCE
     # Every pointer has its records and the one kind of node that carries it, and every
     # versioned record kind is put in force by exactly one pointer.
     assert set(pm.POINTER_RECORD_KINDS) == set(pm.POINTER_ANCHOR_KIND) == set(pm.CURRENT_VERSION_PROPERTIES)
@@ -1083,7 +1086,7 @@ def test_every_declared_source_kind_is_classified_into_exactly_one_phase():
     assert set(pm.RELATION_ENDPOINT_KINDS) == set(pm.ProjectionRelation)
     # Every relation belongs to exactly one lane, so each lane's switch covers its own edges.
     finding_relations = {pm.ProjectionRelation.DERIVED_FROM, pm.ProjectionRelation.ATTESTED_BY}
-    lanes = [finding_relations, set(pm.PROCESS_STRUCTURE_RELATIONS), set(pm.RACI_RELATIONS), set(pm.SUMMARY_RELATIONS)]
+    lanes = [finding_relations, set(pm.PROCESS_STRUCTURE_RELATIONS), set(pm.RACI_RELATIONS), set(pm.SUMMARY_RELATIONS), set(pm.LAW_RELATIONS)]
     assert set().union(*lanes) == set(pm.ProjectionRelation)
     assert sum(len(lane) for lane in lanes) == len(pm.ProjectionRelation)
     # What is still refused by name is not also admitted.
@@ -2772,3 +2775,236 @@ def test_the_records_of_a_map_an_sop_and_a_chart_are_put_in_force_by_the_pointer
 
 def test_the_summary_switch_is_off_unless_it_is_set():
     assert type(settings).model_fields["projection_v2_allow_summaries"].default is False
+
+
+# ==========================================================================
+# Law: the rules an engagement's work is done under, section by section
+# ==========================================================================
+# The law here is invented: a dock authority's rules, two sections of them.
+
+
+@pytest.fixture
+def law_on(monkeypatch):
+    monkeypatch.setattr(settings, "projection_v2_allow_law", True, raising=False)
+
+
+def law_envelope(version="law-v1", **overrides):
+    """Two sections of one law, and the law pointing at the version they belong to."""
+    node_ops = overrides.pop(
+        "node_ops",
+        [
+            structure_op(f"law-1:{version}:2.01", "LAW_SECTION", version=version, workflow="law-1", properties={"text": "Section 2.01 Seals. Every container leaving the dock shall carry an unbroken seal.", "section": "2.01", "title": "Seals"}),
+            structure_op(f"law-1:{version}:2.02", "LAW_SECTION", version=version, workflow="law-1", properties={"text": "Section 2.02 Records. The dock shall keep each seal number for three years.", "section": "2.02", "title": "Records"}),
+            structure_op("law-1", "LAW_SOURCE", version=f"law-1@{version}", workflow=None, properties={"name": "Dock Authority Rules", "current_law_version_id": version}),
+        ],
+    )
+    edge_ops = overrides.pop(
+        "edge_ops",
+        [
+            edge_op(f"e-{version}-1", relation="SECTION_OF", from_id=f"law-1:{version}:2.01", to_id="law-1"),
+            edge_op(f"e-{version}-2", relation="SECTION_OF", from_id=f"law-1:{version}:2.02", to_id="law-1"),
+        ],
+    )
+    return envelope(node_ops=node_ops, edge_ops=edge_ops, **overrides)
+
+
+LAW_ALONE = {
+    "a section alone": lambda: envelope(node_ops=[structure_op("law-1:law-v1:2.01", "LAW_SECTION", version="law-v1", workflow="law-1", properties={"text": "Section 2.01 Seals."})]),
+    "a law alone": lambda: envelope(node_ops=[structure_op("law-1", "LAW_SOURCE", version="law-1@a", workflow=None, properties={"name": "Dock Authority Rules"})]),
+    "a law that points at a version": lambda: envelope(node_ops=[structure_op("law-1", "LAW_SOURCE", version="law-1@a", workflow=None, properties={"current_law_version_id": "law-v1"})]),
+    "a section edge alone": lambda: envelope(edge_ops=[edge_op("e-law-1", relation="SECTION_OF", from_id="law-1:law-v1:2.01", to_id="law-1")]),
+}
+LAW_BUILDS = [law_envelope, *LAW_ALONE.values()]
+LAW_IDS = ["with its law", *LAW_ALONE]
+
+
+@pytest.mark.parametrize("build", LAW_BUILDS, ids=LAW_IDS)
+def test_a_law_is_refused_until_its_lane_is_switched_on(build, store, client, lane_on, raci_on, summaries_on):
+    # Every other lane is on: only the law lane's own switch can stop these.
+    response = apply(client, build())
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_LAW" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+def test_a_law_needs_only_its_own_switch(store, client, law_on):
+    # The process-structure switch is off: a law is not hung on a process.
+    response = apply(client, law_envelope())
+    assert response.status_code == 200, response.json()
+
+
+def test_a_law_applies_and_points_at_the_version_of_its_text_in_force(store, client, law_on):
+    response = apply(client, law_envelope())
+    assert response.status_code == 200, response.json()
+    assert response.json()["nodes_applied"] == 3 and response.json()["edges_applied"] == 2
+    labels = {node["props"]["uuid"]: sorted(set(node["labels"]) - {pm.PROJECTION_NODE_LABEL}) for node in store.nodes.values()}
+    assert labels == {"law-1": ["LawSource"], "law-1:law-v1:2.01": ["LawSection"], "law-1:law-v1:2.02": ["LawSection"]}
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert props["law-1"]["current_law_version_id"] == "law-v1"
+    assert {props[n]["projection_source_version_id"] for n in ("law-1:law-v1:2.01", "law-1:law-v1:2.02")} == {"law-v1"}
+    assert {props[n]["workflow_node_id"] for n in ("law-1:law-v1:2.01", "law-1:law-v1:2.02")} == {"law-1"}
+    assert props["law-1:law-v1:2.01"]["text"] == "Section 2.01 Seals. Every container leaving the dock shall carry an unbroken seal."
+
+
+def test_sending_the_same_law_again_replays_and_writes_nothing(store, client, law_on):
+    assert apply(client, law_envelope()).status_code == 200
+    before = store.snapshot()
+    again = apply(client, law_envelope())
+    assert again.status_code == 200 and again.json()["replay"] is True and again.json()["applied"] is False
+    assert store.snapshot() == before
+
+
+def test_a_new_version_of_a_law_is_new_sections_and_one_restated_pointer_and_the_old_text_stays_on_record(store, client, law_on):
+    assert apply(client, law_envelope()).status_code == 200
+    amended = law_envelope(version="law-v2", operation_id="op-2", ordinal=1)
+    assert apply(client, amended).status_code == 200, "the amended law"
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    # The old sections are still there, word for word; only the pointer moved.
+    assert {"law-1:law-v1:2.01", "law-1:law-v1:2.02", "law-1:law-v2:2.01", "law-1:law-v2:2.02"} <= set(props)
+    assert props["law-1"]["current_law_version_id"] == "law-v2"
+    assert props["law-1:law-v1:2.01"]["projection_source_version_id"] == "law-v1"
+
+
+def test_a_section_names_its_law_and_the_law_pointer_sits_only_on_a_law(store, client, law_on, lane_on):
+    adrift = law_envelope()
+    del adrift["node_ops"][0]["properties"]["workflow_node_id"]
+    response = apply(client, adrift)
+    assert response.status_code == 422 and "must name its workflow node" in json.dumps(response.json())
+
+    # A workflow cannot say which text of a law is in force...
+    on_a_workflow = envelope(node_ops=[structure_op("wf-1", "WORKFLOW", version="wf-1@b", workflow=None, properties={"name": "Receiving", "current_law_version_id": "law-v1"})])
+    response = apply(client, on_a_workflow)
+    assert response.status_code == 422 and "'current_law_version_id' says which version is in force and is only carried by a LAW_SOURCE node, not by a WORKFLOW node" in json.dumps(response.json())
+
+    # ...a law cannot say which map, SOP, chart or summaries are in force...
+    for pointer, anchor in (("current_map_version_id", "WORKFLOW"), ("current_sop_version_id", "WORKFLOW"), ("current_raci_version_id", "WORKFLOW"), ("current_summary_version_id", "RECORD_SET")):
+        on_a_law = law_envelope()
+        on_a_law["node_ops"][2]["properties"][pointer] = "pv-3"
+        response = apply(client, on_a_law)
+        assert response.status_code == 422 and f"'{pointer}' says which version is in force and is only carried by a {anchor} node, not by a LAW_SOURCE node" in json.dumps(response.json())
+
+    # ...and no section carries a pointer at all.
+    pointing = law_envelope()
+    pointing["node_ops"][0]["properties"]["current_law_version_id"] = "law-v1"
+    response = apply(client, pointing)
+    assert response.status_code == 422 and "only carried by a LAW_SOURCE node, not by a LAW_SECTION node" in json.dumps(response.json())
+
+    # A law is not a record of a version and does not name a workflow.
+    named = law_envelope()
+    named["node_ops"][2]["properties"]["workflow_node_id"] = "wf-1"
+    response = apply(client, named)
+    assert response.status_code == 422 and "is only carried by records of an approved version, not by a LAW_SOURCE node" in json.dumps(response.json())
+
+    blank = law_envelope()
+    blank["node_ops"][0]["properties"]["text"] = "   "
+    response = apply(client, blank)
+    assert response.status_code == 422 and "must be a non-empty string" in json.dumps(response.json())
+    assert store.nodes == {}
+
+
+@pytest.mark.parametrize(
+    "extra, edge, message",
+    [
+        (("wf-1", "WORKFLOW", "wf-1@b", None), ("SECTION_OF", "law-1:law-v1:2.01", "wf-1"), "relation SECTION_OF ends at a WORKFLOW node; it must end at a LAW_SOURCE node"),
+        (None, ("SECTION_OF", "law-1", "law-1:law-v1:2.01"), "relation SECTION_OF starts at a LAW_SOURCE node; it must start at a LAW_SECTION node"),
+        (None, ("SECTION_OF", "law-1:law-v1:2.01", "law-1:law-v1:2.02"), "relation SECTION_OF ends at a LAW_SECTION node; it must end at a LAW_SOURCE node"),
+        (("pv-3", "PROCESS_VERSION", "pv-3", "wf-1"), ("HAS_STEP", "pv-3", "law-1:law-v1:2.01"), "relation HAS_STEP ends at a LAW_SECTION node"),
+    ],
+)
+def test_a_section_edge_joins_a_section_to_its_law_and_nothing_else(extra, edge, message, store, client, law_on, lane_on):
+    relation, from_id, to_id = edge
+    body = law_envelope()
+    if extra:
+        node_id, kind, version, workflow = extra
+        body["node_ops"].append(structure_op(node_id, kind, version=version, workflow=workflow, properties={"name": "Receiving"} if kind == "WORKFLOW" else {"text": "Version 3 of the map was approved."}))
+    body["edge_ops"].append(edge_op("e-wrong", relation=relation, from_id=from_id, to_id=to_id))
+    response = apply(client, body)
+    assert response.status_code == 422, response.json()
+    assert message in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+def test_an_envelope_reports_whether_it_belongs_to_the_law_lane():
+    load = pm.ProjectionEnvelopeV2.model_validate
+    law, structure, chart, record_set = load(law_envelope()), load(structure_envelope()), load(raci_envelope()), load(record_set_envelope())
+    assert [law.carries_law(), law.carries_process_structure(), law.carries_raci(), law.carries_summaries()] == [True, False, False, False]
+    assert [structure.carries_law(), chart.carries_law(), record_set.carries_law()] == [False, False, False]
+    for name, build in LAW_ALONE.items():
+        alone = load(build())
+        assert alone.carries_law() is True, name
+        assert not (alone.carries_process_structure() or alone.carries_raci() or alone.carries_summaries()), name
+
+
+def test_the_other_lanes_are_as_they_were_with_the_law_lane_on(store, client, lane_on, raci_on, summaries_on, law_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    assert apply(client, raci_envelope(operation_id="op-2", ordinal=1)).status_code == 200
+    by_id = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert by_id["wf-1"].get("current_law_version_id") is None
+    assert not [uuid for uuid, props in by_id.items() if props.get("projection_source_kind", "").startswith("LAW_")]
+
+
+def test_a_section_of_a_law_is_put_in_force_by_its_law_alone():
+    assert pm.POINTER_RECORD_KINDS["current_law_version_id"] == {pm.ProjectionSourceKind.LAW_SECTION}
+    assert pm.POINTER_ANCHOR_KIND["current_law_version_id"] is pm.ProjectionSourceKind.LAW_SOURCE
+    assert pm.LAW_SOURCE_KINDS == {pm.ProjectionSourceKind.LAW_SOURCE, pm.ProjectionSourceKind.LAW_SECTION}
+    assert pm.SOURCE_KIND_NODE_LABEL[pm.ProjectionSourceKind.LAW_SECTION] == "LawSection"
+    assert pm.SOURCE_KIND_NODE_LABEL[pm.ProjectionSourceKind.LAW_SOURCE] == "LawSource"
+
+
+def test_the_law_switch_is_off_unless_it_is_set():
+    assert type(settings).model_fields["projection_v2_allow_law"].default is False
+
+
+def _law_in_force(store):
+    """The sections whose version is the one the law points at: what retrieval would serve."""
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    pointer = props.get("law-1", {}).get("current_law_version_id")
+    return sorted(uuid for uuid, p in props.items() if p.get("projection_source_kind") == "LAW_SECTION" and p["projection_source_version_id"] == pointer)
+
+
+def test_a_law_is_written_after_its_sections_however_the_envelope_orders_them(store, client, law_on):
+    from app.routers import projection as route
+
+    assert route.POINTER_LAST_LABELS == {"LawSource"} and route.POINTER_FIRST_LABELS == {"RecordSet"}
+    body = law_envelope()
+    body["node_ops"] = [body["node_ops"][2], *body["node_ops"][:2]]  # the law first, its sections after
+    assert [op["source"]["kind"] for op in body["node_ops"]] == ["LAW_SOURCE", "LAW_SECTION", "LAW_SECTION"]
+    assert apply(client, body).status_code == 200
+    assert _node_writes(store) == ["LawSection", "LawSource"]
+
+
+def test_a_new_version_whose_write_stops_half_way_leaves_the_old_text_in_force(store, client, law_on):
+    assert apply(client, law_envelope()).status_code == 200
+    assert _law_in_force(store) == ["law-1:law-v1:2.01", "law-1:law-v1:2.02"]
+    amended = law_envelope(version="law-v2", operation_id="op-2", ordinal=1)
+    amended["node_ops"] = [amended["node_ops"][2], *amended["node_ops"][:2]]  # sent with the law first
+    # The write dies on the second node write. With the law written last that is the law itself, after its sections
+    # are in: the old text stays in force. (Were the law written first, as it was sent, the sections would be what
+    # failed, after the pointer had moved, and nothing would be in force.)
+    store.fail_node_apply_on = store.node_apply_calls + 2
+    assert apply(client, amended).status_code == 500
+    assert _law_in_force(store) == ["law-1:law-v1:2.01", "law-1:law-v1:2.02"]
+    store.fail_node_apply_on = None
+    assert apply(client, law_envelope(version="law-v2", operation_id="op-3", ordinal=2)).status_code == 200
+    assert _law_in_force(store) == ["law-1:law-v2:2.01", "law-1:law-v2:2.02"]
+
+
+@pytest.mark.parametrize(
+    "law_part",
+    [
+        lambda: {"node_ops": [structure_op("law-1:law-v1:2.01", "LAW_SECTION", version="law-v1", workflow="law-1", properties={"text": "Section 2.01 Seals."})]},
+        lambda: {"edge_ops": [edge_op("e-law-1", relation="SECTION_OF", from_id="law-1:law-v1:2.01", to_id="law-1")]},
+    ],
+    ids=["a section among process records", "a section edge among process edges"],
+)
+@pytest.mark.parametrize("where", ["first", "middle", "last"])
+def test_a_law_hidden_in_a_process_envelope_is_refused_until_its_lane_is_on(law_part, where, store, client, lane_on):
+    body = structure_envelope()
+    part = law_part()
+    for key in ("node_ops", "edge_ops"):
+        at = {"first": 0, "middle": len(body[key]) // 2, "last": len(body[key])}[where]
+        body[key][at:at] = part.get(key, [])
+    response = apply(client, body)
+    assert response.status_code == 422
+    assert "PROJECTION_V2_ALLOW_LAW" in json.dumps(response.json())
+    assert store.mutating_queries() == []

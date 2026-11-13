@@ -546,6 +546,18 @@ POINTER_FIRST_LABELS = frozenset(
     for pointer, kinds in POINTER_RECORD_KINDS.items()
     if any(SOURCE_KIND_NODE_LABEL[kind] in RESTATED_IN_PLACE_LABELS for kind in kinds)
 )
+# A law is written after every section of it in its envelope, however the envelope orders them. Its sections are
+# new nodes each version (as a map's records are), so the pointer must move last: written first, a write that
+# stopped half-way (a failure, a batch of sections cut into several writes) would leave the law naming a version
+# whose sections are not all there, and its text would drop out of retrieval or be served in part. With the
+# pointer last, the old version stays in force until every section of the new one is in. Derived from the model:
+# the kinds that carry a pointer, other than a workflow (whose envelopes have always carried it first and whose
+# callers order it) and other than those written first.
+POINTER_LAST_LABELS = frozenset(
+    SOURCE_KIND_NODE_LABEL[anchor]
+    for anchor in POINTER_ANCHOR_KIND.values()
+    if anchor is not ProjectionSourceKind.WORKFLOW and SOURCE_KIND_NODE_LABEL[anchor] not in POINTER_FIRST_LABELS
+)
 # A record set says when its summaries were counted, and retrieval serves them
 # for a few days after that. A time far ahead (milliseconds sent as seconds, a
 # clock set wrong) would be served for good, so it is refused when written.
@@ -1058,6 +1070,15 @@ async def apply_projection_v2(
             "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE, once the lane is switched on",
         )
 
+    if envelope.carries_law() and not settings.projection_v2_allow_law:
+        raise _fail(
+            422,
+            "law projection (a section of a law, word for word, the law it belongs "
+            "to and that law's pointer to the version of its text in force) is not "
+            "authorized on this deployment in this phase; set PROJECTION_V2_ALLOW_LAW "
+            "once the lane is switched on",
+        )
+
     envelope_hash = envelope.canonical_hash()
     scope = {"group_id": graph_name, "engagement_id": envelope.engagement_id}
     receipt_key = {**scope, "operation_id": envelope.operation_id}
@@ -1186,9 +1207,12 @@ async def apply_projection_v2(
         node_rows_all = [row for rows in grouped_nodes.values() for row in rows]
 
         nodes_written = 0
-        # In the order the kinds first appear, except that a pointer that must move first does (the sort keeps
-        # the rest as they were).
-        for type_label, rows in sorted(grouped_nodes.items(), key=lambda group: group[0] not in POINTER_FIRST_LABELS):
+        # In the order the kinds first appear, except that a pointer that must move first does, and one that must
+        # move last does (the sort keeps the rest as they were).
+        def _write_order(group):
+            return 0 if group[0] in POINTER_FIRST_LABELS else 2 if group[0] in POINTER_LAST_LABELS else 1
+
+        for type_label, rows in sorted(grouped_nodes.items(), key=_write_order):
             statement = _node_apply_query(type_label)
             for chunk in _chunks(rows, APPLY_CHUNK_ROWS):
                 result = await _query(graph, statement, params={**scope, "rows": chunk})

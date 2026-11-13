@@ -184,6 +184,15 @@ class Settings(BaseSettings):
     # then drop out of retrieval by themselves after this long, where they
     # would otherwise be served as current for good. Three days.
     summaries_served_for_seconds: int = 3 * 24 * 3600
+    # Law: the text of the rules an engagement's work is done under, section by
+    # section, word for word, and one node per law that says which version of
+    # its text is in force. Its own switch, off by default: an envelope that
+    # carries a law, a section of one or a SECTION_OF edge is refused until this
+    # is set. It does not need the process-structure switch: a law is not
+    # counted from or hung on a process. The switch governs WRITING. A section
+    # already written stays searchable with it off; what takes it out of
+    # retrieval is its law no longer naming its version.
+    projection_v2_allow_law: bool = False
 
     class Config:
         env_file = ".env"

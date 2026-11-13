@@ -153,6 +153,15 @@ class ProjectionSourceKind(str, Enum):
     engagement's approved records, and RECORD_SET is the one node per
     engagement that says which set of them is in force. This module admits the
     shape; the route refuses it unless its own lane is switched on.
+
+    Law is the text of the rules an engagement's work is done under, held
+    exactly: LAW_SECTION is one section of one law, word for word as the law
+    prints it, and LAW_SOURCE is the one node per law that says which version
+    of its text is in force. A new version of a law (an amendment, a new
+    edition) is written as new section records and one restated pointer, so
+    the old text stops feeding retrieval at that instant and stays on record.
+    This module admits the shape; the route refuses it unless its own lane is
+    switched on.
     """
 
     FINDING = "FINDING"
@@ -172,6 +181,8 @@ class ProjectionSourceKind(str, Enum):
     RACI = "RACI"
     RECORD_SET = "RECORD_SET"
     RECORD_SET_SUMMARY = "RECORD_SET_SUMMARY"
+    LAW_SOURCE = "LAW_SOURCE"
+    LAW_SECTION = "LAW_SECTION"
 
 
 # The node type label written for each admitted kind. A caller never supplies a
@@ -195,6 +206,8 @@ SOURCE_KIND_NODE_LABEL: dict[ProjectionSourceKind, str] = {
     ProjectionSourceKind.RACI: "RaciAssignment",
     ProjectionSourceKind.RECORD_SET: "RecordSet",
     ProjectionSourceKind.RECORD_SET_SUMMARY: "RecordSetSummary",
+    ProjectionSourceKind.LAW_SOURCE: "LawSource",
+    ProjectionSourceKind.LAW_SECTION: "LawSection",
 }
 
 P2_PRIME_SOURCE_KINDS = frozenset(
@@ -233,9 +246,14 @@ SUMMARY_SOURCE_KINDS = frozenset(
     {ProjectionSourceKind.RECORD_SET, ProjectionSourceKind.RECORD_SET_SUMMARY}
 )
 
+# Law: one section of one law, word for word, and the one node per law that says
+# which version of its text is in force. Admitted by the model, gated by the
+# route (PROJECTION_V2_ALLOW_LAW).
+LAW_SOURCE_KINDS = frozenset({ProjectionSourceKind.LAW_SOURCE, ProjectionSourceKind.LAW_SECTION})
+
 # Kinds the record rules apply to: a record names its workflow, a workflow names
 # the versions in force, a statement is real text.
-RECORD_RULE_SOURCE_KINDS = PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS | SUMMARY_SOURCE_KINDS
+RECORD_RULE_SOURCE_KINDS = PROCESS_STRUCTURE_SOURCE_KINDS | P3_SOURCE_KINDS | SUMMARY_SOURCE_KINDS | LAW_SOURCE_KINDS
 
 # A record of one approved version. Each of these names the workflow node it
 # belongs to (RECORD_WORKFLOW_PROPERTY), and that workflow node says which
@@ -255,6 +273,7 @@ VERSIONED_RECORD_KINDS = frozenset(
         ProjectionSourceKind.RACI_MATRIX,
         ProjectionSourceKind.RACI,
         ProjectionSourceKind.RECORD_SET_SUMMARY,
+        ProjectionSourceKind.LAW_SECTION,
     }
 )
 
@@ -271,8 +290,8 @@ class ProjectionRelation(str, Enum):
     an approved chart to its workflow and to its rows, and a role to each row it
     is Responsible for, Accountable for, Consulted on or Informed of.
     SUMMARIZES joins a summary to the engagement's record set it was counted
-    from. The ratified OWNED_BY and EVIDENCES edges are refused by
-    ProjectionEdgeOp.
+    from. SECTION_OF joins a section of a law to that law. The ratified
+    OWNED_BY and EVIDENCES edges are refused by ProjectionEdgeOp.
     """
 
     DERIVED_FROM = "DERIVED_FROM"
@@ -294,10 +313,14 @@ class ProjectionRelation(str, Enum):
     CONSULTED = "CONSULTED"
     INFORMED = "INFORMED"
     SUMMARIZES = "SUMMARIZES"
+    SECTION_OF = "SECTION_OF"
 
 
 # The summary lane's relation (PROJECTION_V2_ALLOW_SUMMARIES).
 SUMMARY_RELATIONS = frozenset({ProjectionRelation.SUMMARIZES})
+
+# The law lane's relation (PROJECTION_V2_ALLOW_LAW).
+LAW_RELATIONS = frozenset({ProjectionRelation.SECTION_OF})
 
 # The RACI lane's relations (PROJECTION_V2_ALLOW_RACI).
 RACI_RELATIONS = frozenset(
@@ -362,6 +385,8 @@ RELATION_ENDPOINT_KINDS: dict[
     ProjectionRelation.INFORMED: frozenset({(_K.ROLE, _K.RACI)}),
     # A summary is of an engagement's record set, and of nothing else.
     ProjectionRelation.SUMMARIZES: frozenset({(_K.RECORD_SET_SUMMARY, _K.RECORD_SET)}),
+    # A section is of one law, and of nothing else.
+    ProjectionRelation.SECTION_OF: frozenset({(_K.LAW_SECTION, _K.LAW_SOURCE)}),
 }
 
 
@@ -584,6 +609,7 @@ class ProjectionSource(BaseModel):
             | PROCESS_STRUCTURE_SOURCE_KINDS
             | P3_SOURCE_KINDS
             | SUMMARY_SOURCE_KINDS
+            | LAW_SOURCE_KINDS
         )
         if self.kind not in admitted:
             raise ValueError(
@@ -719,13 +745,22 @@ class FindingLifecycle(BaseModel):
 # version stops feeding retrieval at that instant, and nothing has to restate
 # old rows, which a caller could not rebuild once the source had been edited.
 # The caller projects the new version's records first and the workflow node
-# last, so retrieval never points at records that are not there yet.
+# last, so retrieval never points at records that are not there yet. (A law is
+# the exception the route enforces: it is written after its sections whatever
+# the envelope's order; see POINTER_LAST_LABELS in the route.)
+#
+# What the caller keeps to, for a law as for a workflow: a section's id carries
+# its version (a new version is new nodes, so the old text stays on record);
+# its 'workflow_node_id' and its SECTION_OF edge name the same law; and
+# a law points at a version only once that version's sections are sent. The
+# service checks shapes and kinds, not these.
 RECORD_WORKFLOW_PROPERTY = "workflow_node_id"
 CURRENT_VERSION_PROPERTIES = (
     "current_map_version_id",
     "current_sop_version_id",
     "current_raci_version_id",
     "current_summary_version_id",
+    "current_law_version_id",
 )
 
 # Which records each pointer puts in force. A pointer serves records of its own
@@ -749,6 +784,8 @@ POINTER_RECORD_KINDS: dict[str, frozenset[ProjectionSourceKind]] = {
         {ProjectionSourceKind.RACI_MATRIX, ProjectionSourceKind.RACI}
     ),
     "current_summary_version_id": frozenset({ProjectionSourceKind.RECORD_SET_SUMMARY}),
+    # A section of a law is in force because its law names the version it belongs to.
+    "current_law_version_id": frozenset({ProjectionSourceKind.LAW_SECTION}),
 }
 
 # When a record set's summaries were counted, in whole seconds since 1970 UTC.
@@ -765,6 +802,7 @@ POINTER_ANCHOR_KIND: dict[str, ProjectionSourceKind] = {
     "current_sop_version_id": ProjectionSourceKind.WORKFLOW,
     "current_raci_version_id": ProjectionSourceKind.WORKFLOW,
     "current_summary_version_id": ProjectionSourceKind.RECORD_SET,
+    "current_law_version_id": ProjectionSourceKind.LAW_SOURCE,
 }
 
 
@@ -775,8 +813,8 @@ def _check_record_scope(kind: ProjectionSourceKind, properties: dict[str, Any]) 
         if not isinstance(workflow_node, str) or not workflow_node.strip():
             raise ValueError(
                 f"a {kind.value} node is a record of one approved version and must "
-                f"name its workflow node in '{RECORD_WORKFLOW_PROPERTY}'; without it "
-                "retrieval cannot tell whether the record is in force"
+                f"name its workflow node (for a summary its record set, for a section of a law its law) in "
+                f"'{RECORD_WORKFLOW_PROPERTY}'; without it retrieval cannot tell whether the record is in force"
             )
     elif workflow_node is not None:
         raise ValueError(
@@ -1117,6 +1155,13 @@ class ProjectionEnvelopeV2(BaseModel):
             return True
         summary = {relation.value for relation in SUMMARY_RELATIONS}
         return any(op.relation in summary for op in self.edge_ops)
+
+    def carries_law(self) -> bool:
+        """True when any operation belongs to the law lane: a law, a section of one, or the edge between them."""
+        if any(op.source.kind in LAW_SOURCE_KINDS for op in self.node_ops):
+            return True
+        law = {relation.value for relation in LAW_RELATIONS}
+        return any(op.relation in law for op in self.edge_ops)
 
     def carries_raci(self) -> bool:
         """True when any operation belongs to the RACI lane.
