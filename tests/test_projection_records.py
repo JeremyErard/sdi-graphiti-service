@@ -313,13 +313,16 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
         # and a time ahead of the clock is no time at all.
         assert "(w.projection_source_kind = 'RECORD_SET' AND n.projection_source_kind IN ['RECORD_SET_SUMMARY'] AND n.projection_source_version_id = w.current_summary_version_id AND w.counted_at >= $counted_after AND w.counted_at <= $counted_before)" in leg
         assert leg.count("$counted_after") == 1 and leg.count("$counted_before") == 1
-        # A version is compared with a pointer nowhere outside those four branches, and every
+        # A section of a law is in force only while its law names the version it belongs to.
+        assert "(w.projection_source_kind = 'LAW_SOURCE' AND n.projection_source_kind IN ['LAW_SECTION'] AND n.projection_source_version_id = w.current_law_version_id)" in leg
+        # A version is compared with a pointer nowhere outside those five branches, and every
         # branch names the kind of node its pointer sits on: no pointer is read off any other.
-        assert leg.count("n.projection_source_version_id = w.") == 4
-        assert leg.count("w.projection_source_kind = ") == 4
-        # The four branches are alternatives of one condition that is ANDed with the scope.
+        assert leg.count("n.projection_source_version_id = w.") == 5
+        assert leg.count("w.projection_source_kind = ") == 5
+        # The five branches are alternatives of one condition that is ANDed with the scope.
         assert "w.engagement_id = n.engagement_id AND ((w.projection_source_kind = 'WORKFLOW' AND" in leg
-        assert "w.current_summary_version_id AND w.counted_at >= $counted_after AND w.counted_at <= $counted_before)) RETURN n.uuid AS uuid" in leg
+        assert "w.current_summary_version_id AND w.counted_at >= $counted_after AND w.counted_at <= $counted_before) OR (w.projection_source_kind = 'LAW_SOURCE'" in leg
+        assert "n.projection_source_version_id = w.current_law_version_id)) RETURN n.uuid AS uuid" in leg
         # Every pointer the model lets a workflow carry is one the search reads, and no other.
         named = sorted(set(re.findall(r"w\.(current_[a-z]+_version_id)", leg)))
         assert named == sorted(CURRENT_VERSION_PROPERTIES)
@@ -581,7 +584,8 @@ def test_the_presence_check_asks_for_a_workflow_that_points_at_a_version_in_this
     assert q == (
         "MATCH (w:ProjectionNode) "
         "WHERE w.engagement_id IN $engagement_ids AND w.group_id = $group_id "
-        "AND ((w.projection_source_kind = 'WORKFLOW' AND w.current_map_version_id IS NOT NULL) "
+        "AND ((w.projection_source_kind = 'LAW_SOURCE' AND w.current_law_version_id IS NOT NULL) "
+        "OR (w.projection_source_kind = 'WORKFLOW' AND w.current_map_version_id IS NOT NULL) "
         "OR (w.projection_source_kind = 'WORKFLOW' AND w.current_raci_version_id IS NOT NULL) "
         "OR (w.projection_source_kind = 'WORKFLOW' AND w.current_sop_version_id IS NOT NULL) "
         "OR (w.projection_source_kind = 'RECORD_SET' AND w.current_summary_version_id IS NOT NULL "
@@ -593,7 +597,7 @@ def test_the_presence_check_asks_for_a_workflow_that_points_at_a_version_in_this
     for pointer in CURRENT_VERSION_PROPERTIES:
         assert f"w.{pointer} IS NOT NULL" in q
     # Nothing from a caller is written into the statement.
-    assert "$" in q and "'" not in q.replace("'WORKFLOW'", "").replace("'RECORD_SET'", "")
+    assert "$" in q and "'" not in q.replace("'WORKFLOW'", "").replace("'RECORD_SET'", "").replace("'LAW_SOURCE'", "")
 
 
 def test_the_presence_check_has_a_short_time_limit_of_its_own_and_the_legs_keep_theirs(wired):
@@ -883,3 +887,42 @@ def test_a_summary_is_served_for_three_days_after_it_was_counted_and_every_read_
     assert {(params["counted_after"], params["counted_before"]) for _, params in graph.reads} == {(1_800_000_000 - 259_200, 1_800_000_000 + 86_400)}
     # The presence check asks it too: an engagement whose only counts have gone stale holds nothing to search.
     assert any(statement == projection_records._HOLDS_RECORDS for statement, _ in graph.reads)
+
+
+# Law: a section of a law is a record like any other, served while its law points at its version.
+
+
+def test_record_search_reads_records_with_only_the_law_lane_on(perimeter, monkeypatch):
+    monkeypatch.setattr(settings, "projection_v2_allow_law", True, raising=False)
+    asked = []
+
+    async def spy(**kwargs):
+        asked.append(kwargs)
+        return [dict(zip(RECORD_KEYS, row("a")))]
+
+    monkeypatch.setattr(projection_records, "search_records", spy)
+    response = signed_post("/search/records", RECORD_QUESTION, "search", SEARCH_SECRET)
+    assert response.status_code == 200, response.text
+    assert [len(asked), response.json()["records"][0]["record_id"]] == [1, "a"]
+
+
+def test_embedding_runs_with_only_the_law_lane_on_and_is_refused_with_neither(perimeter, monkeypatch):
+    seen = {}
+
+    async def fake(**kwargs):
+        seen.update(kwargs)
+        return {"graph_name": kwargs["graph_name"], "pending": 2, "written": 2, "failed": 0, "remaining": False}
+
+    monkeypatch.setattr(projection_records, "embed_pending", fake)
+    refused = signed_post("/ingest/projection/v2/embed", {"client_slug": "unit-tenant"}, "ingest", INGEST_SECRET)
+    assert refused.status_code == 422 and "PROJECTION_V2_ALLOW_LAW" in json.dumps(refused.json()) and seen == {}
+    monkeypatch.setattr(settings, "projection_v2_allow_law", True, raising=False)
+    response = signed_post("/ingest/projection/v2/embed", {"client_slug": "unit-tenant", "engagement_id": "eng-1"}, "ingest", INGEST_SECRET)
+    assert response.status_code == 200, response.text
+    assert seen["engagement_id"] == "eng-1"
+
+
+def test_a_section_of_a_law_is_found_by_both_legs_like_any_record():
+    # Only a summary is kept out of the keyword leg and read on its own; a section of a law is an ordinary record.
+    assert projection_records.MEANING_ONLY_KINDS == ("RECORD_SET_SUMMARY",)
+    assert projection_records._NOT_BY_KEYWORD == "NOT n.projection_source_kind IN ['RECORD_SET_SUMMARY']"

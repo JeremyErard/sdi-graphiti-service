@@ -59,12 +59,13 @@ async def embed_projection_records(
     call at any time: with nothing pending it does nothing.
     """
     projection._guard_lane(principal, request.client_slug)
-    if not settings.projection_v2_allow_process_structure:
+    # The pass embeds records of either lane that writes them: the process structure, or the law.
+    if not (settings.projection_v2_allow_process_structure or settings.projection_v2_allow_law):
         raise projection._fail(
             422,
-            "process-structure projection is not authorized on this deployment in "
-            "this phase; set PROJECTION_V2_ALLOW_PROCESS_STRUCTURE once the lane is "
-            "switched on",
+            "record projection is not authorized on this deployment in this phase; set "
+            "PROJECTION_V2_ALLOW_PROCESS_STRUCTURE or PROJECTION_V2_ALLOW_LAW once a lane "
+            "is switched on",
         )
     graph_name = projection._derive_graph_name(request.client_slug)
     correlation_id = uuidlib.uuid4().hex

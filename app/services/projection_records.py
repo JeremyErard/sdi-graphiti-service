@@ -365,7 +365,7 @@ _CANDIDATES = (
 )
 # A record is in force when the node it names is of the kind that carries the
 # pointer for the record's own kind (a workflow for a map, an SOP or a chart; a
-# record set for a summary), in the same tenant and
+# record set for a summary; a law for a section of it), in the same tenant and
 # engagement, and that pointer holds the record's version. The kinds are
 # written into the query from the model's own tables (they are enum values,
 # never caller text): without them any row carrying a pointer-shaped property

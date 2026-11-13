@@ -495,8 +495,12 @@ async def search_records(req: RecordSearchRequest):
     graph_name = ""
     try:
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
+        # Records are served when either lane that writes them is on: the process structure, or the law. So with the
+        # law lane on, switching the process-structure lane off no longer hides the process records already written:
+        # every record in force in the tenant's graph is served, as it was while both were on. The switches govern
+        # writing; what takes a record out of retrieval is its pointer no longer naming its version.
         if (
-            settings.projection_v2_allow_process_structure
+            (settings.projection_v2_allow_process_structure or settings.projection_v2_allow_law)
             and settings.graphiti_auth_mode == "required"
         ):
             engagement_ids = list(dict.fromkeys([req.engagement_id, *req.readable_engagement_ids]))
