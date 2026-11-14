@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from app.config import settings
 from app.services import graphiti_client
 from app.graph_names import graph_name_for_client
-from app.models.projection import PROJECTION_NODE_LABEL, PROJECTION_RECEIPT_LABEL
+from app.models.projection import LAW_SECTION_BASE_LABEL, PROJECTION_NODE_LABEL, PROJECTION_RECEIPT_LABEL
 
 logger = logging.getLogger("graphiti_service")
 
@@ -67,10 +67,12 @@ async def get_graph_data(req: GraphDataRequest):
         # lifecycle state, including REJECTED and MERGED, would become a map node
         # the moment the projection lane is used, and the ledger nodes would be
         # rendered alongside them. Only declared retained states may feed
-        # retrieval, and no retrieval surface consumes projection rows yet.
+        # retrieval, and no retrieval surface consumes projection rows yet. A
+        # section of a law is a projected row too, under a base label of its own.
         node_result = await read(
             f"MATCH (n) WHERE NOT n:Episodic "
             f"AND NOT n:{PROJECTION_NODE_LABEL} AND NOT n:{PROJECTION_RECEIPT_LABEL} "
+            f"AND NOT n:{LAW_SECTION_BASE_LABEL} "
             f"RETURN n LIMIT {req.max_nodes}"
         )
 
@@ -275,6 +277,7 @@ async def get_graph_data(req: GraphDataRequest):
             "MATCH (a)-[r]->(b) "
             "WHERE NOT a:Episodic AND NOT b:Episodic "
             f"AND NOT a:{PROJECTION_NODE_LABEL} AND NOT b:{PROJECTION_NODE_LABEL} "
+            f"AND NOT a:{LAW_SECTION_BASE_LABEL} AND NOT b:{LAW_SECTION_BASE_LABEL} "
             f"RETURN a.uuid, a.id, id(a), r, b.uuid, b.id, id(b) LIMIT {req.max_nodes * 2}"
         )
 

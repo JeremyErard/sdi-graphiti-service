@@ -253,10 +253,12 @@ class FakeGraph:
     def _resolve_edges(self, q: str, params: dict):
         # The identity check is one typed, index-answered lookup per relation,
         # with the endpoints read off the edge and held to the projection label
-        # space and the tenant scope in the WHERE clause.
+        # space (the base labels that relation's endpoint kinds carry) and the
+        # tenant scope in the WHERE clause.
         typed = re.search(r"MATCH \(\)-\[e:(\w+) \{uuid: wanted\}\]->\(\)", q)
         assert typed, q
-        assert f"a:{pm.PROJECTION_NODE_LABEL} AND b:{pm.PROJECTION_NODE_LABEL}" in q, q
+        start, end = pm.RELATION_ENDPOINT_BASE_LABELS[pm.ProjectionRelation(typed.group(1))]
+        assert f"a:{start} AND b:{end}" in q, q
         scope = {key: params[name] for key, name in re.findall(r"\ba\.(\w+) = \$(\w+)", q)}
         assert scope and scope == {key: params[name] for key, name in re.findall(r"\bb\.(\w+) = \$(\w+)", q)}, q
         rows = []
@@ -275,10 +277,12 @@ class FakeGraph:
         if self.store.fail_node_apply_on == self.store.node_apply_calls:
             raise RuntimeError("simulated FalkorDB failure mid-apply")
 
-        match = _LABEL_KEY.search(q)
+        match = re.search(r"MERGE \(n:(\w+) \{([^}]*)\}\)", q)
         assert match, q
-        _, merge_label, body = match.groups()
+        merge_label, body = match.groups()
         keymap = _parse_map(body)
+        # The write is held off a row whose uuid a node of another base label already holds, in the same statement.
+        guards = [(label, _parse_map(guard)) for label, guard in re.findall(r"OPTIONAL MATCH \(other:(\w+) \{([^}]*)\}\) WITH row WHERE other IS NULL ", q)]
         label_set = _SET_LABELS.search(q)
         extra_labels = [lbl for lbl in (label_set.group(2).split(":") if label_set else []) if lbl]
         setter = _SET_MAP.search(q)
@@ -288,6 +292,10 @@ class FakeGraph:
         for row in params["rows"]:
             if row.get("node_id") == self.store.skip_node_row:
                 applied += 1
+                continue
+            # A lookup hidden from the preflight sees the graph again once writing starts.
+            self.store.drop_after_resolve = None
+            if any(self._match_nodes(label, guard, params, row) for label, guard in guards):
                 continue
             key = self._node_key(merge_label, keymap, params, row)
             node = self.store.nodes.setdefault(key, {"labels": {merge_label}, "props": {}})
@@ -1351,6 +1359,10 @@ def test_a_projection_row_is_not_reachable_from_the_knowledge_map_query(store, c
     edge_query = next(q for q in captured if "-[r]->" in q)
     assert f"NOT a:{pm.PROJECTION_NODE_LABEL}" in edge_query
     assert f"NOT b:{pm.PROJECTION_NODE_LABEL}" in edge_query
+    # A section of a law is a projected row under a base label of its own, and is kept off the map the same way.
+    assert f"NOT n:{pm.LAW_SECTION_BASE_LABEL}" in node_query
+    assert f"NOT a:{pm.LAW_SECTION_BASE_LABEL}" in edge_query
+    assert f"NOT b:{pm.LAW_SECTION_BASE_LABEL}" in edge_query
 
 
 # ==========================================================================
@@ -1633,12 +1645,22 @@ def test_the_edge_lane_cannot_bind_a_node_outside_the_projection_label_space(sto
         if "]->" in statement and "MATCH" in statement:
             # Either both endpoints are matched as projected nodes, or (the
             # identity check, which starts from the edge index) both are read
-            # off the edge and then held to the projection label.
-            labelled = f":{pm.PROJECTION_NODE_LABEL} {{" in statement
-            held = f"a:{pm.PROJECTION_NODE_LABEL} AND b:{pm.PROJECTION_NODE_LABEL}" in statement
-            assert labelled or held, statement
-    for statement in [q for q, _ in store.queries if q.startswith("UNWIND $node_ids")]:
-        assert f"MATCH (n:{pm.PROJECTION_NODE_LABEL} {{uuid: wanted" in statement
+            # off the edge and then held to the projection label space: the
+            # base labels the relation's endpoint kinds carry.
+            typed = re.search(r"\[e:(\w+) ", statement)
+            if typed:
+                start, end = pm.RELATION_ENDPOINT_BASE_LABELS[pm.ProjectionRelation(typed.group(1))]
+                assert set((start, end)) <= set(pm.PROJECTION_BASE_LABELS)
+                if statement.startswith("UNWIND $edge_ids"):
+                    assert f"a:{start} AND b:{end}" in statement, statement
+                else:
+                    assert f"(a:{start} {{" in statement and f"(b:{end} {{" in statement, statement
+            else:
+                assert f":{pm.PROJECTION_NODE_LABEL} {{" in statement, statement
+    resolves = [q for q, _ in store.queries if q.startswith("UNWIND $node_ids")]
+    assert resolves
+    for statement in resolves:
+        assert any(f"MATCH (n:{label} {{uuid: wanted" in statement for label in pm.PROJECTION_BASE_LABELS), statement
 
 
 def test_an_edge_endpoint_that_does_not_exist_is_refused_before_any_write(store, client):
@@ -2647,6 +2669,9 @@ def test_a_summary_is_restated_in_place_and_keeps_its_vector_only_while_it_says_
     # whole property map is replaced, and the vector is put back only if the statement has not changed.
     assert route._node_apply_query("RecordSetSummary") == (
         "UNWIND $rows AS row "
+        # Held off a uuid a section of a law already holds, in the same statement (see _node_apply_query).
+        "OPTIONAL MATCH (other:LawRecordNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) "
+        "WITH row WHERE other IS NULL "
         "MERGE (n:ProjectionNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) "
         "WITH n, row, n.text AS said, n.text_embedding AS vector, n.text_emb_model AS model, "
         "n.text_emb_failed AS failed, n.text_emb_failed_at AS failed_at "
@@ -2661,11 +2686,15 @@ def test_a_summary_is_restated_in_place_and_keeps_its_vector_only_while_it_says_
         "SET n.text_emb_failed = failed, n.text_emb_failed_at = failed_at) "
         "RETURN count(n) AS applied"
     )
-    # Every other kind is written exactly as it always was: restated whole, nothing carried over.
+    # Every other kind is written exactly as it always was: restated whole, nothing carried over. A section of a
+    # law is found by its exact identity under its own base label, never as a ProjectionNode.
     for label in sorted(set(pm.SOURCE_KIND_NODE_LABEL.values()) - route.RESTATED_IN_PLACE_LABELS):
+        base, other = ("LawRecordNode", "ProjectionNode") if label == "LawSection" else ("ProjectionNode", "LawRecordNode")
         assert route._node_apply_query(label) == (
             "UNWIND $rows AS row "
-            "MERGE (n:ProjectionNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) "
+            f"OPTIONAL MATCH (other:{other} {{uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}}) "
+            "WITH row WHERE other IS NULL "
+            f"MERGE (n:{base} {{uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}}) "
             f"SET n:{label} "
             "SET n = row.props "
             "RETURN count(n) AS applied"
@@ -2674,7 +2703,7 @@ def test_a_summary_is_restated_in_place_and_keeps_its_vector_only_while_it_says_
 
 def _node_writes(store):
     """The type label of each node write the store received, in the order it received them."""
-    return [re.search(r"SET n:(\w+) ", q).group(1) for q, _ in store.queries if q.startswith("UNWIND $rows AS row MERGE (n:")]
+    return [re.search(r"SET n:(\w+) ", q).group(1) for q, _ in store.queries if q.startswith("UNWIND $rows AS row ") and "MERGE (n:" in q]
 
 
 def _second_count(operation_id="op-2", ordinal=1):
@@ -2837,13 +2866,20 @@ def test_a_law_applies_and_points_at_the_version_of_its_text_in_force(store, cli
     response = apply(client, law_envelope())
     assert response.status_code == 200, response.json()
     assert response.json()["nodes_applied"] == 3 and response.json()["edges_applied"] == 2
-    labels = {node["props"]["uuid"]: sorted(set(node["labels"]) - {pm.PROJECTION_NODE_LABEL}) for node in store.nodes.values()}
-    assert labels == {"law-1": ["LawSource"], "law-1:law-v1:2.01": ["LawSection"], "law-1:law-v1:2.02": ["LawSection"]}
+    labels = {node["props"]["uuid"]: sorted(node["labels"]) for node in store.nodes.values()}
+    # A section carries a base label of its own and not ProjectionNode, so it is not counted in the process records'
+    # keyword index at all; the law keeps ProjectionNode, which the in-force join finds it by.
+    assert labels == {
+        "law-1": ["LawSource", "ProjectionNode"],
+        "law-1:law-v1:2.01": ["LawRecordNode", "LawSection"],
+        "law-1:law-v1:2.02": ["LawRecordNode", "LawSection"],
+    }
     props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
     assert props["law-1"]["current_law_version_id"] == "law-v1"
     assert {props[n]["projection_source_version_id"] for n in ("law-1:law-v1:2.01", "law-1:law-v1:2.02")} == {"law-v1"}
     assert {props[n]["workflow_node_id"] for n in ("law-1:law-v1:2.01", "law-1:law-v1:2.02")} == {"law-1"}
-    assert props["law-1:law-v1:2.01"]["text"] == "Section 2.01 Seals. Every container leaving the dock shall carry an unbroken seal."
+    assert "text" not in props["law-1:law-v1:2.01"]  # a section's words sit under their own name, out of the records' keyword index
+    assert props["law-1:law-v1:2.01"]["law_text"] == "Section 2.01 Seals. Every container leaving the dock shall carry an unbroken seal."
 
 
 def test_sending_the_same_law_again_replays_and_writes_nothing(store, client, law_on):
@@ -3008,3 +3044,217 @@ def test_a_law_hidden_in_a_process_envelope_is_refused_until_its_lane_is_on(law_
     assert response.status_code == 422
     assert "PROJECTION_V2_ALLOW_LAW" in json.dumps(response.json())
     assert store.mutating_queries() == []
+
+
+# A section of a law carries a base label of its own (LawRecordNode), never ProjectionNode: the process records'
+# keyword index counts every node that carries ProjectionNode, whatever its properties, so a law's sections moved
+# process scores while they carried it. Every path that finds a node by its base label finds a section by its own.
+
+
+def _rows_sent(store, prefix):
+    return [(q, [row.get("node_id") or row.get("edge_id") for row in p.get("rows", [])]) for q, p in store.queries if q.startswith(prefix)]
+
+
+def test_a_section_is_written_verified_and_joined_to_its_law_under_its_own_base_label(store, client, law_on):
+    response = apply(client, law_envelope())
+    assert response.status_code == 200, response.json()
+    sections = ["law-1:law-v1:2.01", "law-1:law-v1:2.02"]
+    writes = {re.search(r"SET n:(\w+) ", q).group(1): q for q, _ in store.queries if q.startswith("UNWIND $rows AS row ") and "MERGE (n:" in q}
+    assert "MERGE (n:LawRecordNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) " in writes["LawSection"]
+    # It names ProjectionNode only to stay off a uuid a process record holds.
+    assert writes["LawSection"].startswith(
+        "UNWIND $rows AS row OPTIONAL MATCH (other:ProjectionNode {uuid: row.node_id, group_id: $group_id, "
+        "engagement_id: $engagement_id}) WITH row WHERE other IS NULL MERGE (n:LawRecordNode "
+    )
+    assert "MERGE (n:ProjectionNode {uuid: row.node_id, " in writes["LawSource"]
+    # Read back under the base label each was written under, each node once.
+    verifies = [(q, ids) for q, ids in _rows_sent(store, "UNWIND $rows AS row MATCH (n:")]
+    assert [(q.split(" {", 1)[0], ids) for q, ids in verifies] == [
+        ("UNWIND $rows AS row MATCH (n:LawRecordNode", sections),
+        ("UNWIND $rows AS row MATCH (n:ProjectionNode", ["law-1"]),
+    ]
+    # The edge from a section to its law runs from a LawRecordNode to a ProjectionNode, written and read back so.
+    edge_write = next(q for q, _ in store.queries if "MERGE (a)-[e:SECTION_OF" in q)
+    assert "MATCH (a:LawRecordNode {uuid: row.from_node_id, " in edge_write and "MATCH (b:ProjectionNode {uuid: row.to_node_id, " in edge_write
+    edge_verify = next(q for q, _ in store.queries if q.startswith("UNWIND $rows AS row MATCH (:"))
+    assert edge_verify.startswith("UNWIND $rows AS row MATCH (:LawRecordNode {uuid: row.from_node_id, ")
+    assert "(:ProjectionNode {uuid: row.to_node_id, " in edge_verify
+    # The identity check holds SECTION_OF's ends to the same two labels.
+    identity = next(q for q, _ in store.queries if q.startswith("UNWIND $edge_ids") and "[e:SECTION_OF " in q)
+    assert "WHERE a:LawRecordNode AND b:ProjectionNode " in identity
+    # The base label's own indexes are made beside the projection's, so a section's MERGE is an index probe.
+    for prop in ("uuid", "group_id", "engagement_id"):
+        assert f"CREATE INDEX FOR (n:LawRecordNode) ON (n.{prop})" in store.indices
+    # A human can find a section with the probe offered beside it.
+    probe = response.json()["spot_probe"]
+    assert probe["law_node_cypher"].startswith("MATCH (n:LawRecordNode {group_id: $group_id, uuid: $uuid})")
+    assert probe["law_edge_cypher"].startswith("MATCH (:LawRecordNode {group_id: $group_id})-[e {uuid: $uuid}]->()")
+
+
+def test_a_section_that_did_not_land_under_its_own_base_label_is_not_counted_as_applied(store, client, law_on, monkeypatch):
+    # Written under ProjectionNode by mistake, a section is not found by the read-back and the receipt stays PENDING.
+    from app.routers import projection as route
+
+    real = route._node_apply_query
+    monkeypatch.setattr(route, "_node_apply_query", lambda label: real(label).replace("MERGE (n:LawRecordNode ", "MERGE (n:ProjectionNode "))
+    response = apply(client, law_envelope())
+    assert response.status_code == 500
+    assert "verified 1/3 nodes" in json.dumps(response.json())
+    assert [r["status"] for r in store.receipts.values()] == ["PENDING"]
+
+
+def test_process_records_are_written_and_read_back_exactly_as_before_beside_the_law(store, client, lane_on, law_on):
+    from app.routers import projection as route
+
+    assert apply(client, structure_envelope()).status_code == 200
+    # A write of a process envelope names the law's base label only to stay off a uuid a section holds (the check in
+    # the same statement as the write, see _node_apply_query); nothing is written under it...
+    guard = "OPTIONAL MATCH (other:LawRecordNode {uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}) WITH row WHERE other IS NULL "
+    for q in store.mutating_queries():
+        assert pm.LAW_SECTION_BASE_LABEL not in q.replace(guard, ""), q
+    verifies = [q for q, _ in store.queries if q.startswith("UNWIND $rows AS row MATCH") and "MERGE" not in q]
+    assert len(set(verifies)) == 2 and set(verifies) <= {route.VERIFY_NODES_QUERY, route.VERIFY_EDGES_QUERY}
+    # ...and the read-backs are word for word the statements they always were.
+    assert route.VERIFY_NODES_QUERY == (
+        "UNWIND $rows AS row MATCH (n:ProjectionNode {uuid: row.node_id, group_id: $group_id, "
+        "engagement_id: $engagement_id}) WHERE n.projection_op_hash = row.op_hash RETURN count(DISTINCT n.uuid) AS verified"
+    )
+    assert route.VERIFY_EDGES_QUERY == (
+        "UNWIND $rows AS row MATCH (:ProjectionNode {uuid: row.from_node_id, group_id: $group_id, "
+        "engagement_id: $engagement_id})-[e {uuid: row.edge_id}]->(:ProjectionNode {uuid: row.to_node_id, "
+        "group_id: $group_id, engagement_id: $engagement_id}) WHERE e.projection_op_hash = row.op_hash "
+        "RETURN count(DISTINCT e.uuid) AS verified"
+    )
+    # The only statements that name it are reads (the lookup of ids under it, and the identity check of the one
+    # relation that starts at a section) and the indexes on it.
+    named = [q.replace(guard, "") for q, _ in store.queries if pm.LAW_SECTION_BASE_LABEL in q]
+    reads = {route.RESOLVE_NODES_QUERIES[1], route._resolve_edges_query("SECTION_OF")}
+    assert named and all(q in reads or q.startswith("CREATE INDEX") or pm.LAW_SECTION_BASE_LABEL not in q for q in named)
+    assert "law_node_cypher" not in apply(client, structure_envelope()).json()["spot_probe"]
+
+
+def test_a_section_and_a_process_record_can_never_share_an_id_either_way_round(store, client, lane_on, law_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    # A section declared under a process step's id is refused, nothing written...
+    body = law_envelope(operation_id="op-2", ordinal=1)
+    body["node_ops"][0]["node_id"] = "pv-3:s1"
+    body["edge_ops"][0]["from_node_id"] = "pv-3:s1"
+    before = store.snapshot()
+    response = apply(client, body)
+    assert response.status_code == 422 and "pv-3:s1" in json.dumps(response.json())
+    assert store.snapshot() == before
+    # ...and a process step declared under a section's id is refused too, though the section is not a ProjectionNode.
+    assert apply(client, law_envelope(operation_id="op-3", ordinal=2)).status_code == 200
+    step = structure_envelope(operation_id="op-4", ordinal=3)
+    step["node_ops"][2]["node_id"] = "law-1:law-v1:2.01"
+    step["edge_ops"] = []
+    before = store.snapshot()
+    response = apply(client, step)
+    assert response.status_code == 422 and "law-1:law-v1:2.01" in json.dumps(response.json())
+    assert store.snapshot() == before
+
+
+def test_a_section_left_under_projection_node_by_an_earlier_write_is_refused_not_duplicated(store, client, law_on):
+    assert apply(client, law_envelope()).status_code == 200
+    # As a section written before sections had a base label of their own would be stored.
+    for key in [k for k in store.nodes if k[0] == pm.LAW_SECTION_BASE_LABEL]:
+        node = store.nodes.pop(key)
+        node["labels"] = {pm.PROJECTION_NODE_LABEL, "LawSection"}
+        store.nodes[(pm.PROJECTION_NODE_LABEL,) + key[1:]] = node
+    before = store.snapshot()
+    response = apply(client, law_envelope(operation_id="op-2", ordinal=1))
+    assert response.status_code == 422, response.json()
+    detail = response.json()["detail"]
+    assert "under a base label their kind does not carry" in detail
+    # Only under the old label: the reason given is that one, and the delete names the old label.
+    assert "'law-1:law-v1:2.01' is stored under ProjectionNode only, a label its kind does not carry" in detail
+    assert f'MATCH (n:ProjectionNode {{group_id: "{GRAPH}", engagement_id: "{ENGAGEMENT}", uuid: "law-1:law-v1:2.01"}}) DETACH DELETE n' in detail
+    assert "stored twice" not in detail
+    assert store.snapshot() == before
+
+
+@pytest.mark.parametrize("name", sorted(pm.LAW_OWNED_PROPERTIES))
+def test_the_laws_own_property_names_are_written_by_the_service_and_refused_from_a_caller(name, store, client, law_on):
+    # A section sent with a refusal mark far in the future would be passed over by the embedding pass for good; one
+    # sent with a value in place of its vector would fail the meaning read for the whole graph. Neither is sent.
+    assert pm.LAW_OWNED_PROPERTIES == {
+        f"{pm.LAW_TEXT_PROPERTY}{suffix}" for suffix in ("", "_embedding", "_emb_model", "_emb_failed", "_emb_failed_at")
+    }
+    assert pm.LAW_OWNED_PROPERTIES <= pm.SERVICE_OWNED_PROPERTIES
+    body = law_envelope()
+    body["node_ops"][0]["properties"][name] = 9_999_999_999 if name.endswith("_at") else "x"
+    response = apply(client, body)
+    assert response.status_code == 422
+    assert f"property '{name}' is written by the projection service" in json.dumps(response.json())
+    assert store.mutating_queries() == []
+
+
+def test_a_process_records_text_stays_text_and_only_a_sections_words_move(store, client, lane_on, law_on):
+    assert apply(client, structure_envelope()).status_code == 200
+    assert apply(client, law_envelope(operation_id="op-2", ordinal=1)).status_code == 200
+    props = {node["props"]["uuid"]: node["props"] for node in store.nodes.values()}
+    assert props["pv-3:s1"]["text"] == "Step 1 is a task." and pm.LAW_TEXT_PROPERTY not in props["pv-3:s1"]
+    assert props["pv-3"]["text"] == "Version 3 was approved." and pm.LAW_TEXT_PROPERTY not in props["pv-3"]
+    assert "text" not in props["law-1:law-v1:2.01"] and pm.LAW_TEXT_PROPERTY in props["law-1:law-v1:2.01"]
+
+
+def test_a_section_found_under_both_base_labels_is_refused_with_how_to_recover(store, client, law_on):
+    assert apply(client, law_envelope()).status_code == 200
+    # As a graph written before sections had a label of their own and then written again by this service would hold.
+    key = next(k for k in store.nodes if k[0] == pm.LAW_SECTION_BASE_LABEL and ("uuid", "law-1:law-v1:2.01") in k)
+    store.nodes[(pm.PROJECTION_NODE_LABEL,) + key[1:]] = copy.deepcopy(store.nodes[key])
+    before = store.snapshot()
+    response = apply(client, law_envelope(operation_id="op-2", ordinal=1))
+    assert response.status_code == 422, response.json()
+    detail = response.json()["detail"]
+    assert "law-1:law-v1:2.01" in detail and "Nothing was written" in detail
+    # It says what the operator does: delete those nodes, then send the envelope again.
+    # The reason fits the case (stored twice, not "written before"), and the delete removes exactly the node in the
+    # way, written out with its own label, tenant, engagement and id, so it runs as it stands.
+    assert "'law-1:law-v1:2.01' is stored twice, under LawRecordNode (the label its kind carries) and under ProjectionNode" in detail
+    assert (
+        f'to recover, run MATCH (n:ProjectionNode {{group_id: "{GRAPH}", engagement_id: "{ENGAGEMENT}", '
+        'uuid: "law-1:law-v1:2.01"}) DETACH DELETE n; then send this envelope again.'
+    ) in detail
+    assert "$uuid" not in detail and "MATCH (n:LawRecordNode" not in detail
+    assert store.snapshot() == before
+
+
+@pytest.mark.parametrize("first", ["section", "process step"])
+def test_two_applies_at_once_cannot_leave_two_nodes_under_one_id(first, store, client, lane_on, law_on):
+    # Both pass their preflight before either writes (the fake hides the other's node from the lookup, as a
+    # lookup made before the other's write would). The write itself stays off a uuid the other base label holds,
+    # in the same statement, so the second writes nothing for that row, its read-back finds it missing, and it
+    # fails with its receipt left PENDING.
+    section = law_envelope(node_ops=[structure_op("shared", "LAW_SECTION", version="law-v1", workflow="law-1", properties={"text": "A section."})], edge_ops=[], operation_id="op-law", ordinal=1)
+    step = structure_envelope(node_ops=[structure_op("shared", "PROCESS_STEP", properties={"text": "A step."})], edge_ops=[], operation_id="op-step", ordinal=2)
+    winner, loser = (section, step) if first == "section" else (step, section)
+    assert apply(client, winner).status_code == 200
+    store.drop_after_resolve = "shared"
+    response = apply(client, loser)
+    detail = response.json()["detail"]
+    assert response.status_code == 500 and "verified 0/1 nodes" in detail
+    # It says what happened and that a resend cannot cure it, not that the identical envelope may be resent.
+    assert "not written because a node of another kind already holds each of them" in detail and "['shared']" in detail
+    assert "Resending this envelope as it is will be refused until those ids are free" in detail
+    assert "the identical envelope may be resent" not in detail
+    resend = apply(client, loser)
+    assert resend.status_code == 422 and "shared" in json.dumps(resend.json())
+    holders = [k for k in store.nodes if ("uuid", "shared") in k]
+    assert len(holders) == 1
+    assert {r["operation_id"]: r["status"] for r in store.receipts.values()} == {winner["operation_id"]: "APPLIED", loser["operation_id"]: "PENDING"}
+
+
+def test_a_row_short_for_any_other_cause_still_says_the_identical_envelope_may_be_resent(store, client, law_on):
+    store.skip_node_row = "law-1:law-v1:2.01"
+    response = apply(client, law_envelope())
+    detail = response.json()["detail"]
+    assert response.status_code == 500 and "the identical envelope may be resent" in detail
+    assert "another kind already holds" not in detail
+
+
+# The guard that keeps a write off a uuid the other base label holds (_node_apply_query) is checked here against
+# this fake, which obeys its text. This repository's CI runs no graph engine, so the statement itself is checked on
+# a real FalkorDB by the law acceptance run that is kept outside this repository (invented data, a local engine,
+# two applies at once declaring one id as a section and as a process record, 100 times), before a change to it
+# is merged.

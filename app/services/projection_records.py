@@ -31,8 +31,10 @@ the derived vector and its marker. Searching creates nothing: a tenant with
 no projected records has no graph made for it by being asked.
 
 The projection label space is separate from graphiti's: these queries read
-ProjectionNode rows only and cannot return, or be confused with, an extracted
-fact.
+ProjectionNode rows, and a section of a law under its own base label
+(LawRecordNode), only, and cannot return, or be confused with, an extracted
+fact. A section of a law carries no ProjectionNode label, so it is not even
+counted in the records' keyword index (see LAW_SECTION_BASE_LABEL).
 """
 
 from __future__ import annotations
@@ -47,7 +49,10 @@ from app.models.projection import (
     POINTER_ANCHOR_KIND,
     POINTER_RECORD_KINDS,
     RECORD_SET_COUNTED_AT,
+    LAW_SECTION_BASE_LABEL,
     PROJECTION_NODE_LABEL,
+    LAW_TEXT_PROPERTY,
+    LAW_VECTOR_PROPERTY,
     RECORD_TEXT_PROPERTY,
     RECORD_WORKFLOW_PROPERTY,
     SOURCE_KIND_NODE_LABEL,
@@ -121,6 +126,7 @@ def _ensure_indices(graph: Any, graph_name: str) -> None:
         f"CREATE FULLTEXT INDEX FOR (n:{PROJECTION_NODE_LABEL}) ON (n.{RECORD_TEXT_PROPERTY})",
         f"CREATE VECTOR INDEX FOR (n:{PROJECTION_NODE_LABEL}) ON (n.text_embedding) "
         f"OPTIONS {{dimension:{dim}, similarityFunction:'cosine'}}",
+        # The law has no index: it is searched by meaning only, every section compared one by one (see _LAW_READ).
     )
     ready = True
     for statement in statements:
@@ -140,6 +146,26 @@ def _ensure_indices(graph: Any, graph_name: str) -> None:
 
 def _marker() -> str:
     return f"{settings.embedding_model}:{int(settings.embedding_dim)}"
+
+
+def _law_form(statement: str) -> str:
+    """The same statement for a section of a law. Everything the embedding pass keeps on a record under a name
+    that starts with its words' name (`text`, `text_embedding`, `text_emb_model`, `text_emb_failed`,
+    `text_emb_failed_at`) a section keeps under the same name with the law's prefix: `law_text`,
+    `law_text_embedding`, `law_text_emb_model`, and so on. One rule, so a read and a write cannot disagree.
+    A section is found under its own base label, never as a ProjectionNode (LAW_SECTION_BASE_LABEL)."""
+    record_node = f"(n:{PROJECTION_NODE_LABEL} "
+    if statement.count(record_node) != 1:  # pragma: no cover - a guard on the statements below
+        raise RuntimeError("a law form is made from a statement that starts from one record node")
+    return statement.replace(record_node, f"(n:{LAW_SECTION_BASE_LABEL} ").replace(
+        f"n.{RECORD_TEXT_PROPERTY}", f"n.{LAW_TEXT_PROPERTY}"
+    )
+
+
+# The name a section's vector carries the model it was made by under (see _law_form).
+LAW_MODEL_PROPERTY = f"{LAW_TEXT_PROPERTY}_emb_model"
+if f"{LAW_TEXT_PROPERTY}_embedding" != LAW_VECTOR_PROPERTY:  # pragma: no cover - a guard on the model's names
+    raise RuntimeError("the law's vector name must be the law's text name followed by _embedding")
 
 
 # Only a record that retrieval could ever return: it has a statement and names
@@ -171,6 +197,14 @@ SET_VECTOR_QUERY = (
 )
 
 
+# The same three for the sections of a law (LAW_TEXT_PROPERTY). A row of the law's pending read carries a fourth
+# value, so the pass knows which write to use.
+LAW_PENDING_QUERY = _law_form(PENDING_QUERY).replace(
+    f"n.{LAW_TEXT_PROPERTY} AS text ", f"n.{LAW_TEXT_PROPERTY} AS text, 'law' AS lane "
+)
+LAW_SET_VECTOR_QUERY = _law_form(SET_VECTOR_QUERY)
+
+
 MARK_REFUSED_QUERY = (
     f"MATCH (n:{PROJECTION_NODE_LABEL} {{uuid: $uuid, group_id: $group_id, "
     "engagement_id: $engagement_id}) "
@@ -178,6 +212,11 @@ MARK_REFUSED_QUERY = (
     "SET n.text_emb_failed = $marker, n.text_emb_failed_at = $now "
     "RETURN count(n) AS marked"
 )
+LAW_MARK_REFUSED_QUERY = _law_form(MARK_REFUSED_QUERY)
+
+
+def _of_a_law(row: Any) -> bool:
+    return len(row) > 3 and row[3] == "law"
 
 
 def _batches(rows: list[Any]) -> list[list[Any]]:
@@ -244,6 +283,24 @@ async def embed_pending(
             },
         )
     ).result_set
+    if len(rows) <= bounded:
+        # Room left in this pass: the sections of a law that wait for a vector, after the records.
+        rows = list(rows) + list(
+            (
+                await asyncio.to_thread(
+                    graph.query,
+                    LAW_PENDING_QUERY,
+                    {
+                        "group_id": name,
+                        "engagement_id": engagement_id,
+                        "limit": bounded + 1 - len(rows),
+                        "marker": marker,
+                        "retry_before": int(time.time()) - REFUSED_RETRY_AFTER_SECONDS,
+                    },
+                )
+            ).result_set
+            or []
+        )
     remaining = len(rows) > bounded
     rows = rows[:bounded]
 
@@ -272,7 +329,7 @@ async def embed_pending(
     async def store(row: Any, vector: list[float]) -> int:
         result = await asyncio.to_thread(
             graph.query,
-            SET_VECTOR_QUERY,
+            LAW_SET_VECTOR_QUERY if _of_a_law(row) else SET_VECTOR_QUERY,
             {
                 "uuid": row[0],
                 "group_id": name,
@@ -314,7 +371,7 @@ async def embed_pending(
                     failed += 1
                     await asyncio.to_thread(
                         graph.query,
-                        MARK_REFUSED_QUERY,
+                        LAW_MARK_REFUSED_QUERY if _of_a_law(row) else MARK_REFUSED_QUERY,
                         {
                             "uuid": row[0],
                             "group_id": name,
@@ -401,7 +458,7 @@ _IN_FORCE = (
     f"MATCH (w:{PROJECTION_NODE_LABEL} {{uuid: n.{RECORD_WORKFLOW_PROPERTY}}}) "
     "WHERE w.group_id = $group_id AND w.engagement_id = n.engagement_id "
     f"AND ({_POINTER_BRANCHES}) "
-    f"RETURN n.uuid AS uuid, n.{RECORD_TEXT_PROPERTY} AS text, "
+    f"RETURN n.uuid AS uuid, coalesce(n.{RECORD_TEXT_PROPERTY}, n.{LAW_TEXT_PROPERTY}) AS text, "
     "n.projection_source_kind AS kind, n.projection_source_id AS source_id, "
     "n.projection_source_version_id AS version_id, n.engagement_id AS engagement_id, "
     "n.workflow_id AS workflow_id, n.workflow_name AS workflow_name, score, seen"
@@ -440,6 +497,70 @@ MEANING_ONLY_KINDS = tuple(
     )
 )
 _NOT_BY_KEYWORD = "NOT n.projection_source_kind IN [" + ", ".join(f"'{kind}'" for kind in MEANING_ONLY_KINDS) + "]"
+# A section of a law never takes a place from an approved process record either,
+# and is not returned unless it is asked for. A law's sections are long, share
+# their words with most of an engagement's procedures, and number in the
+# hundreds: on a rehearsal with real records (2026-11-13, one engine state, two
+# laws of 114 and 201 sections beside 128 processes) a section took a place
+# from a process record on 5 of 196 questions at five results and 10 at ten,
+# some of them the right authority and some of them noise. No answer was lost,
+# but which of the two a reader wants is the reader's to say. So the record
+# legs leave law out (the keyword leg before its window is cut, the vector leg
+# after its window is read, as for summaries), and law has a search of its own
+# (search_law), asked for by name. The kinds are the ones a law puts in force,
+# read from the model's own tables. (Since sections stopped carrying the
+# ProjectionNode label neither record index holds one; the filters stay, so a
+# section can never be returned by a record leg whatever is in the index.)
+LAW_KINDS = tuple(
+    sorted(
+        kind.value
+        for pointer, kinds in POINTER_RECORD_KINDS.items()
+        if POINTER_ANCHOR_KIND[pointer] is ProjectionSourceKind.LAW_SOURCE
+        for kind in kinds
+    )
+)
+_LAW_KIND_LIST = "[" + ", ".join(f"'{kind}'" for kind in LAW_KINDS) + "]"
+_NOT_LAW = f"NOT n.projection_source_kind IN {_LAW_KIND_LIST}"
+if len(LAW_KINDS) != 1:  # pragma: no cover - a guard on the model, not a runtime path
+    raise RuntimeError("_LAW_READ reads one node label; a second law record kind needs a read of its own")
+# The law is searched by meaning only. Measured 2026-11-14 on two real laws (114
+# and 201 sections) and 24 questions whose right section was known (8 questions
+# asked of the law directly, and 16 purposes of procedures whose governing
+# section an independent reader confirmed): ranked by meaning alone, the right
+# section came first for 20 of the 24 and in the first three for 23. Ranked by
+# keyword alone, 1 and 3. The two fused with equal weight, as this search did
+# before, 12 and 19; weighted fusions fell in between. Every section's text opens
+# with its law's title, so a question that names the law matches every section
+# of it by keyword, and the shortest sections win. What is given up: a question
+# that quotes a section number is no longer matched by its digits. That was not
+# measured.
+#
+# The law sections in force, nearest first, scored exactly. A law has a few
+# hundred sections, so they are compared with the question one by one, as the
+# summaries are: the same score as the index's, no turn at the index, and no
+# section of a law out of force can crowd a window. The node label is the fixed
+# label the model maps the kind to, never caller text.
+#
+# Only a value the engine holds as a vector is compared: one value of another
+# type would make the comparison fail, and the read with it, for every section
+# of the graph. Only this service writes a section's vector (callers cannot send
+# one, see SERVICE_OWNED_PROPERTIES), so this is a second guard, not the first.
+# A vector of the wrong size would fail the read too, and the engine offers no
+# cheap way to ask a vector's size; the model marker (which names the size) is
+# what keeps one out. A known limit.
+#
+# Another: this read takes no turn at the index (see vector_turns), because it
+# does not use one. Measured by an independent reviewer on a real engine
+# (2026-11-14): one search over 50,000 sections of 1,024 dimensions took 0.2 s,
+# and 64 of them at once 2.7 s. A few hundred sections is the expected size.
+_LAW_READ = (
+    f"MATCH (n:{SOURCE_KIND_NODE_LABEL[ProjectionSourceKind(LAW_KINDS[0])]}) "
+    f"WHERE n.{LAW_MODEL_PROPERTY} = $marker AND typeOf(n.{LAW_VECTOR_PROPERTY}) = 'Vectorf32' "
+    f"WITH n, vec.cosineDistance(n.{LAW_VECTOR_PROPERTY}, vecf32($q)) AS score, 0 AS seen "
+    "WHERE "
+)
+# The most law sections one search of the law returns.
+MAX_LAW_RESULTS = 10
 # The most summaries a search returns beside the records asked for (see the
 # end of search_records).
 SUMMARIES_BESIDE_RECORDS = 3
@@ -494,7 +615,7 @@ def _leg_heads(window: int) -> tuple[str, str]:
     keyword = (
         f"CALL db.idx.fulltext.queryNodes('{PROJECTION_NODE_LABEL}', $query) "
         "YIELD node AS n, score "
-        f"WITH n, score WHERE {_NOT_BY_KEYWORD} "
+        f"WITH n, score WHERE {_NOT_BY_KEYWORD} AND {_NOT_LAW} "
         f"WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT {int(window)} "
     )
     return vector, keyword
@@ -520,7 +641,7 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
     window = int(window if window is not None else pool * _OVERFETCH)
     vector_head, keyword_head = _leg_heads(window)
     vector = (
-        f"{vector_head}{_CANDIDATES}WHERE n.text_emb_model = $marker AND {_NOT_BY_KEYWORD} AND {_IN_FORCE} "
+        f"{vector_head}{_CANDIDATES}WHERE n.text_emb_model = $marker AND {_NOT_BY_KEYWORD} AND {_NOT_LAW} AND {_IN_FORCE} "
         f"ORDER BY score ASC, uuid ASC LIMIT {pool}"
     )
     keyword = f"{keyword_head}{_CANDIDATES}WHERE {_IN_FORCE} ORDER BY score DESC, uuid ASC LIMIT {pool}"
@@ -530,6 +651,12 @@ def record_leg_queries(pool: int, window: int | None = None) -> tuple[str, str]:
 def summary_read_query() -> str:
     """The Cypher of the summaries' own read: those in force, nearest first, no more than are ever returned."""
     return f"{_SUMMARY_READ}{_IN_FORCE} ORDER BY score ASC, uuid ASC LIMIT {SUMMARIES_BESIDE_RECORDS}"
+
+
+def law_query(pool: int) -> str:
+    """The Cypher of the law's one read: every section in force, scored exactly by meaning, nearest first. Two
+    sections the same distance away are put in order by their id, so the answer does not depend on read order."""
+    return f"{_LAW_READ}{_IN_FORCE} ORDER BY score ASC, uuid ASC LIMIT {int(pool)}"
 
 
 def record_leg_counts(window: int) -> tuple[str, str]:
@@ -838,3 +965,52 @@ async def search_records(
         if records >= int(max_results):
             break
     return chosen
+
+
+async def search_law(
+    client_slug: str,
+    engagement_ids: list[str],
+    query: str,
+    max_results: int,
+    graph_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """The sections of the laws in force nearest a question in meaning, and nothing else.
+
+    Asked for by name, beside a record search or instead of one. By meaning
+    only (see _LAW_READ for why), under the vector read's time limit. A read
+    that fails or runs out of time answers an empty list, never an error.
+    """
+    wanted = min(int(max_results), MAX_LAW_RESULTS)
+    if not engagement_ids or not query.strip() or wanted < 1:
+        return []
+    name = graph_name or graphiti_client._graph_name_for_client(client_slug)
+    graph = graphiti_client.get_falkor_db().select_graph(name)
+    now = int(time.time())
+    scope = {
+        "group_id": name,
+        "engagement_ids": list(engagement_ids),
+        "counted_after": now - int(settings.summaries_served_for_seconds),
+        "counted_before": now + COUNTED_AT_AHEAD_SECONDS,
+    }
+    began = time.monotonic()
+    try:
+        embedder = graphiti_client._create_embedder()
+        if embedder is None:
+            return []
+        qvec = await question_vectors.question_vector(embedder, name, query)
+        rows = (
+            await asyncio.to_thread(
+                _read, graph, law_query(wanted), {**scope, "q": qvec, "marker": _marker()},
+                settings.search_vector_timeout_ms,
+            )
+        ).result_set or []
+    except Exception as error:
+        logger.warning(
+            "[graphiti] law read skipped on %s error_type=%s after %d ms",
+            name, type(error).__name__, int((time.monotonic() - began) * 1000),
+        )
+        return []
+    # In the order the read put them (nearest first, then by id). Only sections: the read can return nothing else,
+    # and this keeps it so whatever the read becomes.
+    found = [_row_to_record(row) for row in rows if row and row[0]]
+    return [record for record in found if record["kind"] in LAW_KINDS][:wanted]

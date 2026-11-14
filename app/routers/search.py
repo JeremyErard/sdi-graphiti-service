@@ -1,8 +1,10 @@
 """Provenance-aware KG context retrieval for backend authority resolution."""
 
+import asyncio
 import logging
 import time
 import uuid as uuidlib
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
@@ -492,25 +494,47 @@ async def search_records(req: RecordSearchRequest):
     """
     started = time.time()
     records: list[RecordResult] = []
+    law: list[RecordResult] = []
     graph_name = ""
+
+    async def guarded(what: str, search: Any, max_results: int) -> list[RecordResult]:
+        """One search and the building of its results, failing on its own: a failure of the law never costs the
+        records, and a failure of the records never costs the law."""
+        try:
+            found = await search(
+                client_slug=req.client_slug,
+                engagement_ids=engagement_ids,
+                query=req.query,
+                max_results=max_results,
+            )
+            return [RecordResult(**record) for record in found]
+        except Exception as error:
+            logger.warning(
+                "[graphiti] %s search failed on %s error_type=%s; answering empty",
+                what,
+                graph_name or "(no graph)",
+                type(error).__name__,
+            )
+            return []
+
     try:
         graph_name = graphiti_client._graph_name_for_client(req.client_slug)
         # Records are served when either lane that writes them is on: the process structure, or the law. So with the
         # law lane on, switching the process-structure lane off no longer hides the process records already written:
         # every record in force in the tenant's graph is served, as it was while both were on. The switches govern
-        # writing; what takes a record out of retrieval is its pointer no longer naming its version.
+        # writing, not reading: what takes a record out of retrieval is its pointer no longer naming its version. The
+        # same holds for the law: with the law lane off and the process lane on, a law already written is still
+        # returned when it is asked for (law_results above 0). Ruled 2026-11-14, on purpose.
         if (
             (settings.projection_v2_allow_process_structure or settings.projection_v2_allow_law)
             and settings.graphiti_auth_mode == "required"
         ):
             engagement_ids = list(dict.fromkeys([req.engagement_id, *req.readable_engagement_ids]))
-            found = await projection_records.search_records(
-                client_slug=req.client_slug,
-                engagement_ids=engagement_ids,
-                query=req.query,
-                max_results=req.max_results,
+            records, law = await asyncio.gather(
+                guarded("record", projection_records.search_records, req.max_results),
+                # Law is asked for by name and comes back beside the records, never among them.
+                guarded("law", projection_records.search_law, req.law_results),
             )
-            records = [RecordResult(**record) for record in found]
     except Exception as error:
         logger.warning(
             "[graphiti] record search failed on %s error_type=%s; answering empty",
@@ -518,12 +542,14 @@ async def search_records(req: RecordSearchRequest):
             type(error).__name__,
         )
         records = []
+        law = []
     elapsed_ms = (time.time() - started) * 1000
     logger.info(
         "[graphiti] record search on %s: %d records (%.0fms)", graph_name, len(records), elapsed_ms
     )
     return RecordSearchResponse(
         records=records,
+        law=law,
         graph_name=graph_name,
         search_time_ms=round(elapsed_ms, 1),
     )
