@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI
 
 from app.auth import require_scope, validate_auth_configuration
 from app.config import settings
-from app.routers import admin, graph, health, ingest, projection, projection_embed, search, structured
+from app.routers import admin, graph, health, ingest, law, projection, projection_embed, search, structured
 from app.services import graphiti_client, graphiti_patches
 
 # Install runtime patches over graphiti-core BEFORE any router import paths
@@ -85,6 +85,12 @@ app.include_router(
     search.router,
     prefix="/search",
     tags=["search"],
+    dependencies=[Depends(require_scope("search"))],
+)
+app.include_router(
+    law.router,
+    prefix="/law",
+    tags=["law"],
     dependencies=[Depends(require_scope("search"))],
 )
 app.include_router(
