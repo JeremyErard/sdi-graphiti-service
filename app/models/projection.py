@@ -97,6 +97,23 @@ _CLIENT_SLUG = r"^[a-z0-9-]+$"
 # "reprojecting the same immutable source version converges" requires.
 PROJECTION_NODE_LABEL = "ProjectionNode"
 
+# A section of a law carries this label in place of PROJECTION_NODE_LABEL, beside
+# its type label, and its exact-ID MERGE keys on it. The process records' keyword
+# index is built over every node that carries PROJECTION_NODE_LABEL, and a node
+# counts in that index's statistics by carrying the label, whatever properties it
+# has: measured on a real engine (2026-11-14, 196 questions, one engine state),
+# 396 law sections with no `text` at all still moved the process keyword scores on
+# 32 questions and the ids returned on 22, and deleting them restored every score
+# exactly. A label of their own keeps them out of that index's count entirely.
+# The law itself (LAW_SOURCE) keeps PROJECTION_NODE_LABEL: it carries no words,
+# and it is what a section's in-force join finds, as a workflow is for a record.
+LAW_SECTION_BASE_LABEL = "LawRecordNode"
+
+# Every base label a projected node can carry. A node has exactly one of them,
+# fixed by its kind (SOURCE_KIND_BASE_LABEL), so identity is (base label, uuid,
+# tenant, engagement) and one uuid can never name two projected nodes.
+PROJECTION_BASE_LABELS = (PROJECTION_NODE_LABEL, LAW_SECTION_BASE_LABEL)
+
 # The ledger label. It is not in the projection label space and no caller can
 # write it, because callers do not supply labels at all.
 PROJECTION_RECEIPT_LABEL = "ProjectionReceipt"
@@ -209,6 +226,17 @@ SOURCE_KIND_NODE_LABEL: dict[ProjectionSourceKind, str] = {
     ProjectionSourceKind.LAW_SOURCE: "LawSource",
     ProjectionSourceKind.LAW_SECTION: "LawSection",
 }
+
+# The base label each kind's nodes carry (see LAW_SECTION_BASE_LABEL). Only a
+# section of a law has one of its own.
+SOURCE_KIND_BASE_LABEL = {
+    kind: LAW_SECTION_BASE_LABEL if kind is ProjectionSourceKind.LAW_SECTION else PROJECTION_NODE_LABEL
+    for kind in ProjectionSourceKind
+}
+# The same, looked up by the type label the route writes. A type label names one kind, so this cannot be ambiguous.
+if len(set(SOURCE_KIND_NODE_LABEL.values())) != len(SOURCE_KIND_NODE_LABEL):  # pragma: no cover - a guard on the model
+    raise RuntimeError("two source kinds share a type label; the base label could not be read off the type label")
+TYPE_LABEL_BASE_LABEL = {SOURCE_KIND_NODE_LABEL[kind]: SOURCE_KIND_BASE_LABEL[kind] for kind in ProjectionSourceKind}
 
 P2_PRIME_SOURCE_KINDS = frozenset(
     {
@@ -390,6 +418,23 @@ RELATION_ENDPOINT_KINDS: dict[
 }
 
 
+def _endpoint_base_labels(relation: ProjectionRelation) -> tuple[str, str]:
+    starts = {SOURCE_KIND_BASE_LABEL[pair[0]] for pair in RELATION_ENDPOINT_KINDS[relation]}
+    ends = {SOURCE_KIND_BASE_LABEL[pair[1]] for pair in RELATION_ENDPOINT_KINDS[relation]}
+    if len(starts) != 1 or len(ends) != 1:  # pragma: no cover - a guard on the model, not a runtime path
+        raise RuntimeError(f"relation {relation.value} joins nodes of more than one base label at one end")
+    return starts.pop(), ends.pop()
+
+
+# The base label at each end of each relation, read off the endpoint kinds the
+# relation may join. An edge is refused unless its endpoints are of those kinds,
+# so every edge of a relation runs between nodes of these two base labels, and a
+# statement that matches an edge's endpoints can name them exactly.
+RELATION_ENDPOINT_BASE_LABELS: dict[ProjectionRelation, tuple[str, str]] = {
+    relation: _endpoint_base_labels(relation) for relation in RELATION_ENDPOINT_KINDS
+}
+
+
 def relation_endpoint_error(
     relation: ProjectionRelation, from_kind: str | None, to_kind: str | None
 ) -> str | None:
@@ -447,6 +492,31 @@ RETAINED_LIFECYCLE_STATES = frozenset(
 
 # Property keys the projection service writes itself. A caller supplying one of
 # these could otherwise restate tenancy, provenance, or human validation.
+# The one property a retrieval surface reads from a projected record: a plain
+# statement of what the record says, written by the caller from the source
+# record itself. This service embeds it and never rewrites it.
+RECORD_TEXT_PROPERTY = "text"
+# A section of a law keeps its words and its vector under names of its own, so it sits in neither index the
+# process records are searched through. An envelope still states a section's words as `text`; the write moves them.
+# Measured on a real engine (2026-11-14): with two laws' text in the records' own keyword index, a question that
+# asked for no law still got different process records on 33 of 196 questions, because the law's words changed
+# how often every term occurs. Kept apart, a law cannot move what a process question returns.
+LAW_TEXT_PROPERTY = "law_text"
+LAW_VECTOR_PROPERTY = "law_text_embedding"
+# Everything this service keeps on a section of a law under the law's own names:
+# its words (moved there from `text` by the write), and what the embedding pass
+# writes beside them (the vector, the model it was made by, and the mark that the
+# provider refused it, with when). A caller that could send any of these could
+# set a section aside from the embedding pass for good (a refusal mark far in the
+# future), or put a value the meaning read cannot compare in place of a vector.
+# Derived from LAW_TEXT_PROPERTY, so the names cannot drift from the ones the
+# embedding pass and the search use.
+LAW_OWNED_PROPERTIES = frozenset(
+    f"{LAW_TEXT_PROPERTY}{suffix}" for suffix in ("", "_embedding", "_emb_model", "_emb_failed", "_emb_failed_at")
+)
+if LAW_VECTOR_PROPERTY not in LAW_OWNED_PROPERTIES:  # pragma: no cover - a guard on the names above
+    raise RuntimeError("the law's vector name must be among the names the service owns")
+
 SERVICE_OWNED_PROPERTIES = frozenset(
     {
         "uuid",
@@ -482,12 +552,9 @@ SERVICE_OWNED_PROPERTIES = frozenset(
         "text_emb_failed_at",
         "emb_model",
     }
+    | LAW_OWNED_PROPERTIES
 )
 
-# The one property a retrieval surface reads from a projected record: a plain
-# statement of what the record says, written by the caller from the source
-# record itself. This service embeds it and never rewrites it.
-RECORD_TEXT_PROPERTY = "text"
 
 
 def _check_scalar(key: str, value: Any) -> None:

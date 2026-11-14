@@ -54,6 +54,16 @@ class FakeGraph:
             if kind in self.index_errors:
                 raise self.index_errors[kind]
             return SimpleNamespace(result_set=[])
+        if statement == projection_records.LAW_PENDING_QUERY:
+            done = {w["uuid"] for w in self.written} | {m["uuid"] for m in self.refused}
+            waiting = [[*r, "law"] for r in getattr(self, "law_pending", []) if r[0] not in done]
+            return SimpleNamespace(result_set=waiting[: params["limit"]])
+        if "SET n.law_text_embedding" in statement:
+            self.written.append({**params, "lane": "law"})
+            return SimpleNamespace(result_set=[[1]])
+        if "SET n.law_text_emb_failed" in statement:
+            self.refused.append({**params, "lane": "law"})
+            return SimpleNamespace(result_set=[[1]])
         if "text_embedding IS NULL" in statement:
             # As the real query does: a record with a vector, or already refused by this model, is not pending.
             done = {w["uuid"] for w in self.written} | {m["uuid"] for m in self.refused}
@@ -80,6 +90,11 @@ class FakeGraph:
                 raise RuntimeError("the summary read timed out")
             limit = int(statement.rsplit("LIMIT ", 1)[1])
             return SimpleNamespace(result_set=[[*row[:8], row[8], 0] for row in self.summary_rows[:limit]])
+        if statement.startswith("MATCH (n:LawSection) "):
+            if "law-meaning" in self.fail:
+                raise RuntimeError("the law read by meaning timed out")
+            limit = int(statement.rsplit("LIMIT ", 1)[1])
+            return SimpleNamespace(result_set=[[*r[:8], r[8], 0] for r in getattr(self, "law_meaning_rows", [])[:limit]])
         if "db.idx.vector.queryNodes" in statement:
             leg, rows = "vector", self.vector_rows
             window = int(statement.split("'text_embedding', ")[1].split(",")[0])
@@ -246,7 +261,9 @@ def test_a_statement_set_aside_is_stamped_and_the_pass_asks_only_for_those_due_a
     graph = wired(FakeGraph(pending=[["r1", "eng-1", "poison"]]), FakeEmbedder(refuse={"poison"}))
     asyncio.run(projection_records.embed_pending("unit-tenant", "eng-1"))
     assert graph.refused[0]["now"] == 1_000_000
-    (params,) = [p for q, p in graph.queries if "text_embedding IS NULL" in q]
+    params, law_params = [p for q, p in graph.queries if "text_embedding IS NULL" in q]
+    # The law's own pending read is asked with the same marker and the same wait before a retry.
+    assert (law_params["marker"], law_params["retry_before"]) == (params["marker"], params["retry_before"])
     assert params["retry_before"] == 1_000_000 - projection_records.REFUSED_RETRY_AFTER_SECONDS
 
 
@@ -336,17 +353,19 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
     assert keyword.startswith(
         "CALL db.idx.fulltext.queryNodes('ProjectionNode', $query) YIELD node AS n, score "
         "WITH n, score WHERE NOT n.projection_source_kind IN ['RECORD_SET_SUMMARY'] "
+        "AND NOT n.projection_source_kind IN ['LAW_SECTION'] "
         "WITH n, score ORDER BY score DESC, n.uuid ASC LIMIT 30 "
         "WITH collect({n: n, score: score}) AS candidates "
     )
-    assert keyword.count("NOT n.projection_source_kind IN") == 1
+    assert keyword.count("NOT n.projection_source_kind IN") == 2
     assert "seen WHERE n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in keyword
     # The vector leg leaves them out too, but AFTER its window is read: the index's window can only be read whole,
     # and whether it was full (so worth widening) is judged by what the index handed over, as before.
-    assert vector.count("NOT n.projection_source_kind IN") == 1
+    assert vector.count("NOT n.projection_source_kind IN") == 2
     assert vector.index("NOT n.projection_source_kind IN") > vector.index("size(candidates) AS seen")
     assert (
         "seen WHERE n.text_emb_model = $marker AND NOT n.projection_source_kind IN ['RECORD_SET_SUMMARY'] "
+        "AND NOT n.projection_source_kind IN ['LAW_SECTION'] "
         "AND n.group_id = $group_id AND n.engagement_id IN $engagement_ids " in vector
     )
     # They are read on their own instead: those in force, scored exactly against the question with the distance
@@ -357,7 +376,7 @@ def test_both_legs_return_only_records_whose_version_their_workflow_points_at():
         "WITH n, vec.cosineDistance(n.text_embedding, vecf32($q)) AS score, 0 AS seen "
         "WHERE n.group_id = $group_id AND n.engagement_id IN $engagement_ids MATCH (w:ProjectionNode"
     )
-    assert summary.endswith("RETURN n.uuid AS uuid, n.text AS text, n.projection_source_kind AS kind, n.projection_source_id AS source_id, n.projection_source_version_id AS version_id, n.engagement_id AS engagement_id, n.workflow_id AS workflow_id, n.workflow_name AS workflow_name, score, seen ORDER BY score ASC, uuid ASC LIMIT 3")
+    assert summary.endswith("RETURN n.uuid AS uuid, coalesce(n.text, n.law_text) AS text, n.projection_source_kind AS kind, n.projection_source_id AS source_id, n.projection_source_version_id AS version_id, n.engagement_id AS engagement_id, n.workflow_id AS workflow_id, n.workflow_name AS workflow_name, score, seen ORDER BY score ASC, uuid ASC LIMIT 3")
     # The same in-force rule as the legs, freshness of the counting run included.
     assert projection_records._IN_FORCE in summary and "w.counted_at >= $counted_after" in summary
     assert "queryNodes" not in summary
@@ -922,7 +941,234 @@ def test_embedding_runs_with_only_the_law_lane_on_and_is_refused_with_neither(pe
     assert seen["engagement_id"] == "eng-1"
 
 
-def test_a_section_of_a_law_is_found_by_both_legs_like_any_record():
-    # Only a summary is kept out of the keyword leg and read on its own; a section of a law is an ordinary record.
+def test_a_section_of_a_law_is_kept_out_of_both_record_legs_and_has_a_read_of_its_own_by_meaning_only():
+    # A summary is read on its own by meaning; so is a section of a law, and by meaning only (see _LAW_READ).
     assert projection_records.MEANING_ONLY_KINDS == ("RECORD_SET_SUMMARY",)
-    assert projection_records._NOT_BY_KEYWORD == "NOT n.projection_source_kind IN ['RECORD_SET_SUMMARY']"
+    assert projection_records.LAW_KINDS == ("LAW_SECTION",)
+    assert projection_records._NOT_LAW == "NOT n.projection_source_kind IN ['LAW_SECTION']"
+    assert not hasattr(projection_records, "law_queries") and not hasattr(projection_records, "_ONLY_LAW")
+    read = projection_records.law_query(6)
+    # Every section with a vector from the model in use, and only a value the engine holds as a vector (one value of
+    # another type would fail the comparison for the whole graph), scored exactly, then only those in force.
+    assert read.startswith(
+        "MATCH (n:LawSection) WHERE n.law_text_emb_model = $marker AND typeOf(n.law_text_embedding) = 'Vectorf32' "
+        "WITH n, vec.cosineDistance(n.law_text_embedding, vecf32($q)) AS score, 0 AS seen "
+        "WHERE n.group_id = $group_id AND n.engagement_id IN $engagement_ids "
+    )
+    # Nearest first; two sections the same distance away in order of their ids, so the answer is not read order.
+    assert read.endswith("ORDER BY score ASC, uuid ASC LIMIT 6") and "db.idx" not in read
+    # Held to the same in-force rule as every record: the law must name the section's version.
+    assert "(w.projection_source_kind = 'LAW_SOURCE' AND n.projection_source_kind IN ['LAW_SECTION'] AND n.projection_source_version_id = w.current_law_version_id)" in read
+    assert "w.group_id = $group_id AND w.engagement_id = n.engagement_id" in read
+
+
+def test_a_law_sections_words_and_vector_sit_in_no_index_the_process_records_are_searched_through(wired):
+    # Its words are written under their own name, so the records' keyword index (on `text`) never holds them...
+    from app.models.projection import LAW_TEXT_PROPERTY, LAW_VECTOR_PROPERTY
+
+    assert (LAW_TEXT_PROPERTY, LAW_VECTOR_PROPERTY) == ("law_text", "law_text_embedding")
+    by_meaning = projection_records.law_query(6)
+    record_vector, record_keyword = projection_records.record_leg_queries(6)
+    assert "queryNodes('ProjectionNode'" in record_keyword and "law_text" not in record_keyword.replace("coalesce(n.text, n.law_text)", "")
+    assert "law_text_embedding" in by_meaning and "law_text_embedding" not in record_vector
+    # ...its vector under its own name, so the records' vector index never holds it either...
+    assert "n.law_text IS NOT NULL" in projection_records.LAW_PENDING_QUERY
+    assert "SET n.law_text_embedding = vecf32($vector)" in projection_records.LAW_SET_VECTOR_QUERY
+    assert "WHERE n.law_text = $text" in projection_records.LAW_SET_VECTOR_QUERY
+    # The model a section's vector was made by is written and read under one name (a mismatch returns no law at all).
+    assert "n.law_text_emb_model = $marker" in projection_records.LAW_SET_VECTOR_QUERY
+    assert "n.law_text_emb_model = $marker" in by_meaning and "n.text_emb_model" not in by_meaning
+    assert "n.law_text_emb_model" in projection_records.LAW_PENDING_QUERY and "n.text_emb" not in projection_records.LAW_PENDING_QUERY
+    assert "n.law_text_emb_failed = $marker" in projection_records.LAW_MARK_REFUSED_QUERY
+    assert "text_embedding" not in projection_records.LAW_SET_VECTOR_QUERY.replace("law_text_embedding", "")
+    # ...and a section is returned with its words whichever name they are under.
+    assert "coalesce(n.text, n.law_text) AS text" in by_meaning and "coalesce(n.text, n.law_text) AS text" in record_keyword
+    # The embedding pass gives the sections their vectors after the records, with the law's own write.
+    graph = FakeGraph(pending=[["r1", "eng-1", "a record"]])
+    graph.law_pending = [["s1", "eng-1", "Section 1.01 Short Title."]]
+    wired(graph, FakeEmbedder())
+    out = asyncio.run(projection_records.embed_pending("unit-tenant"))
+    assert (out["pending"], out["written"]) == (2, 2)
+    assert [(w["uuid"], w.get("lane")) for w in graph.written] == [("r1", None), ("s1", "law")]
+    # The law has no index of its own: it is read by meaning only, every section compared one by one.
+    assert not any("LawSection" in q or "law_text" in q for q, _ in graph.queries if q.startswith("CREATE "))
+
+
+def law(record_id, score=1.0):
+    return [record_id, f"Section {record_id}", "LAW_SECTION", f"src-{record_id}", "law-v1", "eng-1", "law-1", "The Act", score]
+
+
+def test_a_search_of_the_law_is_one_read_by_meaning_kept_in_its_order_and_returns_only_sections(wired, monkeypatch):
+    monkeypatch.setattr(settings, "search_vector_timeout_ms", 1234, raising=False)
+    monkeypatch.setattr(settings, "search_bm25_timeout_ms", 4321, raising=False)
+    graph = FakeGraph()
+    # As the read hands them over: nearest first, s2 and s3 the same distance away and so in order of their ids. A
+    # row of another kind (the read cannot return one; this keeps it so whatever the read becomes) is dropped.
+    graph.law_meaning_rows = [law("s1", 0.1), law("s2", 0.2), row("p1", score=0.2), law("s3", 0.2), law("s4", 0.3)]
+    wired(graph, FakeEmbedder())
+    found = asyncio.run(projection_records.search_law("unit-tenant", ["eng-1"], "issuance of credit", 4))
+    assert [r["record_id"] for r in found] == ["s1", "s2", "s3"]
+    assert {r["kind"] for r in found} == {"LAW_SECTION"}
+    # One read, by meaning, asking for what was wanted, under the vector read's time limit; no index, no keyword read.
+    assert [(s.startswith("MATCH (n:LawSection) "), s.endswith("LIMIT 4")) for s, _ in graph.reads] == [(True, True)]
+    assert [t for _, t in graph.read_timeouts] == [1234]
+    assert not any("queryNodes" in s for s, _ in graph.reads)
+
+
+def test_a_search_of_the_law_asks_for_nothing_when_none_is_wanted_and_never_more_than_ten(wired):
+    graph = FakeGraph()
+    graph.law_meaning_rows = [law(f"s{i}", i / 100) for i in range(40)]
+    wired(graph, FakeEmbedder())
+    assert asyncio.run(projection_records.search_law("unit-tenant", ["eng-1"], "credit", 0)) == [] and graph.reads == []
+    assert asyncio.run(projection_records.search_law("unit-tenant", [], "credit", 3)) == [] and graph.reads == []
+    assert len(asyncio.run(projection_records.search_law("unit-tenant", ["eng-1"], "credit", 50))) == 10
+
+
+def test_a_law_read_that_fails_answers_empty_and_logs_the_error_type_only(wired, caplog):
+    graph = FakeGraph()
+    graph.law_meaning_rows = [law("s1", 0.1)]
+    graph.fail = {"law-meaning"}
+    wired(graph, FakeEmbedder())
+    with caplog.at_level("WARNING", logger="graphiti_service"):
+        assert asyncio.run(projection_records.search_law("unit-tenant", ["eng-1"], "credit", 3)) == []
+    # The type, never the text: an engine's error text can carry the query and what it was asked with.
+    assert "law read skipped" in caplog.text and "error_type=RuntimeError" in caplog.text
+    assert "the law read by meaning timed out" not in caplog.text
+
+
+def test_the_record_search_route_returns_law_beside_the_records_only_when_asked(perimeter, monkeypatch):
+    monkeypatch.setattr(settings, "projection_v2_allow_law", True, raising=False)
+    asked = []
+
+    async def records(**kwargs):
+        return [dict(zip(RECORD_KEYS, row("a")))]
+
+    async def sections(**kwargs):
+        asked.append(kwargs["max_results"])
+        return [dict(zip(RECORD_KEYS, law("s1")))][: kwargs["max_results"]]
+
+    monkeypatch.setattr(projection_records, "search_records", records)
+    monkeypatch.setattr(projection_records, "search_law", sections)
+    plain = signed_post("/search/records", RECORD_QUESTION, "search", SEARCH_SECRET).json()
+    assert [[r["record_id"] for r in plain["records"]], plain["law"], asked] == [["a"], [], [0]]
+    both = signed_post("/search/records", {**RECORD_QUESTION, "law_results": 3}, "search", SEARCH_SECRET).json()
+    assert [[r["record_id"] for r in both["records"]], [r["record_id"] for r in both["law"]], asked] == [["a"], ["s1"], [0, 3]]
+    assert signed_post("/search/records", {**RECORD_QUESTION, "law_results": 11}, "search", SEARCH_SECRET).status_code == 422
+
+
+def test_a_section_of_a_law_is_found_under_its_own_base_label_by_the_embedding_pass_and_never_as_a_process_record():
+    # A section carries LawRecordNode and not ProjectionNode (the records' keyword index counts every ProjectionNode,
+    # whatever it holds), so each of the law's own writes and reads starts from that label or from its type label.
+    from app.models.projection import LAW_SECTION_BASE_LABEL
+
+    assert LAW_SECTION_BASE_LABEL == "LawRecordNode"
+    for statement in (
+        projection_records.LAW_PENDING_QUERY,
+        projection_records.LAW_SET_VECTOR_QUERY,
+        projection_records.LAW_MARK_REFUSED_QUERY,
+    ):
+        assert statement.startswith("MATCH (n:LawRecordNode {"), statement
+        assert PROJECTION_NODE_LABEL not in statement
+    assert "{uuid: $uuid, group_id: $group_id, engagement_id: $engagement_id}" in projection_records.LAW_SET_VECTOR_QUERY
+    by_meaning = projection_records.law_query(6)
+    assert by_meaning.startswith("MATCH (n:LawSection) ")
+    # The law a section names is found where it has always been: it keeps ProjectionNode, and the in-force join
+    # that every record and every section goes through starts from it. A section can never stand in for a law.
+    for read in (by_meaning, *projection_records.record_leg_queries(6)):
+        assert f"MATCH (w:{PROJECTION_NODE_LABEL} {{uuid: n.workflow_node_id}})" in read
+    # Nothing a process question runs names the law's base label.
+    for read in (
+        *projection_records.record_leg_queries(6),
+        *projection_records.record_leg_counts(30),
+        projection_records.summary_read_query(),
+        projection_records._HOLDS_RECORDS,
+        projection_records.PENDING_QUERY,
+        projection_records.SET_VECTOR_QUERY,
+        projection_records.MARK_REFUSED_QUERY,
+    ):
+        assert LAW_SECTION_BASE_LABEL not in read
+
+
+def test_a_section_the_provider_refuses_is_marked_with_the_laws_own_mark_and_the_next_pass_goes_past_it(wired):
+    # One section the provider will not embed, while it answers a known-good statement: it is set aside under the
+    # law's own names (written with the record's names it would sit at the front of every pass for good), the
+    # section behind it gets its vector, and the next pass does not ask for it again.
+    graph = FakeGraph()
+    graph.law_pending = [["s1", "eng-1", "Section 1.01 Refused."], ["s2", "eng-1", "Section 1.02 Fine."]]
+    wired(graph, FakeEmbedder(refuse={"Section 1.01 Refused."}))
+    out = asyncio.run(projection_records.embed_pending("unit-tenant"))
+    assert (out["pending"], out["written"], out["failed"]) == (2, 1, 1)
+    assert [(m["uuid"], m.get("lane")) for m in graph.refused] == [("s1", "law")]
+    marks = [q for q, _ in graph.queries if "_emb_failed = $marker" in q]
+    assert marks == [projection_records.LAW_MARK_REFUSED_QUERY]
+    assert [(w["uuid"], w.get("lane")) for w in graph.written] == [("s2", "law")]
+    again = asyncio.run(projection_records.embed_pending("unit-tenant"))
+    assert (again["pending"], again["written"], again["failed"]) == (0, 0, 0)
+
+
+def test_the_laws_pending_read_fills_only_the_room_the_records_left_in_the_pass(wired):
+    # Three to a pass: two records leave room for one section, asked for with one more so the pass can tell that
+    # more remain.
+    graph = FakeGraph(pending=[["r1", "eng-1", "a record"], ["r2", "eng-1", "another record"]])
+    graph.law_pending = [[f"s{i}", "eng-1", f"Section {i}."] for i in range(5)]
+    wired(graph, FakeEmbedder())
+    out = asyncio.run(projection_records.embed_pending("unit-tenant", limit=3))
+    law_reads = [params for q, params in graph.queries if q == projection_records.LAW_PENDING_QUERY]
+    assert [p["limit"] for p in law_reads] == [2]
+    assert (out["pending"], out["written"], out["remaining"]) == (3, 3, True)
+    assert [w["uuid"] for w in graph.written] == ["r1", "r2", "s0"]
+    # A pass the records fill asks for no law at all.
+    graph = FakeGraph(pending=[[f"r{i}", "eng-1", f"record {i}"] for i in range(5)])
+    wired(graph, FakeEmbedder())
+    asyncio.run(projection_records.embed_pending("unit-tenant", limit=3))
+    assert not [q for q, _ in graph.queries if q == projection_records.LAW_PENDING_QUERY]
+
+
+@pytest.mark.parametrize("failing", ["law", "records"])
+@pytest.mark.parametrize("where", ["search", "result"])
+def test_a_failure_of_the_law_never_costs_the_records_and_the_reverse(failing, where, perimeter, monkeypatch, caplog):
+    monkeypatch.setattr(settings, "projection_v2_allow_law", True, raising=False)
+    good = {"records": [dict(zip(RECORD_KEYS, row("a")))], "law": [dict(zip(RECORD_KEYS, law("s1")))]}
+
+    def search(which):
+        async def run(**kwargs):
+            if which == failing and where == "search":
+                raise RuntimeError(f"secret text of the {which} failure")
+            if which == failing:
+                return [{"not": "a result"}]  # building the results fails, not the search
+            return good[which]
+
+        return run
+
+    monkeypatch.setattr(projection_records, "search_records", search("records"))
+    monkeypatch.setattr(projection_records, "search_law", search("law"))
+    with caplog.at_level("WARNING", logger="graphiti_service"):
+        response = signed_post("/search/records", {**RECORD_QUESTION, "law_results": 3}, "search", SEARCH_SECRET)
+    assert response.status_code == 200, response.text
+    # The log names which search failed, by its error type only.
+    named, other = ("law", "record") if failing == "law" else ("record", "law")
+    assert f"[graphiti] {named} search failed on" in caplog.text and f"[graphiti] {other} search failed on" not in caplog.text
+    assert "error_type=" in caplog.text and "secret text" not in caplog.text
+    body = response.json()
+    got = {"records": [r["record_id"] for r in body["records"]], "law": [r["record_id"] for r in body["law"]]}
+    expected = {"records": ["a"], "law": ["s1"]}
+    expected[failing] = []
+    assert got == expected
+
+
+def test_with_the_law_lane_off_a_law_already_written_is_still_returned_when_asked_for(perimeter, monkeypatch):
+    # Ruled on purpose (2026-11-14): the switches govern writing, not reading. What takes a section out of
+    # retrieval is its law no longer pointing at its version, not the law lane being switched off.
+    monkeypatch.setattr(settings, "projection_v2_allow_process_structure", True, raising=False)
+    monkeypatch.setattr(settings, "projection_v2_allow_law", False, raising=False)
+
+    async def records(**kwargs):
+        return [dict(zip(RECORD_KEYS, row("a")))]
+
+    async def sections(**kwargs):
+        return [dict(zip(RECORD_KEYS, law("s1")))][: kwargs["max_results"]]
+
+    monkeypatch.setattr(projection_records, "search_records", records)
+    monkeypatch.setattr(projection_records, "search_law", sections)
+    body = signed_post("/search/records", {**RECORD_QUESTION, "law_results": 2}, "search", SEARCH_SECRET).json()
+    assert [r["record_id"] for r in body["law"]] == ["s1"]

@@ -214,6 +214,15 @@ class RecordSearchRequest(BaseModel):
     )
     query: str = Field(..., min_length=1, max_length=4000)
     max_results: int = Field(default=6, ge=1, le=20)
+    law_results: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        description=(
+            "How many sections of the laws in force to return as well, in `law`. "
+            "They never take a place among `records`; 0 asks for none."
+        ),
+    )
 
 
 class RecordResult(BaseModel):
@@ -230,6 +239,8 @@ class RecordResult(BaseModel):
 class RecordSearchResponse(BaseModel):
     contract_version: Literal[RECORD_SEARCH_CONTRACT_VERSION] = RECORD_SEARCH_CONTRACT_VERSION
     records: list[RecordResult] = Field(default_factory=list)
+    # Sections of the laws in force, only when asked for (law_results). Never among `records`.
+    law: list[RecordResult] = Field(default_factory=list)
     graph_name: str = ""
     search_time_ms: float = 0.0
 

@@ -25,10 +25,11 @@ tests/test_projection_v2.py:
 * memory headroom is reported before and after the apply, and per-operation
   detail is returned so a spot probe can verify graph-matches-source
 
-The projection owns its own label space. Every projected node carries the
-ProjectionNode label and the exact-ID MERGE keys on it, so a node's identity
-never depends on its type label, and nothing here can bind, rewrite, or graft
-onto a node that graphiti's extraction path owns.
+The projection owns its own label space. Every projected node carries one
+base label, fixed by its kind (ProjectionNode, or LawRecordNode for a section of
+a law, see LAW_SECTION_BASE_LABEL), and the exact-ID MERGE keys on it, so a
+node's identity never depends on its type label, and nothing here can bind,
+rewrite, or graft onto a node that graphiti's extraction path owns.
 
 The tenant-local relational database stays authoritative. This service reads
 nothing from it and writes nothing back to it. Every hash and identity is
@@ -52,11 +53,17 @@ from app.graph_names import graph_name_for_client
 from app.models.projection import (
     POINTER_ANCHOR_KIND,
     POINTER_RECORD_KINDS,
+    LAW_SECTION_BASE_LABEL,
+    PROJECTION_BASE_LABELS,
     PROJECTION_NODE_LABEL,
     PROJECTION_RECEIPT_LABEL,
     RECORD_SET_COUNTED_AT,
+    LAW_TEXT_PROPERTY,
     RECORD_TEXT_PROPERTY,
+    RELATION_ENDPOINT_BASE_LABELS,
+    SOURCE_KIND_BASE_LABEL,
     SOURCE_KIND_NODE_LABEL,
+    TYPE_LABEL_BASE_LABEL,
     FindingLifecycle,
     ProjectionEdgeOp,
     ProjectionEnvelopeV2,
@@ -141,12 +148,21 @@ MANIFEST_CUTOFF_QUERY = (
 # Scoped to the projection label space. An unscoped MATCH on uuid would bind
 # graphiti's Entity, Episodic, Community, and Saga nodes, which would let an edge
 # graft projected content onto extracted content and would scan the whole graph.
-RESOLVE_NODES_QUERY = (
-    "UNWIND $node_ids AS wanted "
-    f"MATCH (n:{PROJECTION_NODE_LABEL} {{uuid: wanted, group_id: $group_id, "
-    "engagement_id: $engagement_id}) "
-    "RETURN wanted AS id, n.projection_source_kind AS kind"
-)
+def _resolve_nodes_query(base_label: str) -> str:
+    return (
+        "UNWIND $node_ids AS wanted "
+        f"MATCH (n:{base_label} {{uuid: wanted, group_id: $group_id, "
+        "engagement_id: $engagement_id}) "
+        "RETURN wanted AS id, n.projection_source_kind AS kind"
+    )
+
+
+RESOLVE_NODES_QUERY = _resolve_nodes_query(PROJECTION_NODE_LABEL)
+# Every id is looked up under each base label, not only under the one its
+# declared kind carries: an id already taken by a node of the other base label
+# then comes back with that node's kind and is refused as a change of kind,
+# instead of the MERGE making a second node under the same uuid.
+RESOLVE_NODES_QUERIES = tuple(_resolve_nodes_query(label) for label in PROJECTION_BASE_LABELS)
 
 def _resolve_edges_query(relation: str) -> str:
     """Find edges of one relation by identity, wherever their endpoints are.
@@ -164,38 +180,53 @@ def _resolve_edges_query(relation: str) -> str:
     of ProjectionRelation.
 
     Scope is unchanged: both endpoints must be projected nodes of this tenant
-    and engagement, so an edge of graphiti's own can never be bound.
+    and engagement, so an edge of graphiti's own can never be bound. Each end
+    is held to the base label that relation's endpoint kinds carry
+    (RELATION_ENDPOINT_BASE_LABELS): a section of a law is not a ProjectionNode.
     """
+    start_label, end_label = RELATION_ENDPOINT_BASE_LABELS[ProjectionRelation(relation)]
     return (
         "UNWIND $edge_ids AS wanted "
         f"MATCH ()-[e:{relation} {{uuid: wanted}}]->() "
         "WITH wanted, e, startNode(e) AS a, endNode(e) AS b "
-        f"WHERE a:{PROJECTION_NODE_LABEL} AND b:{PROJECTION_NODE_LABEL} "
+        f"WHERE a:{start_label} AND b:{end_label} "
         "AND a.group_id = $group_id AND a.engagement_id = $engagement_id "
         "AND b.group_id = $group_id AND b.engagement_id = $engagement_id "
         "RETURN wanted AS id, type(e) AS relation, a.uuid AS from_id, b.uuid AS to_id"
     )
 
-VERIFY_NODES_QUERY = (
-    "UNWIND $rows AS row "
-    f"MATCH (n:{PROJECTION_NODE_LABEL} {{uuid: row.node_id, group_id: $group_id, "
-    "engagement_id: $engagement_id}) "
-    "WHERE n.projection_op_hash = row.op_hash "
-    "RETURN count(DISTINCT n.uuid) AS verified"
-)
+# A node is read back under the base label its kind carries, so a row that
+# landed under the wrong one is not counted as applied.
+def _verify_nodes_query(base_label: str) -> str:
+    return (
+        "UNWIND $rows AS row "
+        f"MATCH (n:{base_label} {{uuid: row.node_id, group_id: $group_id, "
+        "engagement_id: $engagement_id}) "
+        "WHERE n.projection_op_hash = row.op_hash "
+        "RETURN count(DISTINCT n.uuid) AS verified"
+    )
+
+
+VERIFY_NODES_QUERY = _verify_nodes_query(PROJECTION_NODE_LABEL)
+
 
 # Anchored on the endpoints the operation declares, which the node index on
 # uuid answers, instead of walking every edge of the projection per row. It
-# also verifies more: the edge has to be where the operation put it.
-VERIFY_EDGES_QUERY = (
-    "UNWIND $rows AS row "
-    f"MATCH (:{PROJECTION_NODE_LABEL} {{uuid: row.from_node_id, group_id: $group_id, "
-    "engagement_id: $engagement_id})-[e {uuid: row.edge_id}]->"
-    f"(:{PROJECTION_NODE_LABEL} {{uuid: row.to_node_id, group_id: $group_id, "
-    "engagement_id: $engagement_id}) "
-    "WHERE e.projection_op_hash = row.op_hash "
-    "RETURN count(DISTINCT e.uuid) AS verified"
-)
+# also verifies more: the edge has to be where the operation put it. Each end
+# is named by the base label its relation's endpoint kinds carry.
+def _verify_edges_query(start_label: str, end_label: str) -> str:
+    return (
+        "UNWIND $rows AS row "
+        f"MATCH (:{start_label} {{uuid: row.from_node_id, group_id: $group_id, "
+        "engagement_id: $engagement_id})-[e {uuid: row.edge_id}]->"
+        f"(:{end_label} {{uuid: row.to_node_id, group_id: $group_id, "
+        "engagement_id: $engagement_id}) "
+        "WHERE e.projection_op_hash = row.op_hash "
+        "RETURN count(DISTINCT e.uuid) AS verified"
+    )
+
+
+VERIFY_EDGES_QUERY = _verify_edges_query(PROJECTION_NODE_LABEL, PROJECTION_NODE_LABEL)
 
 # Best-effort. Without these every exact-ID MERGE is a label scan, which turns a
 # manifest-scale import quadratic while the memory probe still reports healthy.
@@ -203,6 +234,10 @@ INDEX_STATEMENTS = (
     f"CREATE INDEX FOR (n:{PROJECTION_NODE_LABEL}) ON (n.uuid)",
     f"CREATE INDEX FOR (n:{PROJECTION_NODE_LABEL}) ON (n.group_id)",
     f"CREATE INDEX FOR (n:{PROJECTION_NODE_LABEL}) ON (n.engagement_id)",
+    # The same three for a section of a law, which carries a base label of its own.
+    f"CREATE INDEX FOR (n:{LAW_SECTION_BASE_LABEL}) ON (n.uuid)",
+    f"CREATE INDEX FOR (n:{LAW_SECTION_BASE_LABEL}) ON (n.group_id)",
+    f"CREATE INDEX FOR (n:{LAW_SECTION_BASE_LABEL}) ON (n.engagement_id)",
     f"CREATE INDEX FOR (r:{PROJECTION_RECEIPT_LABEL}) ON (r.group_id)",
     f"CREATE INDEX FOR (r:{PROJECTION_RECEIPT_LABEL}) ON (r.operation_id)",
     f"CREATE INDEX FOR (r:{PROJECTION_RECEIPT_LABEL}) ON (r.cursor_key)",
@@ -225,6 +260,11 @@ EDGE_PROBE_CYPHER = (
     f"MATCH (:{PROJECTION_NODE_LABEL} {{group_id: $group_id}})-[e {{uuid: $uuid}}]->() "
     "RETURN properties(e)"
 )
+# The same two for a section of a law and the edges that start at one. Offered
+# only beside an envelope that carries a section, so every other response is as
+# it was.
+LAW_NODE_PROBE_CYPHER = NODE_PROBE_CYPHER.replace(f"(n:{PROJECTION_NODE_LABEL} ", f"(n:{LAW_SECTION_BASE_LABEL} ")
+LAW_EDGE_PROBE_CYPHER = EDGE_PROBE_CYPHER.replace(f"(:{PROJECTION_NODE_LABEL} ", f"(:{LAW_SECTION_BASE_LABEL} ")
 
 CONFLICT_CODE_OPERATION = "projection_operation_conflict"
 CONFLICT_CODE_CURSOR = "projection_cursor_conflict"
@@ -496,6 +536,9 @@ def _node_row(op: ProjectionNodeOp, envelope_props: dict[str, Any]) -> dict[str,
     props.update(_lifecycle_properties(op.lifecycle))
     props["uuid"] = op.node_id
     props["projection_op_hash"] = operation_hash(op)
+    # A law section's words go under their own name, out of the process records' indexes (LAW_TEXT_PROPERTY).
+    if op.source.kind is ProjectionSourceKind.LAW_SECTION and RECORD_TEXT_PROPERTY in props:
+        props[LAW_TEXT_PROPERTY] = props.pop(RECORD_TEXT_PROPERTY)
     return {"node_id": op.node_id, "op_hash": props["projection_op_hash"], "props": props}
 
 
@@ -575,17 +618,39 @@ def _node_apply_query(type_label: str) -> str:
     so this relies on a node appearing once in a batch, which the envelope
     model enforces (a repeated node_id is refused before anything is written).
 
-    The MERGE key is the constant projection label plus the tenant, engagement,
-    and caller-supplied uuid. Identity therefore does not depend on the node's
+    The MERGE key is the constant base label of the kind (ProjectionNode, or
+    LawRecordNode for a section of a law) plus the tenant, engagement, and
+    caller-supplied uuid. Identity therefore does not depend on the node's
     type label, so a node whose type changes between projections updates in place
-    instead of splitting into two rows that share a uuid. The type label is
-    inlined because Cypher cannot parameterize a label; it is never caller text,
-    it is the fixed label this service maps the declared source kind to.
+    instead of splitting into two rows that share a uuid; and a change between
+    the two base labels is refused before anything is written (_preflight). The
+    labels are inlined because Cypher cannot parameterize a label; they are never
+    caller text, they are the fixed labels this service maps the declared source
+    kind to.
+
+    Each row is written only while no node of the other base label holds its
+    uuid, checked in the same statement as the write. _preflight refuses that
+    case before anything is written, but two applies running at once can both
+    pass their preflight before either writes (a section declared by one, a
+    process record under the same id by the other). The engine runs one
+    write statement on a graph at a time, so whichever of the two writes second
+    finds the other's node here and writes nothing for that row; its read-back
+    then finds the row missing, and that apply fails with its receipt left
+    PENDING, as for any row that did not land. Resent, it is refused by
+    _preflight as a change of kind.
     """
+    base_label = TYPE_LABEL_BASE_LABEL[type_label]
+    guard = "".join(
+        f"OPTIONAL MATCH (other:{other} {{uuid: row.node_id, group_id: $group_id, engagement_id: $engagement_id}}) "
+        "WITH row WHERE other IS NULL "
+        for other in PROJECTION_BASE_LABELS
+        if other != base_label
+    )
     if type_label in RESTATED_IN_PLACE_LABELS:
         return (
             "UNWIND $rows AS row "
-            f"MERGE (n:{PROJECTION_NODE_LABEL} {{uuid: row.node_id, "
+            f"{guard}"
+            f"MERGE (n:{base_label} {{uuid: row.node_id, "
             "group_id: $group_id, engagement_id: $engagement_id}) "
             f"WITH n, row, n.{RECORD_TEXT_PROPERTY} AS said, n.text_embedding AS vector, n.text_emb_model AS model, "
             "n.text_emb_failed AS failed, n.text_emb_failed_at AS failed_at "
@@ -600,7 +665,8 @@ def _node_apply_query(type_label: str) -> str:
         )
     return (
         "UNWIND $rows AS row "
-        f"MERGE (n:{PROJECTION_NODE_LABEL} {{uuid: row.node_id, "
+        f"{guard}"
+        f"MERGE (n:{base_label} {{uuid: row.node_id, "
         "group_id: $group_id, engagement_id: $engagement_id}) "
         f"SET n:{type_label} "
         "SET n = row.props "
@@ -609,11 +675,14 @@ def _node_apply_query(type_label: str) -> str:
 
 
 def _edge_apply_query(relation: str) -> str:
+    """Each end is matched under the base label its relation's endpoint kinds carry (a section of a law is not a
+    ProjectionNode), so the edge lands on the exact nodes named and on nothing graphiti owns."""
+    start_label, end_label = RELATION_ENDPOINT_BASE_LABELS[ProjectionRelation(relation)]
     return (
         "UNWIND $rows AS row "
-        f"MATCH (a:{PROJECTION_NODE_LABEL} {{uuid: row.from_node_id, "
+        f"MATCH (a:{start_label} {{uuid: row.from_node_id, "
         "group_id: $group_id, engagement_id: $engagement_id}) "
-        f"MATCH (b:{PROJECTION_NODE_LABEL} {{uuid: row.to_node_id, "
+        f"MATCH (b:{end_label} {{uuid: row.to_node_id, "
         "group_id: $group_id, engagement_id: $engagement_id}) "
         f"MERGE (a)-[e:{relation} {{uuid: row.edge_id}}]->(b) "
         "SET e = row.props "
@@ -754,10 +823,14 @@ def _operation_probes(envelope: ProjectionEnvelopeV2) -> list[ProjectionOperatio
 
 def _spot_probe(envelope: ProjectionEnvelopeV2, group_id: str) -> dict[str, Any]:
     sample_nodes = _spread(envelope.node_ops, SPOT_PROBE_SAMPLE)
+    law_probes: dict[str, Any] = {}
+    if any(SOURCE_KIND_BASE_LABEL[op.source.kind] == LAW_SECTION_BASE_LABEL for op in envelope.node_ops):
+        law_probes = {"law_node_cypher": LAW_NODE_PROBE_CYPHER, "law_edge_cypher": LAW_EDGE_PROBE_CYPHER}
     return {
         "group_id": group_id,
         "node_cypher": NODE_PROBE_CYPHER,
         "edge_cypher": EDGE_PROBE_CYPHER,
+        **law_probes,
         "cutoff_id": envelope.cutoff.cutoff_id,
         "samples": [
             {
@@ -821,6 +894,49 @@ def _derive_graph_name(client_slug: str) -> str:
         raise _fail(422, f"Invalid client_slug: {exc}")
 
 
+def _misfiled_message(graph_name: str, engagement_id: str, misfiled: dict[str, tuple[str, set[str]]]) -> str:
+    """What the operator does about ids stored under a base label their kind does not carry, case by case.
+
+    Each id comes with the delete that removes exactly the node in the way, written out with its own label, tenant,
+    engagement and id, so it can be run as it stands; the reason is the one that fits the case."""
+    lines = []
+    for node_id in sorted(misfiled)[:10]:
+        expected, bases = misfiled[node_id]
+        wrong = sorted(bases - {expected})
+        if expected in bases:
+            reason = f"stored twice, under {expected} (the label its kind carries) and under {', '.join(wrong)}"
+        else:
+            reason = (
+                f"stored under {', '.join(wrong)} only, a label its kind does not carry (as a section of a law "
+                "written before sections had a label of their own would be)"
+            )
+        deletes = " and ".join(
+            f"MATCH (n:{label} {{group_id: {canonical_json(graph_name)}, engagement_id: {canonical_json(engagement_id)}, "
+            f"uuid: {canonical_json(node_id)}}}) DETACH DELETE n"
+            for label in wrong
+        )
+        lines.append(f"'{node_id}' is {reason}; to recover, run {deletes}")
+    more = f" ({len(misfiled) - 10} more ids not listed)" if len(misfiled) > 10 else ""
+    return (
+        "these node IDs are already in this tenant graph under a base label their kind does not carry, and "
+        "writing them again would make a second node under the same id. Nothing was written. "
+        + "; ".join(lines)
+        + f"; then send this envelope again{more}."
+    )
+
+
+async def _held_by_another_base(graph: Any, scope: dict[str, Any], base_by_node: dict[str, str]) -> list[str]:
+    """The ids of this envelope that a node of another base label holds. Asked only when a read-back came up short,
+    to tell the operator the one cause a resend cannot cure."""
+    held: set[str] = set()
+    for label, statement in zip(PROJECTION_BASE_LABELS, RESOLVE_NODES_QUERIES):
+        others = sorted(node_id for node_id, base in base_by_node.items() if base != label)
+        for chunk in _chunks([{"id": node_id} for node_id in others], APPLY_CHUNK_ROWS):
+            rows = _rows_of(await _query(graph, statement, params={**scope, "node_ids": [r["id"] for r in chunk]}))
+            held.update(str(row[0]) for row in rows if row)
+    return sorted(held)
+
+
 async def _preflight(
     graph: Any,
     envelope: ProjectionEnvelopeV2,
@@ -836,18 +952,21 @@ async def _preflight(
     wanted_ids = sorted(set(declared_kinds) | endpoint_ids)
 
     stored_kinds: dict[str, str] = {}
+    stored_bases: dict[str, set[str]] = {}
     if wanted_ids:
         for chunk in _chunks([{"id": node_id} for node_id in wanted_ids], APPLY_CHUNK_ROWS):
-            rows = _rows_of(
-                await _query(
-                    graph,
-                    RESOLVE_NODES_QUERY,
-                    params={**scope, "node_ids": [row["id"] for row in chunk]},
+            for base_label, statement in zip(PROJECTION_BASE_LABELS, RESOLVE_NODES_QUERIES):
+                rows = _rows_of(
+                    await _query(
+                        graph,
+                        statement,
+                        params={**scope, "node_ids": [row["id"] for row in chunk]},
+                    )
                 )
-            )
-            for row in rows:
-                if row:
-                    stored_kinds[str(row[0])] = str(row[1]) if len(row) > 1 else ""
+                for row in rows:
+                    if row:
+                        stored_kinds[str(row[0])] = str(row[1]) if len(row) > 1 else ""
+                        stored_bases.setdefault(str(row[0]), set()).add(base_label)
 
     missing = [
         node_id
@@ -878,6 +997,25 @@ async def _preflight(
             "and a projected node's type label cannot be removed: "
             f"{sorted(retyped)[:10]}",
         )
+
+    # A node already stored under a base label other than the one its kind
+    # carries (a section of a law written as a ProjectionNode before sections had
+    # a label of their own) would not be found by the MERGE, which would make a
+    # second node under the same uuid, nor by an edge that names it. Refused, so
+    # one uuid names one node. This guard is for graphs written before sections
+    # had a label of their own; no production graph held a section of a law when
+    # it was added. A node found under both labels is refused the same way.
+    misfiled: dict[str, tuple[str, set[str]]] = {}
+    for node_id, bases in stored_bases.items():
+        kind = declared_kinds[node_id].value if node_id in declared_kinds else stored_kinds.get(node_id, "")
+        try:
+            expected = SOURCE_KIND_BASE_LABEL[ProjectionSourceKind(kind)]
+        except ValueError:
+            continue
+        if bases != {expected}:
+            misfiled[node_id] = (expected, bases)
+    if misfiled:
+        raise _fail(422, _misfiled_message(graph_name, envelope.engagement_id, misfiled))
 
     # Endpoint kinds must match the relation's declared shape, so a Finding
     # cannot be recorded as derived from another Finding.
@@ -1250,33 +1388,66 @@ async def apply_projection_v2(
         # always return the number of rows sent; this reads back from the graph
         # and only counts rows whose stored op hash is the one this envelope
         # describes, so a row that did not land is caught.
+        # Each node is read back under its own base label, and each edge between
+        # the base labels of its relation, in the order they were sent.
+        base_by_node = {op.node_id: SOURCE_KIND_BASE_LABEL[op.source.kind] for op in envelope.node_ops}
+        nodes_by_base: dict[str, list[dict[str, Any]]] = {}
+        for row in node_rows_all:
+            nodes_by_base.setdefault(base_by_node[row["node_id"]], []).append(row)
         nodes_applied = 0
-        for chunk in _chunks(node_rows_all, APPLY_CHUNK_ROWS):
-            verify_rows = [{"node_id": r["node_id"], "op_hash": r["op_hash"]} for r in chunk]
-            nodes_applied += _first_scalar(
-                await _query(graph, VERIFY_NODES_QUERY, params={**scope, "rows": verify_rows}),
-                default=0,
-            )
+        for base_label, base_rows in nodes_by_base.items():
+            statement = _verify_nodes_query(base_label)
+            for chunk in _chunks(base_rows, APPLY_CHUNK_ROWS):
+                verify_rows = [{"node_id": r["node_id"], "op_hash": r["op_hash"]} for r in chunk]
+                nodes_applied += _first_scalar(
+                    await _query(graph, statement, params={**scope, "rows": verify_rows}),
+                    default=0,
+                )
 
+        ends_by_edge = {
+            op.edge_id: RELATION_ENDPOINT_BASE_LABELS[ProjectionRelation(op.relation)] for op in envelope.edge_ops
+        }
+        edges_by_ends: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in edge_rows_all:
+            edges_by_ends.setdefault(ends_by_edge[row["edge_id"]], []).append(row)
         edges_applied = 0
-        for chunk in _chunks(edge_rows_all, APPLY_CHUNK_ROWS):
-            verify_rows = [
-                {
-                    "edge_id": r["edge_id"],
-                    "op_hash": r["op_hash"],
-                    "from_node_id": r["from_node_id"],
-                    "to_node_id": r["to_node_id"],
-                }
-                for r in chunk
-            ]
-            edges_applied += _first_scalar(
-                await _query(graph, VERIFY_EDGES_QUERY, params={**scope, "rows": verify_rows}),
-                default=0,
-            )
+        for ends, end_rows in edges_by_ends.items():
+            statement = _verify_edges_query(*ends)
+            for chunk in _chunks(end_rows, APPLY_CHUNK_ROWS):
+                verify_rows = [
+                    {
+                        "edge_id": r["edge_id"],
+                        "op_hash": r["op_hash"],
+                        "from_node_id": r["from_node_id"],
+                        "to_node_id": r["to_node_id"],
+                    }
+                    for r in chunk
+                ]
+                edges_applied += _first_scalar(
+                    await _query(graph, statement, params={**scope, "rows": verify_rows}),
+                    default=0,
+                )
 
         if nodes_applied != len(envelope.node_ops) or edges_applied != len(envelope.edge_ops):
-            # The receipt stays PENDING, so the identical envelope can be resent
-            # and will converge rather than duplicate.
+            # A row the write held off because a node of the other base label
+            # holds its uuid (another apply wrote it while this one ran, see
+            # _node_apply_query) will not land on a resend either: the resend is
+            # refused until that node is gone. Said so, plainly, for that cause.
+            held = await _held_by_another_base(graph, scope, base_by_node) if nodes_applied != len(envelope.node_ops) else []
+            if held:
+                raise _fail(
+                    500,
+                    "projection verified "
+                    f"{nodes_applied}/{len(envelope.node_ops)} nodes and "
+                    f"{edges_applied}/{len(envelope.edge_ops)} edges against the graph. These node IDs were "
+                    "not written because a node of another kind already holds each of them in this tenant "
+                    "graph (written by another operation while this one ran): "
+                    f"{held[:10]}. The receipt stays PENDING. Resending this envelope as it is will be refused "
+                    "until those ids are free: give these nodes ids of their own, or remove the other nodes "
+                    "if they are the ones in error, then send it again",
+                )
+            # For every other cause the receipt stays PENDING, so the identical
+            # envelope can be resent and will converge rather than duplicate.
             raise _fail(
                 500,
                 "projection verified "
