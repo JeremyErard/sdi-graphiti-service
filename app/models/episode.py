@@ -44,6 +44,10 @@ class EpisodeType(str, Enum):
     # department actually decided about who does what, so it kept returning the
     # uncorrected SOP-era fact after the client had corrected it in review.
     RACI_APPROVED = "raci_approved"
+    # A courseware piece the client has approved, ingested so the graph can learn
+    # what was decided. Mirrors RACI_APPROVED: without this member the value is a
+    # 422 before any work starts.
+    COURSEWARE_APPROVED = "courseware_approved"
 
 
 class EpisodeAnchorMode(str, Enum):
